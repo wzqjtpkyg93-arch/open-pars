@@ -18,7 +18,6 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
@@ -30,6 +29,10 @@ from telegram.ext import (
 )
 from playwright.async_api import async_playwright
 
+# --- ТОКЕН ВПИСАН СЮДА ---
+TOKEN = "8816022011:AAGQHE3PVnngi33K8MxxO5DKzPL2BK7Ldlg"
+ADMIN_ID = 1110325917
+
 COUNTRIES = "kw ae bh sa".split()
 HOSTS = {"opensooq.com", "www.opensooq.com"} | {c + ".opensooq.com" for c in COUNTRIES}
 METRICS = {"price", "views", "seller_views", "rating", "ratings", "reviews", "sold", "photos", "listings_count"}
@@ -40,8 +43,7 @@ log = logging.getLogger("opensooq")
 EXCLUDED_WORDS = ["car", "cars", "auto", "autos", "kia", "gmc", "toyota", "nissan", "chevrolet", "ford", "bmw", "mercedes", "audi", "hyundai", "apartment", "flat", "real estate", "rent", "rental", "delivery", "service", "job", "vacancy", "سيارة", "سيارات", "شقة", "شقق", "عقار", "ايجار", "تأجير", "خدمة", "وظيفة"]
 
 def generate_password(length=8):
-    chars = string.ascii_letters + string.digits
-    return "".join(random.choice(chars) for _ in range(length))
+    return "".join(random.choice(string.ascii_letters + string.digits) for _ in range(length))
 
 def save_user_password(user_id, password):
     data = {}
@@ -204,6 +206,7 @@ def parse_listing(raw, ad):
         ad["price"] = number(prices[0].get("price"))
         ad["currency"] = str(prices[0].get("key") or prices[0].get("currencyLabel") or ad["currency"])
 
+    # УЛУЧШЕННЫЙ ПАРСЕР ВРЕМЕНИ
     time_str = None
     for obj in walk([data]):
         if isinstance(obj, dict):
@@ -217,10 +220,22 @@ def parse_listing(raw, ad):
         text_content = soup.get_text(" ", strip=True)
         match_time = re.search(r"(\d+\s+(?:minutes?|hours?|days?|mins?|hrs?|دقائق|ساعات|أيام)\s+ago)", text_content, re.I)
         if match_time: time_str = match_time.group(1).strip()
+    
+    # Если нашли время в формате ISO, конвертируем в "X минут назад"
+    if time_str and len(time_str) > 15 and "T" in time_str:
+        try:
+            dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
+            diff = datetime.now(timezone.utc) - dt
+            if diff.days > 0: time_str = f"{diff.days} дн. назад"
+            elif diff.seconds > 3600: time_str = f"{diff.seconds // 3600} ч. назад"
+            elif diff.seconds > 60: time_str = f"{diff.seconds // 60} мин. назад"
+            else: time_str = "Только что"
+        except: pass
+
     ad["time"] = time_str or "Неизвестно"
     return ad
 
-# --- НОВЫЙ ПАРСИНГ ПРОФИЛЯ С PLAYWRIGHT ---
+# --- ПАРСИНГ ПРОФИЛЯ С PLAYWRIGHT (УВЕЛИЧЕНО ВРЕМЯ) ---
 async def get_profile_with_playwright(seller_url):
     result = {"seller_views": None, "listings_count": None, "reviews": None, "rating": None, "ratings": None, "sold": None}
     
@@ -232,13 +247,14 @@ async def get_profile_with_playwright(seller_url):
         page = await context.new_page()
         
         try:
-            await page.goto(seller_url, timeout=40000, wait_until="networkidle")
-            await page.wait_for_timeout(3000)
+            await page.goto(seller_url, timeout=45000, wait_until="networkidle")
+            # ЖДЕМ 8 СЕКУНД, ЧТОБЫ ВСЕ СКРИПТЫ ЗАГРУЗИЛИСЬ
+            await page.wait_for_timeout(8000)
             
             content = await page.content()
             soup = BeautifulSoup(content, "html.parser")
             
-            # 1. Пытаемся вытащить из JSON, который загрузил браузер
+            # Поиск в JSON
             for script in soup.find_all("script", type="application/json"):
                 try:
                     data = json.loads(script.string)
@@ -251,7 +267,7 @@ async def get_profile_with_playwright(seller_url):
                             result["listings_count"] = count(inv.get("liveListingsCount"))
                 except: pass
 
-            # 2. Если JSON не помог, ищем в тексте страницы
+            # Поиск в тексте
             text = soup.get_text(" ", strip=True)
             
             if result["seller_views"] is None:
@@ -678,7 +694,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not parts: return
     command = parts[0].split("@")[0].lower()
     argument = parts[1] if len(parts) > 1 else ""
-    admin_id = int(os.getenv("ALLOWED_TELEGRAM_IDS", "0").split(",")[0])
     
     if is_blocked(user.id):
         await message.reply_text("⛔ Вы заблокированы.")
@@ -688,7 +703,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text(f"Ваш Telegram ID: {user.id}")
         return
     if command == "/createpass":
-        if user.id != admin_id: return
+        if user.id != ADMIN_ID: return
         try:
             target_id = argument.strip()
             new_pass = generate_password()
@@ -698,7 +713,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("⚠️ Используй так: `/createpass 123456789`", parse_mode="Markdown")
         return
     if command == "/block":
-        if user.id != admin_id: return
+        if user.id != ADMIN_ID: return
         try:
             target_id = int(argument.strip())
             block_user(target_id)
@@ -706,7 +721,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: await message.reply_text("⚠️ Используй: `/block 123456789`")
         return
     if command == "/unblock":
-        if user.id != admin_id: return
+        if user.id != ADMIN_ID: return
         try:
             target_id = int(argument.strip())
             unblock_user(target_id)
@@ -714,7 +729,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: await message.reply_text("⚠️ Используй: `/unblock 123456789`")
         return
     if command == "/admin":
-        if user.id != admin_id: return
+        if user.id != ADMIN_ID: return
         await message.reply_text("👑 *АДМИН-ПАНЕЛЬ*\n\n🔑 `/createpass [ID]` — Создать пароль\n🚫 `/block [ID]` — Заблокировать\n✅ `/unblock [ID]` — Разблокировать\n\nℹ️ *Остальные функции доступны в меню /start*", parse_mode="Markdown")
         return
 
@@ -841,14 +856,6 @@ def build_app(token, allowed, database):
     return app
 
 if __name__ == "__main__":
-    load_dotenv()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-    
-    token = os.getenv("TOKEN", "").strip()
-    admin_id_str = os.getenv("ALLOWED_TELEGRAM_IDS", "")
-    allowed = {int(v.strip()) for v in admin_id_str.split(",") if v.strip()}
-    
-    app = build_app(token, allowed, os.getenv("DATABASE_PATH", "bot.sqlite3"))
+    allowed = {ADMIN_ID}
+    app = build_app(TOKEN, allowed, os.getenv("DATABASE_PATH", "bot.sqlite3"))
     app.run_polling(allowed_updates=["message", "callback_query"])
