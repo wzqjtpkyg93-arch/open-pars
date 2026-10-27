@@ -1,16 +1,14 @@
-FROM python:3.11-slim
+# Используем официальный образ Playwright для Python
+FROM mcr.microsoft.com/playwright/python:v1.49.0-noble
 
-# Устанавливаем системные библиотеки, которые нужны браузеру
-RUN apt-get update && apt-get install -y \
-    wget gnupg curl libnss3 libatk-bridge2.0-0 libxkbcommon0 libgtk-3-0 libasound2 \
-    && rm -rf /var/lib/apt/lists/*
+# Устанавливаем рабочую директорию
+WORKDIR /app
 
-# Копируем файлы и ставим зависимости Python
+# Копируем файлы зависимостей
 COPY requirements.txt .
-RUN pip install -r requirements.txt
 
-# Устанавливаем сам браузер Chromium для Playwright
-RUN playwright install chromium
+# Устанавливаем Python-библиотеки
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Копируем код бота
 COPY . .
