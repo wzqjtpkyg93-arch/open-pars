@@ -7,11 +7,13 @@ from playwright.async_api import async_playwright
 import requests
 from bs4 import BeautifulSoup
 
+# --- НАСТРОЙКИ ---
 TOKEN = os.environ.get("TOKEN")
 ADMIN_ID = 1110325917
 PASSWORD = "МойСекретныйПароль123"
 AUTHORIZED_USERS = set()
 
+# --- ПАРСИНГ ПРОСМОТРОВ ---
 async def get_views_from_profile(profile_url):
     if not profile_url:
         return "Ссылка на профиль не найдена."
@@ -30,10 +32,12 @@ async def get_views_from_profile(profile_url):
             soup = BeautifulSoup(content, "html.parser")
             text = soup.get_text(" ", strip=True)
             
+            # Поиск в тексте
             match = re.search(r"([\d.,٬٫]+\s*[kKmM]?)\s*(?:Views|مشاهدة|مشاهدات)", text, re.I)
             if match:
                 return match.group(1).strip()
             
+            # Поиск в JSON
             if '"views_count"' in content:
                 json_match = re.search(r'"views_count"\s*:\s*(\d+)', content)
                 if json_match: return json_match.group(1)
@@ -50,6 +54,7 @@ async def get_views_from_profile(profile_url):
         finally:
             await browser.close()
 
+# --- ПОИСК ССЫЛКИ НА ПРОФИЛЬ В ОБЪЯВЛЕНИИ ---
 def find_profile_url(listing_url):
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"}
@@ -66,6 +71,7 @@ def find_profile_url(listing_url):
     except Exception:
         return None
 
+# --- ЛОГИКА БОТА ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in AUTHORIZED_USERS:
@@ -80,7 +86,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in AUTHORIZED_USERS:
         if text == PASSWORD:
             AUTHORIZED_USERS.add(user_id)
-            await update.message.reply_text("✅ Пароль верный! Теперь отправь ссылку на объявление OpenSooq.")
+            await update.message.reply_text("✅ Пароль верный! Теперь отправь ссылку на конкретное объявление.")
             try: await context.bot.send_message(chat_id=ADMIN_ID, text=f"🚨 Новый юзер: {user_id}")
             except: pass
         else:
@@ -88,7 +94,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if "opensooq.com" not in text and "opn.so" not in text:
-        await update.message.reply_text("⚠️ Отправь ссылку на объявление OpenSooq.")
+        await update.message.reply_text("⚠️ Отправь ссылку на конкретное объявление OpenSooq.")
+        return
+
+    # Проверка, что это не страница поиска
+    if "/find" in text or "/search?" in text:
+        await update.message.reply_text("⚠️ Это страница поиска. Открой конкретный товар и скопируй ссылку на него.")
         return
 
     msg = await update.message.reply_text("🔎 Ищу профиль продавца...")
@@ -109,7 +120,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Отправь ссылку на объявление OpenSooq, и я покажу просмотры продавца.")
+    await update.message.reply_text("Отправь ссылку на конкретное объявление OpenSooq, и я покажу просмотры продавца.")
 
 def main():
     if not TOKEN:
