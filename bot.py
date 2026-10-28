@@ -21,6 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import (
     parse_qsl,
+    unquote,
     urlencode,
     urljoin,
     urlsplit,
@@ -118,7 +119,10 @@ EXCLUDED_WORDS = [
 
 EXCLUDED_RE = re.compile(
     r"(?<!\w)(?:"
-    + "|".join(re.escape(word) for word in EXCLUDED_WORDS)
+    + "|".join(
+        re.escape(word)
+        for word in EXCLUDED_WORDS
+    )
     + r")(?!\w)",
     re.I,
 )
@@ -130,6 +134,88 @@ class SourceError(Exception):
 
 class RateLimit(SourceError):
     pass
+
+
+def proxy_settings(value):
+    value = value.strip()
+
+    if not value:
+        return None, None
+
+    try:
+        parsed = urlsplit(value)
+
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or not parsed.port
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+            or any(char.isspace() for char in value)
+        ):
+            raise ValueError()
+
+        hostname = parsed.hostname
+
+        if ":" in hostname:
+            hostname = "[" + hostname + "]"
+
+        browser = {
+            "server": (
+                f"{parsed.scheme}://"
+                f"{hostname}:{parsed.port}"
+            )
+        }
+
+        if parsed.username is not None:
+            browser["username"] = unquote(
+                parsed.username
+            )
+
+        if parsed.password is not None:
+            browser["password"] = unquote(
+                parsed.password
+            )
+
+        return value, browser
+
+    except ValueError:
+        raise ValueError(
+            "OPENSOOQ_PROXY_URL: нужен HTTP URI вида "
+            "http://USER:PASS@HOST:PORT."
+        ) from None
+
+
+def error_text(error):
+    text = str(error)
+
+    value = os.getenv(
+        "OPENSOOQ_PROXY_URL",
+        "",
+    ).strip()
+
+    if value:
+        text = text.replace(value, "[proxy]")
+
+        with suppress(ValueError):
+            parsed = urlsplit(value)
+
+            for secret in (
+                parsed.password,
+                parsed.username,
+            ):
+                if secret:
+                    text = text.replace(
+                        secret,
+                        "[hidden]",
+                    )
+                    text = text.replace(
+                        unquote(secret),
+                        "[hidden]",
+                    )
+
+    return text
 
 
 def safe_url(value, base=""):
@@ -171,13 +257,21 @@ def photo_url(value, base=CDN):
     if value.startswith("//"):
         value = "https:" + value
 
-    if not value.startswith(("https://", "http://", "//")):
+    if not value.startswith((
+        "https://",
+        "http://",
+        "//",
+    )):
         value = urljoin(
             base.replace("{size}", "700x0"),
             value,
         )
 
-        if value.lower().endswith((".jpg", ".jpeg", ".png")):
+        if value.lower().endswith((
+            ".jpg",
+            ".jpeg",
+            ".png",
+        )):
             value += ".webp"
 
     parsed = urlsplit(value)
@@ -269,6 +363,7 @@ def count(value):
 def walk(value):
     if isinstance(value, dict):
         yield value
+
         for child in value.values():
             yield from walk(child)
 
@@ -278,13 +373,18 @@ def walk(value):
 
 
 def props(soup):
-    tag = soup.find("script", id="__NEXT_DATA__")
+    tag = soup.find(
+        "script",
+        id="__NEXT_DATA__",
+    )
 
     if not tag:
         return {}
 
     try:
-        data = json.loads(tag.string or tag.get_text())
+        data = json.loads(
+            tag.string or tag.get_text()
+        )
         return data["props"]["pageProps"]
 
     except (ValueError, KeyError, TypeError):
@@ -297,7 +397,10 @@ def flight(soup):
     chunks = []
     result = []
 
-    for tag in soup.find_all("script", src=False):
+    for tag in soup.find_all(
+        "script",
+        src=False,
+    ):
         text = tag.string or tag.get_text()
 
         for match in re.finditer(
@@ -398,16 +501,25 @@ def parse_profile(raw, expected_id):
 
         if matching:
             members = matching
+
         elif without_id:
             members = without_id
+
         elif members:
             raise SourceError(
                 "Открыт профиль другого продавца."
             )
 
     for member in members:
-        put("seller_views", member.get("views_count"))
-        put("seller_views", member.get("views"))
+        put(
+            "seller_views",
+            member.get("views_count"),
+        )
+
+        put(
+            "seller_views",
+            member.get("views"),
+        )
 
         rating = member.get("rating")
 
@@ -417,10 +529,12 @@ def parse_profile(raw, expected_id):
                 rating.get("average_rating"),
                 number,
             )
+
             put(
                 "ratings",
                 rating.get("number_of_rating"),
             )
+
             put(
                 "reviews",
                 rating.get("number_of_reviews"),
@@ -443,7 +557,10 @@ def parse_profile(raw, expected_id):
         tag.decompose()
 
     def clean_text(value):
-        value = unicodedata.normalize("NFKC", value)
+        value = unicodedata.normalize(
+            "NFKC",
+            value,
+        )
 
         value = re.sub(
             r"[\u064b-\u065f\u0670\u200e\u200f\u061c]",
@@ -451,7 +568,11 @@ def parse_profile(raw, expected_id):
             value,
         )
 
-        return re.sub(r"\s+", " ", value).strip()
+        return re.sub(
+            r"\s+",
+            " ",
+            value,
+        ).strip()
 
     numeric = (
         r"\d[\d.,٬٫]*(?: \d{3})*"
@@ -498,7 +619,10 @@ def parse_profile(raw, expected_id):
                         re.I,
                     )
                 ):
-                    put("seller_views", match.group(1))
+                    put(
+                        "seller_views",
+                        match.group(1),
+                    )
 
                     if result["seller_views"] is not None:
                         break
@@ -557,7 +681,10 @@ def parse_profile(raw, expected_id):
         )
 
         if match:
-            put("reviews", match.group(1))
+            put(
+                "reviews",
+                match.group(1),
+            )
 
     if result["rating"] is None:
         match = re.search(
@@ -568,11 +695,12 @@ def parse_profile(raw, expected_id):
         )
 
         if match:
-            put("rating", match.group(1), number)
+            put(
+                "rating",
+                match.group(1),
+                number,
+            )
 
-    # listings_count читается из Live Listings.
-    # Число карточек одной страницы не равно общему счётчику.
-    # Неизвестные значения остаются None, а не превращаются в 0.
     return result
 
 
@@ -619,7 +747,10 @@ def update_filters(current, text):
             result[key] = value
 
         elif key == "currency":
-            if not re.fullmatch("[A-Za-z]{3}", value):
+            if not re.fullmatch(
+                "[A-Za-z]{3}",
+                value,
+            ):
                 raise ValueError(
                     "Валюта: код из 3 букв."
                 )
@@ -665,7 +796,10 @@ def update_filters(current, text):
     for metric in METRICS:
         if (
             result.get(metric + "_min", 0)
-            > result.get(metric + "_max", math.inf)
+            > result.get(
+                metric + "_max",
+                math.inf,
+            )
         ):
             raise ValueError(
                 f"{metric}_min больше {metric}_max."
@@ -684,14 +818,18 @@ def matches(ad, rules):
     def terms(name):
         return [
             value.strip().casefold()
-            for value in rules.get(name, "").split(",")
+            for value in rules.get(
+                name,
+                "",
+            ).split(",")
             if value.strip()
         ]
 
     keywords = terms("keywords")
 
     if keywords and not any(
-        value in text for value in keywords
+        value in text
+        for value in keywords
     ):
         return False, set()
 
@@ -707,6 +845,7 @@ def matches(ad, rules):
     if rules.get("currency"):
         if not ad.get("currency"):
             missing.add("currency")
+
         elif ad["currency"] != rules["currency"]:
             accepted = False
 
@@ -721,6 +860,7 @@ def matches(ad, rules):
 
         if value is None:
             missing.add(metric)
+
         elif (
             (low is not None and value < low)
             or (high is not None and value > high)
@@ -774,7 +914,7 @@ def check_user_password(user_id, password):
 
             if (
                 uid == str(user_id)
-                and secrets.compare_digest(pwd, password)
+                and pwd == password
             ):
                 return True
 
@@ -828,6 +968,7 @@ def plain(value):
         for key in ("content", "text", "value"):
             if key in value:
                 return plain(value[key])
+
         return ""
 
     if isinstance(value, list):
@@ -857,6 +998,7 @@ def publication(value):
                 text,
                 fmt,
             ).strftime("%d.%m.%Y")
+
         except ValueError:
             pass
 
@@ -867,7 +1009,10 @@ def publication(value):
 
         if parsed.tzinfo is not None:
             parsed = parsed.astimezone(DISPLAY_TZ)
-            return parsed.strftime("%d.%m.%Y %H:%M %Z")
+
+            return parsed.strftime(
+                "%d.%m.%Y %H:%M %Z"
+            )
 
         return (
             parsed.strftime("%d.%m.%Y %H:%M")
@@ -903,8 +1048,10 @@ def relative_label(value):
 
         if unit.startswith("m"):
             label = "мин."
+
         elif unit.startswith("h"):
             label = "ч."
+
         else:
             label = "дн."
 
@@ -921,8 +1068,6 @@ def next_category_url(data, block, url):
     if next_path:
         return safe_url(next_path, url)
 
-    # У /en/find может отсутствовать SEO-ссылка.
-    # Тогда используем метаданные пагинации.
     meta = block.get("meta") or {}
 
     if (
@@ -952,7 +1097,10 @@ def next_category_url(data, block, url):
         if key != "page"
     ]
 
-    query.append(("page", str(current + 1)))
+    query.append((
+        "page",
+        str(current + 1),
+    ))
 
     return safe_url(urlunsplit((
         parsed.scheme,
@@ -964,7 +1112,11 @@ def next_category_url(data, block, url):
 
 
 def parse_category(raw, url):
-    soup = BeautifulSoup(raw, "html.parser")
+    soup = BeautifulSoup(
+        raw,
+        "html.parser",
+    )
+
     documents = []
 
     with suppress(SourceError):
@@ -985,7 +1137,10 @@ def parse_category(raw, url):
     )
 
     block = (
-        data.get("serpApiResponse", {}).get("listings")
+        data.get(
+            "serpApiResponse",
+            {},
+        ).get("listings")
         if data
         else None
     )
@@ -1018,37 +1173,70 @@ def parse_category(raw, url):
 
             path = (
                 "/"
-                + (locale if locale in {"ar", "en"} else "en")
+                + (
+                    locale
+                    if locale in {"ar", "en"}
+                    else "en"
+                )
                 + path
             )
 
-        image = photo_url(row.get("image_uri"))
+        image = photo_url(
+            row.get("image_uri")
+        )
+
         ad = dict.fromkeys(METRICS)
 
         ad.update(
             id=str(row["id"]),
             url=safe_url(path, url),
             title=plain(row["title"]),
-            description=plain(row.get("masked_description")),
-            price=number(row.get("price_amount")),
-            currency=plain(row.get("price_currency_iso")),
-            photos=count(row.get("image_count")),
+            description=plain(
+                row.get("masked_description")
+            ),
+            price=number(
+                row.get("price_amount")
+            ),
+            currency=plain(
+                row.get("price_currency_iso")
+            ),
+            photos=count(
+                row.get("image_count")
+            ),
             images=[image] if image else [],
-            views=count(row.get("views_count")),
-            seller_id=str(row.get("member_id") or ""),
-            seller_name=plain(row.get("member_display_name")),
+            views=count(
+                row.get("views_count")
+            ),
+            seller_id=str(
+                row.get("member_id") or ""
+            ),
+            seller_name=plain(
+                row.get("member_display_name")
+            ),
             seller_url="",
-            rating=number(row.get("member_rating_avg")),
-            ratings=count(row.get("member_rating_count")),
-            location=", ".join(filter(None, [
-                plain(row.get("nhood_label")),
-                plain(row.get("city_label")),
-            ])),
-            published=publication(row.get("inserted_date")),
-            posted_label=relative_label(row.get("posted_at")),
+            rating=number(
+                row.get("member_rating_avg")
+            ),
+            ratings=count(
+                row.get("member_rating_count")
+            ),
+            location=", ".join(
+                filter(None, [
+                    plain(row.get("nhood_label")),
+                    plain(row.get("city_label")),
+                ])
+            ),
+            published=publication(
+                row.get("inserted_date")
+            ),
+            posted_label=relative_label(
+                row.get("posted_at")
+            ),
         )
 
-        username = plain(row.get("member_user_name"))
+        username = plain(
+            row.get("member_user_name")
+        )
 
         if username:
             locale = (
@@ -1069,7 +1257,11 @@ def parse_category(raw, url):
             "Карточки категории имеют неизвестную структуру."
         )
 
-    return ads, next_category_url(data, block, url)
+    return ads, next_category_url(
+        data,
+        block,
+        url,
+    )
 
 
 def parse_listing(raw, ad):
@@ -1124,8 +1316,6 @@ def parse_listing(raw, ad):
         if owner.get(key) is not None:
             ad[target] = convert(owner[key])
 
-    # Этот счётчик может отличаться от Live Listings.
-    # Не подставляем его вместо подтверждённых активных.
     ad["seller_listings_hint"] = count(
         owner.get("numberOfListings")
     )
@@ -1148,14 +1338,20 @@ def parse_listing(raw, ad):
             if kind == "ListingPostDate" and value:
                 ad["published"] = publication(value)
 
-            if kind in {"Neighborhood", "City"} and value:
+            if kind in {
+                "Neighborhood",
+                "City",
+            } and value:
                 locations[kind] = value
 
     if locations:
         ad["location"] = ", ".join(
             dict.fromkeys(
                 locations[key]
-                for key in ("Neighborhood", "City")
+                for key in (
+                    "Neighborhood",
+                    "City",
+                )
                 if key in locations
             )
         )
@@ -1167,7 +1363,9 @@ def parse_listing(raw, ad):
             "createdAt",
         ):
             if info.get(key):
-                ad["published"] = publication(info[key])
+                ad["published"] = publication(
+                    info[key]
+                )
                 break
 
     gallery = info.get("gallery") or {}
@@ -1177,7 +1375,10 @@ def parse_listing(raw, ad):
     ).get("imagesBaseUrl") or CDN
 
     images = [
-        photo_url(media.get("uri"), base)
+        photo_url(
+            media.get("uri"),
+            base,
+        )
         for media in gallery.get("media", [])
         if (
             isinstance(media, dict)
@@ -1195,7 +1396,9 @@ def parse_listing(raw, ad):
     chips = gallery.get("chips") or {}
 
     if chips.get("imagesCount") is not None:
-        ad["photos"] = count(chips["imagesCount"])
+        ad["photos"] = count(
+            chips["imagesCount"]
+        )
 
     for key in (
         "viewsCount",
@@ -1207,7 +1410,8 @@ def parse_listing(raw, ad):
             break
 
     prices = (
-        (data.get("listing") or {}).get("price") or {}
+        (data.get("listing") or {}).get("price")
+        or {}
     ).get("prices", [])
 
     if prices:
@@ -1228,9 +1432,18 @@ def parse_listing(raw, ad):
 
 class Reader:
     def __init__(self):
+        self.proxy_url, self.browser_proxy = proxy_settings(
+            os.getenv(
+                "OPENSOOQ_PROXY_URL",
+                "",
+            )
+        )
+
         self.http = httpx.AsyncClient(
             timeout=30,
             follow_redirects=False,
+            proxy=self.proxy_url,
+            trust_env=False,
             headers={
                 "User-Agent": "OpenSooqTelegramBot/2.0",
                 "Accept-Language": "en",
@@ -1257,20 +1470,33 @@ class Reader:
                     self.last + 2 - time.monotonic(),
                 )
             )
+
             self.last = time.monotonic()
 
-    def status_error(self, status, headers, host):
+    def status_error(
+        self,
+        status,
+        headers,
+        host,
+    ):
         if status == 429:
-            retry = headers.get("retry-after", "300")
+            retry = headers.get(
+                "retry-after",
+                "300",
+            )
 
             try:
                 delay = float(retry)
+
             except ValueError:
                 try:
                     delay = (
-                        parsedate_to_datetime(retry).timestamp()
+                        parsedate_to_datetime(
+                            retry
+                        ).timestamp()
                         - time.time()
                     )
+
                 except (
                     ValueError,
                     TypeError,
@@ -1367,9 +1593,15 @@ class Reader:
                     )
 
             if response.status_code in {
-                301, 302, 303, 307, 308
+                301,
+                302,
+                303,
+                307,
+                308,
             }:
-                location = response.headers.get("location")
+                location = response.headers.get(
+                    "location"
+                )
 
                 if not location:
                     raise SourceError(
@@ -1392,8 +1624,15 @@ class Reader:
             "Слишком много перенаправлений."
         )
 
-    async def browser_profile(self, url, seller_id):
-        if not USE_BROWSER or self.browser_failures >= 3:
+    async def browser_profile(
+        self,
+        url,
+        seller_id,
+    ):
+        if (
+            not USE_BROWSER
+            or self.browser_failures >= 3
+        ):
             raise SourceError(
                 "Браузерная загрузка профилей "
                 "недоступна в этой проверке."
@@ -1413,11 +1652,26 @@ class Reader:
                     or not self.browser.is_connected()
                 ):
                     if self.pw is None:
-                        self.pw = await async_playwright().start()
+                        self.pw = (
+                            await async_playwright().start()
+                        )
 
-                    self.browser = await self.pw.chromium.launch(
-                        headless=True,
-                        args=["--disable-dev-shm-usage"],
+                    launch_options = {
+                        "headless": True,
+                        "args": [
+                            "--disable-dev-shm-usage"
+                        ],
+                    }
+
+                    if self.browser_proxy is not None:
+                        launch_options["proxy"] = (
+                            self.browser_proxy
+                        )
+
+                    self.browser = (
+                        await self.pw.chromium.launch(
+                            **launch_options
+                        )
                     )
 
                     self.browser_context = (
@@ -1443,7 +1697,9 @@ class Reader:
 
                 await self.throttle()
 
-                page = await self.browser_context.new_page()
+                page = (
+                    await self.browser_context.new_page()
+                )
 
                 try:
                     response = await page.goto(
@@ -1451,6 +1707,7 @@ class Reader:
                         timeout=25000,
                         wait_until="domcontentloaded",
                     )
+
                 except PlaywrightTimeout:
                     response = None
 
@@ -1497,6 +1754,7 @@ class Reader:
                             profile["seller_views"],
                             profile["listings_count"],
                         )
+
                         return profile
 
                     if attempt < 3:
@@ -1523,7 +1781,7 @@ class Reader:
                 log.warning(
                     "[profile_browser] seller=%s error=%s",
                     seller_id,
-                    str(exc)[:1200],
+                    error_text(exc)[:1200],
                 )
 
                 if isinstance(exc, SourceError):
@@ -1539,7 +1797,11 @@ class Reader:
                     with suppress(Exception):
                         await page.close()
 
-    async def profile(self, url, seller_id):
+    async def profile(
+        self,
+        url,
+        seller_id,
+    ):
         key = (url, seller_id)
         cached = self.cache.get(key)
 
@@ -1569,12 +1831,14 @@ class Reader:
             raise
 
         except (SourceError, ValueError) as exc:
-            problems.append("HTTP: " + str(exc))
+            problems.append(
+                "HTTP: " + error_text(exc)
+            )
 
             log.warning(
                 "[profile_http] seller=%s error=%s",
                 seller_id,
-                str(exc)[:500],
+                error_text(exc)[:500],
             )
 
         if profile is None or any(
@@ -1607,7 +1871,7 @@ class Reader:
                 ImportError,
             ) as exc:
                 problems.append(
-                    "Браузер: " + str(exc)
+                    "Браузер: " + error_text(exc)
                 )
 
         absent = [
@@ -1630,13 +1894,17 @@ class Reader:
 
             issue = (
                 "Недоступны "
-                + ", ".join(labels[name] for name in absent)
+                + ", ".join(
+                    labels[name]
+                    for name in absent
+                )
                 + ". "
                 + (
                     "; ".join(problems)
                     or "Счётчики не найдены в профиле."
                 )
             )
+
         else:
             issue = ""
 
@@ -1747,29 +2015,54 @@ def card(ad):
             + "\n"
         )
 
+    listings = (
+        "• <b>Активных объявлений:</b> "
+        + show("listings_count")
+    )
+
+    if (
+        ad.get("listings_count") is None
+        and ad.get("seller_listings_hint") is not None
+    ):
+        listings += (
+            "\n• <b>Объявлений по карточке:</b> "
+            + show("seller_listings_hint")
+            + " (активность не подтверждена)"
+        )
+
     return (
         f"<b>Объявление №{show('id')}</b>\n\n"
         f"📦 <b>{escape(ad['title'][:100])}</b>\n"
+
         f"🏷 <b>Цена:</b> {show('price')} "
         f"{escape(ad.get('currency', ''))}\n"
+
         f"📍 <b>Локация:</b> "
         f"{escape(ad.get('location') or 'Не указана')}\n"
+
         f"🕓 <b>Опубликовано:</b> {timing}\n"
         f"{extra_time}\n"
+
         f"📖 <b>Описание:</b>\n"
         f"<blockquote>{escape(desc)}</blockquote>\n\n"
+
         f"💼 <b>Продавец:</b> "
         f"{escape((ad.get('seller_name') or 'Неизвестен')[:60])}"
         f"\n\n"
+
         f"• <b>Фото:</b> {show('photos')}\n"
+
         f"• <b>Рейтинг:</b> {show('rating')} "
         f"(оценок: {show('ratings')})\n"
+
         f"• <b>Отзывов:</b> {show('reviews')}\n"
+
         f"• <b>Продано:</b> {show('sold')}\n"
+
         f"• <b>Просмотры профиля:</b> "
         f"{show('seller_views')}\n"
-        f"• <b>Активных объявлений:</b> "
-        f"{show('listings_count')}"
+
+        f"{listings}"
     )
 
 
@@ -1780,7 +2073,10 @@ async def telegram_call(method, **kwargs):
     except RetryAfter as exc:
         delay = (
             exc.retry_after.total_seconds()
-            if hasattr(exc.retry_after, "total_seconds")
+            if hasattr(
+                exc.retry_after,
+                "total_seconds",
+            )
             else float(exc.retry_after)
         )
 
@@ -1788,6 +2084,7 @@ async def telegram_call(method, **kwargs):
             raise
 
         await asyncio.sleep(delay + 1)
+
         return await method(**kwargs)
 
 
@@ -1810,6 +2107,7 @@ HELP_TEXT = """ℹ️ Команды
 /interval 15 — интервал 5–1440 минут
 /pause — остановить проверку и мониторинг
 /status — статус и последний отчёт
+/testproxy — проверить просмотры и активные объявления через прокси
 /id — ваш Telegram ID
 
 seller_views — просмотры профиля продавца
@@ -2026,7 +2324,10 @@ class Service:
             )
 
         values = [
-            json.dumps(value, ensure_ascii=False)
+            json.dumps(
+                value,
+                ensure_ascii=False,
+            )
             if key in {"urls", "rules"}
             else value
             for key, value in changes.items()
@@ -2034,7 +2335,10 @@ class Service:
 
         query = (
             "UPDATE users SET "
-            + ",".join(key + "=?" for key in changes)
+            + ",".join(
+                key + "=?"
+                for key in changes
+            )
             + " WHERE chat=?"
         )
 
@@ -2136,7 +2440,9 @@ class Service:
                     self.bot.send_photo,
                     chat_id=chat,
                     photo=ad["images"][0],
-                    caption=escape(ad["title"][:100]),
+                    caption=escape(
+                        ad["title"][:100]
+                    ),
                     parse_mode="HTML",
                 )
 
@@ -2154,7 +2460,11 @@ class Service:
             reply_markup=markup,
         )
 
-    async def live_progress(self, message, stats):
+    async def live_progress(
+        self,
+        message,
+        stats,
+    ):
         previous = ""
 
         while True:
@@ -2178,6 +2488,7 @@ class Service:
                         message.edit_text,
                         text=text,
                     )
+
                     previous = text
 
                 except TelegramError:
@@ -2266,13 +2577,18 @@ class Service:
                         except RateLimit as exc:
                             warnings[str(exc)] = True
                             stats["errors"] += 1
+
                             outcome = "partial"
                             stop = True
                             break
 
-                        except (SourceError, ValueError) as exc:
+                        except (
+                            SourceError,
+                            ValueError,
+                        ) as exc:
                             warnings[str(exc)] = True
                             stats["errors"] += 1
+
                             outcome = "partial"
                             break
 
@@ -2320,7 +2636,9 @@ class Service:
                                 continue
 
                             try:
-                                ad, warning = await self.reader.enrich(ad)
+                                ad, warning = (
+                                    await self.reader.enrich(ad)
+                                )
 
                                 absent_profile = {
                                     name
@@ -2331,7 +2649,9 @@ class Service:
                                     if ad.get(name) is None
                                 }
 
-                                missing.update(absent_profile)
+                                missing.update(
+                                    absent_profile
+                                )
 
                                 if absent_profile:
                                     stats["profiles"] += 1
@@ -2360,6 +2680,7 @@ class Service:
                                     )
 
                                 stats["sent"] += 1
+
                                 await asyncio.sleep(1.1)
 
                             except Forbidden:
@@ -2368,6 +2689,7 @@ class Service:
                             except RateLimit as exc:
                                 warnings[str(exc)] = True
                                 stats["errors"] += 1
+
                                 outcome = "partial"
                                 stop = True
                                 break
@@ -2378,7 +2700,10 @@ class Service:
                                 TelegramError,
                             ) as exc:
                                 stats["errors"] += 1
-                                warnings[str(exc)[:220]] = True
+
+                                warnings[
+                                    str(exc)[:220]
+                                ] = True
 
                                 log.warning(
                                     "Объявление %s: %s",
@@ -2484,7 +2809,10 @@ class Service:
                     ),
                 )
 
-            if self.tasks.get(chat) is asyncio.current_task():
+            if (
+                self.tasks.get(chat)
+                is asyncio.current_task()
+            ):
                 self.tasks.pop(chat, None)
 
             if report_allowed and not self.closing:
@@ -2522,6 +2850,7 @@ class Service:
 
     async def close(self):
         self.closing = True
+
         tasks = list(self.tasks.values())
 
         for task in tasks:
@@ -2554,6 +2883,7 @@ async def handle(
         return
 
     service = context.application.bot_data["service"]
+
     text = message.text.strip()
     parts = text.split(maxsplit=1)
 
@@ -2604,12 +2934,16 @@ async def handle(
             if command == "/createpass":
                 password = "".join(
                     secrets.choice(
-                        string.ascii_letters + string.digits
+                        string.ascii_letters
+                        + string.digits
                     )
                     for _ in range(12)
                 )
 
-                save_user_password(target, password)
+                save_user_password(
+                    target,
+                    password,
+                )
 
                 await message.reply_text(
                     f"Пароль для {target}: "
@@ -2625,7 +2959,11 @@ async def handle(
 
                 block_user(target)
                 service.state(target)
-                service.save(target, enabled=0)
+
+                service.save(
+                    target,
+                    enabled=0,
+                )
 
                 await service.cancel_scan(target)
 
@@ -2651,6 +2989,7 @@ async def handle(
                     "Отправьте ссылку на категорию.",
                     reply_markup=get_main_menu(),
                 )
+
             else:
                 await message.reply_text(
                     "🔒 Бот приватный. "
@@ -2669,9 +3008,14 @@ async def handle(
             )
 
         elif command == "/help":
-            await message.reply_text(HELP_TEXT)
+            await message.reply_text(
+                HELP_TEXT
+            )
 
-        elif command in {"/filters", "/set"}:
+        elif command in {
+            "/filters",
+            "/set",
+        }:
             if argument:
                 state["rules"] = update_filters(
                     state["rules"],
@@ -2689,11 +3033,69 @@ async def handle(
             )
 
         elif command == "/reset":
-            service.save(chat.id, rules={})
+            service.save(
+                chat.id,
+                rules={},
+            )
 
             await message.reply_text(
                 "✅ Фильтры сброшены."
             )
+
+        elif command == "/testproxy":
+            if not service.reader.proxy_url:
+                await message.reply_text(
+                    "Добавьте OPENSOOQ_PROXY_URL "
+                    "в Environment на Render "
+                    "и перезапустите сервис."
+                )
+                return
+
+            await message.reply_text(
+                "Проверяю профиль chilltime Ali "
+                "через настроенный прокси…"
+            )
+
+            try:
+                raw, _ = await service.reader.get(
+                    "https://kw.opensooq.com/en/mid/"
+                    "member-103907011724500523077"
+                )
+
+                profile = await asyncio.to_thread(
+                    parse_profile,
+                    raw,
+                    "39101505",
+                )
+
+                def value(key):
+                    item = profile.get(key)
+
+                    return (
+                        "нет данных"
+                        if item is None
+                        else str(item)
+                    )
+
+                await message.reply_text(
+                    "Профиль загружен: HTTP 200.\n"
+                    f"Просмотры: {value('seller_views')}\n"
+                    f"Активных объявлений: "
+                    f"{value('listings_count')}\n"
+                    f"Продано: {value('sold')}\n"
+                    f"Рейтинг: {value('rating')}\n"
+                    f"Оценок: {value('ratings')}\n"
+                    f"Отзывов: {value('reviews')}"
+                )
+
+            except (
+                SourceError,
+                ValueError,
+            ) as exc:
+                await message.reply_text(
+                    "Проверка профиля: "
+                    + error_text(exc)[:700]
+                )
 
         elif command == "/sources":
             sources = "\n".join(
@@ -2707,7 +3109,8 @@ async def handle(
             await message.reply_text(
                 (
                     sources
-                    or "Категории не добавлены. Отправьте ссылку."
+                    or "Категории не добавлены. "
+                    "Отправьте ссылку."
                 )[:3900],
                 disable_web_page_preview=True,
             )
@@ -2743,16 +3146,28 @@ async def handle(
             service.save(
                 chat.id,
                 minutes=minutes,
-                next_check=time.time() + minutes * 60,
+                next_check=(
+                    time.time()
+                    + minutes * 60
+                ),
             )
 
             await message.reply_text(
                 f"Интервал: {minutes} мин."
             )
 
-        elif command in {"/pause", "/stop"}:
-            service.save(chat.id, enabled=0)
-            await service.cancel_scan(chat.id)
+        elif command in {
+            "/pause",
+            "/stop",
+        }:
+            service.save(
+                chat.id,
+                enabled=0,
+            )
+
+            await service.cancel_scan(
+                chat.id
+            )
 
             await message.reply_text(
                 "⏸ Мониторинг остановлен."
@@ -2789,7 +3204,10 @@ async def handle(
                 "/restart",
                 "/add",
             }
-            or text.startswith(("https://", "http://"))
+            or text.startswith((
+                "https://",
+                "http://",
+            ))
         ):
             is_link = text.startswith((
                 "https://",
@@ -2798,7 +3216,9 @@ async def handle(
 
             if command == "/add" or is_link:
                 url = safe_url(
-                    argument if command == "/add" else text
+                    argument
+                    if command == "/add"
+                    else text
                 )
 
                 if re.search(
@@ -2829,7 +3249,10 @@ async def handle(
                 )
 
             if command == "/watch":
-                service.save(chat.id, enabled=1)
+                service.save(
+                    chat.id,
+                    enabled=1,
+                )
 
             if command == "/restart":
                 await service.cancel_scan(chat.id)
@@ -2844,7 +3267,8 @@ async def handle(
 
         else:
             await message.reply_text(
-                "Отправьте ссылку на категорию или /help."
+                "Отправьте ссылку на категорию "
+                "или /help."
             )
 
     except ValueError as exc:
@@ -2876,6 +3300,7 @@ async def button_handler(
                 "Доступ закрыт.",
                 show_alert=True,
             )
+
         return
 
     await query.answer()
@@ -2883,7 +3308,10 @@ async def button_handler(
     state = service.state(chat.id)
     data = query.data
 
-    if data in {"menu_check", "restart_scan"}:
+    if data in {
+        "menu_check",
+        "restart_scan",
+    }:
         if not state["urls"]:
             await query.message.reply_text(
                 "Сначала добавьте категорию.",
@@ -2892,7 +3320,9 @@ async def button_handler(
             return
 
         if data == "restart_scan":
-            await service.cancel_scan(chat.id)
+            await service.cancel_scan(
+                chat.id
+            )
 
         started = service.trigger(chat.id)
 
@@ -2916,7 +3346,10 @@ async def button_handler(
                 state["urls"],
                 1,
             )
-        ) or "Категории не добавлены. Отправьте ссылку."
+        ) or (
+            "Категории не добавлены. "
+            "Отправьте ссылку."
+        )
 
         await query.message.reply_text(
             text[:3900],
@@ -2948,10 +3381,12 @@ def build_app(token, allowed, database):
         app.bot_data["service"] = service
 
         log.info(
-            "[startup] database=%s data_dir=%s browser=%s",
+            "[startup] database=%s "
+            "data_dir=%s browser=%s proxy=%s",
             Path(database).resolve(),
             DATA_DIR.resolve(),
             USE_BROWSER,
+            bool(service.reader.proxy_url),
         )
 
         if os.getenv("PORT"):
@@ -2959,7 +3394,10 @@ def build_app(token, allowed, database):
                 def do_GET(self):
                     status = (
                         200
-                        if self.path in {"/", "/healthz"}
+                        if self.path in {
+                            "/",
+                            "/healthz",
+                        }
                         else 404
                     )
 
@@ -2971,7 +3409,10 @@ def build_app(token, allowed, database):
                     pass
 
             server = ThreadingHTTPServer(
-                ("0.0.0.0", int(os.environ["PORT"])),
+                (
+                    "0.0.0.0",
+                    int(os.environ["PORT"]),
+                ),
                 HealthHandler,
             )
 
@@ -3002,6 +3443,10 @@ def build_app(token, allowed, database):
             BotCommand("status", "Статус и отчёт"),
             BotCommand("help", "Справка"),
             BotCommand("id", "Мой ID"),
+            BotCommand(
+                "testproxy",
+                "Проверить прокси и просмотры",
+            ),
         ])
 
     async def cleanup(app):
@@ -3014,6 +3459,7 @@ def build_app(token, allowed, database):
             await asyncio.to_thread(
                 server.shutdown
             )
+
             server.server_close()
 
         service = app.bot_data.pop(
@@ -3077,7 +3523,10 @@ if __name__ == "__main__":
         logging.WARNING
     )
 
-    token = os.getenv("BOT_TOKEN", "").strip()
+    token = os.getenv(
+        "BOT_TOKEN",
+        "",
+    ).strip()
 
     if not token:
         raise SystemExit(
