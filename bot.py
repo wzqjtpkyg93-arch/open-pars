@@ -49,6 +49,43 @@ CDN = "https://opensooq-imagesv2.os-cdn.com/previews/700x0/"
 log = logging.getLogger("opensooq")
 EXCLUDED_WORDS = ["car", "cars", "auto", "autos", "kia", "gmc", "toyota", "nissan", "chevrolet", "ford", "bmw", "mercedes", "audi", "hyundai", "apartment", "flat", "real estate", "rent", "rental", "delivery", "service", "job", "vacancy", "سيارة", "سيارات", "شقة", "شقق", "عقار", "ايجار", "تأجير", "خدمة", "وظيفة"]
 EXCLUDED_RE = re.compile(r"(?<!\w)(?:" + "|".join(re.escape(w) for w in EXCLUDED_WORDS) + r")(?!\w)", re.I)
+# Коды приходят от OpenSooq для каждой карточки, независимо от языка заголовка.
+EXCLUDED_CATEGORY_PREFIXES = (
+    "autos", "vehicles", "cars", "realestate", "propertyfor", "propertiesfor",
+    "services", "jobs", "jobopenings", "jobseekers", "employment",
+)
+TOPIC_FALLBACK_RE = re.compile(
+    r"(?<!\w)(?:cars?\s+for\s+(?:sale|rent)|(?:apartment|flat|villa|room|warehouse)s?\s+for\s+(?:rent|sale)"
+    r"|لل(?:ايجار|تاجير)|سيارات?|شقق?|عقارات?|فلل|فيلا|جيب|مستودعات?|وظائف|وظيفة|خدمات)(?!\w)", re.I)
+
+
+def category_codes(value):
+    if not isinstance(value, dict):
+        return "", ""
+    def first(keys):
+        return next((value[k].strip() for k in keys if isinstance(value.get(k), str) and value[k].strip()), "")
+    return (
+        first(("cat1_code", "categoryReportingName", "category_reporting_name", "category_code", "cat_code")),
+        first(("cat2_code", "subCategoryReportingName", "subcategory_reporting_name", "subcategory_code")),
+    )
+
+
+def excluded_topic(ad):
+    """Классифицируем именно объявление, а не тип аккаунта продавца."""
+    codes = [re.sub(r"[^a-z0-9]", "", str(ad.get(k) or "").lower())
+             for k in ("category_code", "subcategory_code")]
+    if codes[0]:
+        return "category:" + codes[0] if codes[0].startswith(EXCLUDED_CATEGORY_PREFIXES) else ""
+    # При известной разрешённой категории слова car/rent/service сами по себе
+    # не должны скрывать игрушку, запчасть для электроники или мебель.
+    if codes[1] and codes[1].startswith(EXCLUDED_CATEGORY_PREFIXES):
+        return "category:" + codes[1]
+    title = unicodedata.normalize("NFKC", str(ad.get("title") or ""))
+    title = re.sub(r"[\u064b-\u065f\u0670ـ]", "", title)
+    title = title.translate(str.maketrans({"أ": "ا", "إ": "ا", "آ": "ا"}))
+    if EXCLUDED_RE.search(title) or TOPIC_FALLBACK_RE.search(title):
+        return "title"
+    return ""
 
 class SourceError(Exception):
     pass
@@ -449,6 +486,7 @@ def parse_category_dom(soup, url, documents):
             continue
         seen.add(ad_id)
         post = metadata.get(ad_id, {})
+        main_category, subcategory = category_codes(post)
         price_node = heading.find_previous_sibling("span")
         price_text = price_node.get_text(" ", strip=True) if price_node else ""
         currency_match = re.search(r"\b([A-Z]{3})\b", price_text)
@@ -463,6 +501,7 @@ def parse_category_dom(soup, url, documents):
             images=[image] if image else [],
             photos=count(camera.parent.get_text(" ", strip=True)) if camera else None,
             seller_id=str(post.get("member_id") or ""), seller_name="", seller_url="",
+            category_code=main_category, subcategory_code=subcategory,
             location=", ".join(filter(None, [plain(post.get("neighborhoodName") or node.get("data-nhood")),
                                             plain(post.get("city_reporting") or node.get("data-city"))])),
             published="", posted_label=relative_label(status.get_text(" ", strip=True)) if status else "")
@@ -507,6 +546,7 @@ def parse_category(raw, url):
             path = "/" + (locale if locale in {"ar", "en"} else "en") + path
         image = photo_url(row.get("image_uri"))
         ad = dict.fromkeys(METRICS)
+        main_category, subcategory = category_codes(row)
         ad.update(
             id=str(row["id"]), url=safe_url(path, url), title=plain(row["title"]),
             description=plain(row.get("masked_description")),
@@ -515,6 +555,7 @@ def parse_category(raw, url):
             views=count(row.get("views_count")), seller_id=str(row.get("member_id") or ""),
             seller_name=plain(row.get("member_display_name")), seller_url="",
             rating=number(row.get("member_rating_avg")), ratings=count(row.get("member_rating_count")),
+            category_code=main_category, subcategory_code=subcategory,
             location=", ".join(filter(None, [plain(row.get("nhood_label")), plain(row.get("city_label"))])),
             published=publication(row.get("inserted_date")), posted_label=relative_label(row.get("posted_at")),
         )
@@ -543,6 +584,14 @@ def parse_listing(raw, ad):
     if data is None:
         raise SourceError("Не удалось прочитать данные объявления.")
     info = data["commonInfo"]
+    # Только метаданные выбранного объявления: рекомендации других категорий
+    # на этой же странице не участвуют в классификации.
+    for metadata in walk(data.get("loggingData") or {}):
+        main_category, subcategory = category_codes(metadata)
+        if main_category:
+            ad["category_code"] = main_category
+            ad["subcategory_code"] = subcategory
+            break
     owner = info.get("ownerData") or {}
     ad["title"] = plain(info.get("topTitle")) or ad["title"]
     ad["description"] = plain(info.get("description")) or ad.get("description", "")
@@ -760,11 +809,17 @@ class Reader:
         return profile, issue
 
     async def enrich(self, ad, rules=None):
+        if excluded_topic(ad):
+            ad["_filtered_before_profile"] = True
+            return ad, ""
         raw, final = await self.get(ad["url"])
         if urlsplit(final).hostname != urlsplit(ad["url"]).hostname:
             raise SourceError("Объявление перенаправило на другую страну.")
         ad["url"] = final
         ad = await asyncio.to_thread(parse_listing, raw, ad)
+        if excluded_topic(ad):
+            ad["_filtered_before_profile"] = True
+            return ad, ""
         if rules:
             # Эти поля уже окончательны после загрузки объявления и не меняются
             # профилем. Неизвестное поле здесь не является причиной отказа.
@@ -1080,8 +1135,9 @@ class Service:
                             if source not in self.state(chat)["urls"] or not self.permitted(chat):
                                 break
                             stats["checked"] += 1
-                            if EXCLUDED_RE.search(ad["title"]):
+                            if excluded_topic(ad):
                                 stats["filtered"] += 1
+                                stats["topic_skipped"] += 1
                                 continue
                             try:
                                 rules = self.state(chat)["rules"]
@@ -1157,7 +1213,7 @@ class Service:
             if missing:
                 log.warning("[scan_missing] chat=%s fields=%s", chat, ",".join(sorted(missing)))
             report = report_text(stats, time.monotonic() - started, outcome, warnings, missing)
-            log.info("[scan_done] chat=%s outcome=%s pages=%s sent=%s duplicates=%s filtered=%s errors=%s", chat, outcome, stats["pages"], stats["sent"], stats["duplicates"], stats["filtered"], stats["errors"])
+            log.info("[scan_done] chat=%s outcome=%s pages=%s sent=%s duplicates=%s filtered=%s topic_skipped=%s errors=%s", chat, outcome, stats["pages"], stats["sent"], stats["duplicates"], stats["filtered"], stats["topic_skipped"], stats["errors"])
             with suppress(sqlite3.Error):
                 self.save(chat, last=report, next_check=time.time() + self.state(chat)["minutes"] * 60)
             # Удаляем только собственную задачу, чтобы не затронуть новый запуск.
@@ -1411,7 +1467,7 @@ def filters_text(state):
         "разрешены при числовых ограничениях" if rules.get("unknown") == "include"
         else "исключаются при заданных ограничениях"),
         "Слова для поиска работают по принципу «хотя бы одно».",
-        "Встроенный список исключённых тематик из EXCLUDED_WORDS также действует."])
+        "Авто, недвижимость, услуги и вакансии исключаются по категории ещё до загрузки карточки. Если категория неизвестна — используется заголовок."])
     return "\n".join(lines)
 
 
