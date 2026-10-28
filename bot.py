@@ -1630,3 +1630,771 @@ async def panel(update, context, screen="home", notice=""):
         keyboard = get_main_menu()
     else:
         active = chat in service.tasks and not service.tasks[chat].done()
+        countries = ", ".join(dict.fromkeys(source_country(url) for url in state["urls"])) or "не выбрана"
+        text = ("🔎 <b>Панель поиска OpenSooq</b>\n\n"
+            f"🌍 {countries}\n"
+            f"🔗 Категорий: <b>{len(state['urls'])}/5</b>\n"
+            f"⚙️ Настроек фильтров: <b>{len(state['rules'])}</b>\n"
+            f"💾 Сохранённых поисков: <b>{len(saved_rows(service, chat))}</b>\n"
+            f"⏱ Мониторинг: {'включён' if state['enabled'] else 'выключен'} · {state['minutes']} мин.\n"
+            f"{'⏳ Поиск выполняется или ожидает очереди.' if active else 'Готов к запуску.'}\n\n"
+            "Выберите действие ниже.")
+        keyboard = get_main_menu()
+    if screen == "home" and update.effective_user.id == ADMIN_ID:
+        keyboard = InlineKeyboardMarkup(list(keyboard.inline_keyboard) + [[InlineKeyboardButton("👑 Пользователи", callback_data="ui:admin")]])
+    if notice:
+        text = escape(notice) + "\n\n" + text
+    await show_panel(update, text, keyboard)
+
+
+async def ask_field(update, context, action, prompt, **payload):
+    context.user_data["panel_form"] = dict(action=action, payload=payload, expires=time.time() + 600)
+    await show_panel(update, prompt + "\n\nОтправьте ответ одним сообщением. Отмена: /cancel",
+        ui_keyboard([[ ("Отмена", "ui:cancel") ]]))
+
+
+async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message, user, chat = update.effective_message, update.effective_user, update.effective_chat
+    service = context.application.bot_data["service"]
+    if not message or not message.text or not user or not chat or chat.type != "private":
+        return
+    if await billing_message(update, context):
+        return
+    if not service.permitted(user.id):
+        await handle_commands(update, context)
+        return
+    text = message.text.strip()
+    command = text.split(maxsplit=1)[0].split("@")[0].lower() if text else ""
+    form = context.user_data.get("panel_form")
+    if text.startswith("/"):
+        context.user_data.pop("panel_form", None)
+        if command in {"/admin", "/users", "/revokepass", "/revoke"}:
+            if user.id != ADMIN_ID:
+                await message.reply_text("Эта команда доступна только администратору.")
+                return
+            if command in {"/revokepass", "/revoke"}:
+                try:
+                    target = admin_target(text.split(maxsplit=1)[1])
+                    await service.revoke_access(target)
+                    await message.reply_text(f"🚫 Пароль и доступ пользователя {target} отозваны. Мониторинг остановлен.")
+                except (ValueError, IndexError) as exc:
+                    await message.reply_text(str(exc) if isinstance(exc, ValueError) else "Используйте /revokepass ID")
+            else:
+                await admin_panel(update, context)
+            return
+        if command in {"/start", "/cancel", "/sources", "/saved", "/status"}:
+            await panel(update, context, {"/sources": "sources", "/saved": "saved", "/status": "status"}.get(command, "home"))
+            return
+        if command == "/filters" and len(text.split(maxsplit=1)) == 1:
+            await panel(update, context, "filters")
+            return
+        await handle_commands(update, context)
+        return
+    if form:
+        if form["expires"] < time.time():
+            context.user_data.pop("panel_form", None)
+            await panel(update, context, notice="Время ввода истекло. Выберите действие заново.")
+            return
+        action, payload = form["action"], form["payload"]
+        state = service.state(chat.id)
+        screen, notice = "home", "✅ Сохранено."
+        try:
+            if action in {"add", "replace"}:
+                url = checked_source(text)
+                urls = list(state["urls"])
+                if action == "replace":
+                    old = payload["url"]
+                    if old not in urls:
+                        raise ValueError("Категория уже изменена. Отмените ввод и откройте список заново.")
+                    if url in urls and url != old:
+                        raise ValueError("Такая категория уже есть.")
+                    urls[urls.index(old)] = url
+                else:
+                    if url in urls:
+                        raise ValueError("Эта категория уже добавлена.")
+                    if len(urls) >= 5:
+                        raise ValueError("Максимум 5 категорий. Сначала удалите одну.")
+                    urls.append(url)
+                service.save(chat.id, urls=urls)
+                screen = "sources"
+            elif action in {"filter", "range"}:
+                if action == "range":
+                    metric = payload["metric"]
+                    rules = metric_input(state["rules"], metric, text)
+                    notice = f"✅ {FILTER_LABELS[metric]}: {ui_range(rules, metric)}. Фильтр сохранён."
+                else:
+                    field = payload["field"]
+                    metric, _, bound = field.rpartition("_")
+                    range_text = re.fullmatch(r"(?:от\s*)?\d+(?:[.,]\d+)?\s*(?:-|–|—|\.\.|до)\s*\d+(?:[.,]\d+)?", text, re.I)
+                    if metric in FILTER_LABELS and bound in {"min", "max"} and range_text:
+                        rules = metric_input(state["rules"], metric, text)
+                        notice = f"✅ {FILTER_LABELS[metric]}: {ui_range(rules, metric)}. Фильтр сохранён."
+                    else:
+                        rules = update_filters(state["rules"], field + "=" + shlex.quote(text))
+                        label = TEXT_LABELS.get(field, FILTER_LABELS.get(metric, field))
+                        display = ui_range(rules, metric) if metric in FILTER_LABELS else str(rules.get(field) or "не задано")
+                        notice = f"✅ {label}: {display}. Фильтр сохранён."
+                service.save(chat.id, rules=rules)
+                screen = "filters"
+            elif action == "save":
+                save_search(service, chat.id, text)
+                screen, notice = "saved", "💾 Поиск сохранён."
+            elif action == "admin_target":
+                if user.id != ADMIN_ID:
+                    raise ValueError("Доступ закрыт.")
+                target = admin_target(text)
+                context.user_data.pop("panel_form", None)
+                await admin_confirmation(update, context, payload["kind"], target)
+                return
+            elif action == "interval":
+                minutes = int(text)
+                if not 5 <= minutes <= 1440:
+                    raise ValueError("Введите число от 5 до 1440.")
+                service.save(chat.id, minutes=minutes, next_check=time.time() + minutes * 60)
+                screen = "monitor"
+            context.user_data.pop("panel_form", None)
+            await panel(update, context, screen, notice)
+        except ValueError as exc:
+            await message.reply_text(str(exc)[:800] + "\nПопробуйте ещё раз или /cancel.")
+        return
+    if text.startswith(("http://", "https://")):
+        try:
+            url = checked_source(text)
+            urls = service.state(chat.id)["urls"]
+            if url in urls:
+                await panel(update, context, "sources", "Эта категория уже есть.")
+                return
+            if len(urls) >= 5:
+                raise ValueError("Максимум 5 категорий. Удалите одну или замените её.")
+            service.save(chat.id, urls=urls + [url])
+            await panel(update, context, "sources", "✅ Категория добавлена. Для запуска нажмите «Начать поиск».")
+        except ValueError as exc:
+            await message.reply_text(str(exc))
+        return
+    await panel(update, context)
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query, user, chat = update.callback_query, update.effective_user, update.effective_chat
+    service = context.application.bot_data["service"]
+    if query and user and chat and chat.type == "private" and (query.data or "").startswith("bill:"):
+        await billing_callback(update, context)
+        return
+    if not query or not user or not chat or chat.type != "private" or not service.permitted(user.id):
+        if query:
+            await query.answer("Доступ закрыт.", show_alert=True)
+        return
+    await query.answer()
+    context.user_data.pop("panel_form", None)
+    data, state = query.data or "", service.state(chat.id)
+    back = [("‹ Главное меню", "menu_home")]
+    try:
+        navigation = {"menu_home": "home", "menu_sources": "sources", "menu_filters": "filters",
+                      "menu_status": "status", "ui:saved": "saved", "ui:monitor": "monitor", "ui:cancel": "home"}
+        if data.startswith("ui:admin"):
+            if user.id != ADMIN_ID:
+                raise ValueError("Админ-панель доступна только владельцу.")
+            await admin_callback(update, context, data)
+        elif data in navigation:
+            await panel(update, context, navigation[data])
+        elif data in {"menu_check", "restart_scan", "ui:watch"}:
+            if not state["urls"]:
+                await panel(update, context, "sources", "Сначала добавьте категорию.")
+                return
+            if data == "restart_scan":
+                await service.cancel_scan(chat.id)
+            if data == "ui:watch":
+                service.save(chat.id, enabled=1)
+            started = service.trigger(chat.id)
+            await panel(update, context, notice="🚀 Поиск запущен." if started else "⏳ Поиск уже выполняется.")
+        elif data == "menu_stop":
+            service.save(chat.id, enabled=0)
+            await service.cancel_scan(chat.id)
+            await panel(update, context, notice="⏸ Поиск и мониторинг остановлены.")
+        elif data == "menu_help":
+            await show_panel(update, HELP_TEXT + "\n/saved — сохранённые поиски\n/cancel — отменить ввод\n\nСсылки можно добавлять, заменять и удалять кнопками в разделе «Категории».\nОтправленная ссылка сохраняется; запуск выполняется кнопкой «Начать поиск».", get_main_menu())
+        elif data == "ui:add":
+            await ask_field(update, context, "add", "🔗 <b>Добавить категорию</b>\nОтправьте ссылку на категорию или выдачу OpenSooq.")
+        elif data.startswith(("ui:replace:", "ui:delete:", "ui:delete_yes:")):
+            key = data.rsplit(":", 1)[1]
+            url = next((url for url in state["urls"] if source_key(url) == key), None)
+            if url is None:
+                raise ValueError("Эта категория уже изменена или удалена.")
+            if data.startswith("ui:replace:"):
+                await ask_field(update, context, "replace", "✏️ <b>Заменить категорию</b>\nТекущая ссылка:\n" + ui_url(url) + "\n\nОтправьте новую ссылку.", url=url)
+            elif data.startswith("ui:delete_yes:"):
+                service.save(chat.id, urls=[item for item in state["urls"] if item != url])
+                if len(state["urls"]) == 1:
+                    service.save(chat.id, enabled=0)
+                    await service.cancel_scan(chat.id)
+                await panel(update, context, "sources", "🗑 Категория удалена.")
+            else:
+                await show_panel(update, "🗑 <b>Удалить эту категорию?</b>\n\n" + ui_url(url),
+                    ui_keyboard([[ ("Да, удалить", "ui:delete_yes:" + key) ], [("Отмена", "menu_sources")]]))
+        elif data == "ui:countries":
+            await show_panel(update, "🌍 <b>Выберите страну</b>\n\nБудет предложена общая выдача выбранной страны.",
+                ui_keyboard([[(label, "ui:country:" + code)] for code, label in COUNTRY_LABELS.items()] + [back]))
+        elif data.startswith("ui:country:"):
+            code = data.rsplit(":", 1)[1]
+            if code not in COUNTRY_LABELS:
+                raise ValueError("Неизвестная страна.")
+            await show_panel(update, f"🌍 <b>{COUNTRY_LABELS[code]}</b>\n\nЗаменить текущие категории общей выдачей этой страны?\nФильтры сохранятся — проверьте выбранную валюту.\nМониторинг будет остановлен. Сохраните текущий поиск заранее, если он нужен.",
+                ui_keyboard([[("Заменить категории", "ui:country_yes:" + code)], [("Отмена", "menu_sources")]]))
+        elif data.startswith("ui:country_yes:"):
+            code = data.rsplit(":", 1)[1]
+            if code not in COUNTRY_LABELS:
+                raise ValueError("Неизвестная страна.")
+            service.save(chat.id, enabled=0)
+            await service.cancel_scan(chat.id)
+            service.save(chat.id, urls=[f"https://{code}.opensooq.com/en/find?search=true&sort_code=recent"])
+            await panel(update, context, "sources", "✅ Страна изменена. Проверьте фильтры и нажмите «Начать поиск».")
+        elif data.startswith("ui:metric:"):
+            metric = data.rsplit(":", 1)[1]
+            if metric not in FILTER_LABELS:
+                raise ValueError("Неизвестный фильтр.")
+            context.user_data["panel_form"] = dict(action="range", payload={"metric": metric}, expires=time.time() + 600)
+            await show_panel(update, f"⚙️ <b>{FILTER_LABELS[metric]}</b>\n\nСейчас: <b>{escape(ui_range(state['rules'], metric))}</b>\n\nОтправьте диапазон одним сообщением: <code>1-99999</code>.\nОдно число задаёт максимум.\nФильтр сохранится автоматически.\n\nТакже можно отдельно выбрать минимум или максимум кнопками ниже.\nСнять обе границы: <code>off</code>. Отмена: /cancel.", ui_keyboard([
+                [("Минимум", "ui:field:" + metric + "_min"), ("Максимум", "ui:field:" + metric + "_max")],
+                [("Убрать ограничение", "ui:clear:" + metric)], [("‹ Все фильтры", "menu_filters")]]))
+        elif data.startswith("ui:field:"):
+            field = data.rsplit(":", 1)[1]
+            metric, _, bound = field.rpartition("_")
+            if field in TEXT_LABELS:
+                label = TEXT_LABELS[field]
+                hint = "Слова через запятую, например: iphone,samsung." if field != "currency" else "Код из трёх букв, например AED."
+            elif metric in FILTER_LABELS and bound in {"min", "max"}:
+                label = FILTER_LABELS[metric] + (" — минимум" if bound == "min" else " — максимум")
+                hint = "Одно число. Для снятия ограничения: off."
+            else:
+                raise ValueError("Неизвестное поле.")
+            await ask_field(update, context, "filter", f"⚙️ <b>{label}</b>\n{hint}\nТекущее значение: {escape(str(state['rules'].get(field, 'не задано')))}\nДля удаления значения отправьте off.", field=field)
+        elif data.startswith("ui:clear:"):
+            metric = data.rsplit(":", 1)[1]
+            if metric not in FILTER_LABELS:
+                raise ValueError("Неизвестный фильтр.")
+            rules = dict(state["rules"])
+            rules.pop(metric + "_min", None)
+            rules.pop(metric + "_max", None)
+            service.save(chat.id, rules=rules)
+            await panel(update, context, "filters", "✅ Ограничение снято.")
+        elif data == "ui:currency":
+            await show_panel(update, "💱 <b>Валюта цены</b>\n\nОбъявления с другой валютой будут исключаться. Пересчёта валют нет.", ui_keyboard([
+                [(code, "ui:currency_set:" + code) for code in ("KWD", "AED", "SAR", "BHD")],
+                [("Любая валюта", "ui:currency_set:off"), ("Другая", "ui:field:currency")], [("‹ Фильтры", "menu_filters")]]))
+        elif data.startswith("ui:currency_set:"):
+            rules = update_filters(state["rules"], "currency=" + data.rsplit(":", 1)[1])
+            service.save(chat.id, rules=rules)
+            await panel(update, context, "filters", "✅ Валюта сохранена.")
+        elif data == "ui:unknown":
+            await show_panel(update, "❔ <b>Если значение неизвестно</b>\n\nПример: задан минимум просмотров, но профиль недоступен.\n«Исключать» — такое объявление не отправляется.\n«Разрешать» — может отправиться, если остальные фильтры подходят.", ui_keyboard([
+                [("Исключать", "ui:unknown_set:exclude"), ("Разрешать", "ui:unknown_set:include")], [("‹ Фильтры", "menu_filters")]]))
+        elif data.startswith("ui:unknown_set:"):
+            rules = update_filters(state["rules"], "unknown=" + data.rsplit(":", 1)[1])
+            service.save(chat.id, rules=rules)
+            await panel(update, context, "filters", "✅ Настройка сохранена.")
+        elif data == "ui:reset":
+            await show_panel(update, "↺ <b>Сбросить все пользовательские фильтры?</b>\nКатегории и сохранённые поиски останутся.", ui_keyboard([
+                [("Сбросить", "ui:reset_yes"), ("Отмена", "menu_filters")]]))
+        elif data == "ui:reset_yes":
+            service.save(chat.id, rules={})
+            await panel(update, context, "filters", "✅ Фильтры сброшены.")
+        elif data == "ui:save":
+            if not state["urls"]:
+                raise ValueError("Сначала добавьте категорию.")
+            await ask_field(update, context, "save", "💾 <b>Сохранить текущий поиск</b>\nВведите название, например: ОАЭ · телефоны.\nСохранятся категории, фильтры и интервал.")
+        elif data.startswith(("ui:search:", "ui:load:", "ui:load_yes:", "ui:drop:", "ui:drop_yes:")):
+            search_id = int(data.rsplit(":", 1)[1])
+            row = saved_row(service, chat.id, search_id)
+            if data.startswith("ui:load_yes:"):
+                name = await load_search(service, chat.id, search_id)
+                await panel(update, context, notice=f"✅ Загружен поиск «{name}». Для запуска нажмите «Начать поиск».")
+            elif data.startswith("ui:drop_yes:"):
+                with service.db:
+                    service.db.execute("DELETE FROM saved_searches WHERE chat=? AND id=?", (chat.id, search_id))
+                await panel(update, context, "saved", "🗑 Сохранённый поиск удалён. Текущие настройки не менялись.")
+            elif data.startswith("ui:load:"):
+                await show_panel(update, "💾 <b>Загрузить поиск «" + escape(row["name"]) + "»?</b>\n\nТекущие категории и фильтры будут заменены. Мониторинг остановится. История отправок сохранится.", ui_keyboard([
+                    [("Загрузить", f"ui:load_yes:{search_id}"), ("Отмена", "ui:saved")]]))
+            elif data.startswith("ui:drop:"):
+                await show_panel(update, "🗑 Удалить сохранённый поиск «" + escape(row["name"]) + "»?", ui_keyboard([
+                    [("Удалить", f"ui:drop_yes:{search_id}"), ("Отмена", "ui:saved")]]))
+            else:
+                config = json.loads(row["config"])
+                detail = "💾 <b>" + escape(row["name"]) + "</b>\n\n"
+                detail += "\n".join(ui_url(url) for url in config["urls"])
+                detail += f"\n\nИнтервал: {config['minutes']} мин.\n\n" + filters_text(config)
+                await show_panel(update, detail, ui_keyboard([
+                    [("📂 Загрузить", f"ui:load:{search_id}"), ("🗑 Удалить", f"ui:drop:{search_id}")], [("‹ Мои поиски", "ui:saved")]]))
+        elif data == "ui:custom_interval":
+            await ask_field(update, context, "interval", "⏱ <b>Интервал мониторинга</b>\nВведите количество минут: от 5 до 1440.")
+        elif data.startswith("ui:interval:"):
+            minutes = int(data.rsplit(":", 1)[1])
+            if not 5 <= minutes <= 1440:
+                raise ValueError("Интервал: 5–1440 минут.")
+            service.save(chat.id, minutes=minutes, next_check=time.time() + minutes * 60)
+            await panel(update, context, "monitor", "✅ Интервал сохранён.")
+        else:
+            await panel(update, context)
+    except ValueError as exc:
+        await query.message.reply_text(str(exc)[:800], reply_markup=get_main_menu())
+
+
+
+def admin_target(value):
+    try:
+        target = int(str(value).strip())
+    except (ValueError, TypeError):
+        raise ValueError("Укажите Telegram ID пользователя числом.") from None
+    if target <= 0:
+        raise ValueError("Telegram ID должен быть положительным.")
+    if target == ADMIN_ID:
+        raise ValueError("Доступ администратора изменять нельзя.")
+    return target
+
+
+async def admin_panel(update, context, page=0, notice=""):
+    if update.effective_user.id != ADMIN_ID:
+        raise ValueError("Доступ закрыт.")
+    service = context.application.bot_data["service"]
+    known = set(service.allowed) | set(service.revoked)
+    for table in ("users", "authorized"):
+        known.update(row["chat"] for row in service.db.execute("SELECT chat FROM " + table))
+    users = sorted(target for target in known if target > 0 and target != ADMIN_ID)
+    pages = max(1, (len(users) + 9) // 10)
+    page = max(0, min(page, pages - 1))
+    lines = ["👑 <b>Пользователи</b>", "", f"Известных пользователей: <b>{len(users)}</b>",
+             "🟢 доступ открыт · 🚫 отозван · ⛔ заблокирован · ⚪ ожидает входа", ""]
+    rows = []
+    for target in users[page * 10:(page + 1) * 10]:
+        badge = "⛔" if is_blocked(target) else "🚫" if target in service.revoked else "🟢" if service.permitted(target) else "⚪"
+        lines.append(f"{badge} <code>{target}</code>")
+        rows.append([(f"{badge} {target}", f"ui:admin:user:{target}")])
+    navigation = []
+    if page:
+        navigation.append(("‹ Назад", f"ui:admin:page:{page-1}"))
+    if page + 1 < pages:
+        navigation.append(("Далее ›", f"ui:admin:page:{page+1}"))
+    if navigation:
+        rows.append(navigation)
+    rows.extend([
+        [("🎁 Добавить часы / бесплатный период", "bill:gift")],
+        [("🔑 Выдать пароль", "ui:admin:choose:create"), ("🚫 Отозвать доступ", "ui:admin:choose:revoke")],
+        [("⛔ Блокировать", "ui:admin:choose:block"), ("✅ Разблокировать", "ui:admin:choose:unblock")],
+        [("‹ Главное меню", "menu_home")],
+    ])
+    text = "\n".join(lines)
+    if notice:
+        text = escape(notice) + "\n\n" + text
+    await show_panel(update, text, ui_keyboard(rows))
+
+
+async def admin_confirmation(update, context, kind, target):
+    if update.effective_user.id != ADMIN_ID:
+        raise ValueError("Доступ закрыт.")
+    target = admin_target(target)
+    descriptions = {
+        "create": "Выдать новый пароль? Старый пароль и текущая авторизация будут отозваны, мониторинг остановится.",
+        "revoke": "Отозвать пароль и доступ? Пользователь потеряет авторизацию, его мониторинг остановится. Для возврата доступа нужно выдать новый пароль.",
+        "block": "Заблокировать пользователя и остановить его мониторинг?",
+        "unblock": "Снять блокировку пользователя? Отозванный пароль этим действием не восстанавливается.",
+    }
+    if kind not in descriptions:
+        raise ValueError("Неизвестное действие.")
+    await show_panel(update, f"👤 <code>{target}</code>\n\n" + descriptions[kind], ui_keyboard([
+        [("Подтвердить", f"ui:admin:apply:{kind}:{target}"), ("Отмена", "ui:admin")],
+    ]))
+
+
+async def admin_callback(update, context, data):
+    if update.effective_user.id != ADMIN_ID:
+        raise ValueError("Доступ закрыт.")
+    service = context.application.bot_data["service"]
+    parts = data.split(":")
+    if data == "ui:admin":
+        await admin_panel(update, context)
+    elif len(parts) == 4 and parts[2] == "page":
+        await admin_panel(update, context, int(parts[3]))
+    elif len(parts) == 4 and parts[2] == "choose":
+        kind = parts[3]
+        if kind not in {"create", "revoke", "block", "unblock"}:
+            raise ValueError("Неизвестное действие.")
+        await ask_field(update, context, "admin_target", "👤 <b>Telegram ID пользователя</b>\nПопросите пользователя отправить боту /id и пришлите полученное число.", kind=kind)
+    elif len(parts) == 4 and parts[2] == "user":
+        target = admin_target(parts[3])
+        state = service.state(target)
+        status = "заблокирован" if is_blocked(target) else "доступ отозван" if target in service.revoked else "доступ открыт" if service.permitted(target) else "ожидает входа"
+        await show_panel(update, f"👤 <b>Пользователь</b> <code>{target}</code>\n\nСтатус: {status}\nПодписка до: {access_date(service.access_until(target))}\nКатегорий: {len(state['urls'])}\nМониторинг: {'включён' if state['enabled'] else 'выключен'}", ui_keyboard([
+            [("🎁 Добавить часы", f"bill:gift:{target}")],
+            [("🔑 Новый пароль", f"ui:admin:confirm:create:{target}"), ("🚫 Отозвать", f"ui:admin:confirm:revoke:{target}")],
+            [("⛔ Блокировать", f"ui:admin:confirm:block:{target}"), ("✅ Разблокировать", f"ui:admin:confirm:unblock:{target}")],
+            [("‹ Пользователи", "ui:admin")],
+        ]))
+    elif len(parts) == 5 and parts[2] == "confirm":
+        await admin_confirmation(update, context, parts[3], admin_target(parts[4]))
+    elif len(parts) == 5 and parts[2] == "apply":
+        kind, target = parts[3], admin_target(parts[4])
+        if kind == "create":
+            await service.revoke_access(target)
+            password = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12))
+            save_user_password(target, password)
+            await update.callback_query.message.reply_text(
+                f"🔑 Новый пароль для <code>{target}</code>:\n<code>{password}</code>\n\nПередайте пароль пользователю. Его старый доступ отозван.", parse_mode="HTML")
+            notice = f"Пароль для {target} создан."
+        elif kind == "revoke":
+            await service.revoke_access(target)
+            notice = f"🚫 Пароль и доступ пользователя {target} отозваны."
+        elif kind == "block":
+            block_user(target)
+            service.state(target)
+            service.save(target, enabled=0)
+            await service.cancel_scan(target)
+            notice = f"⛔ Пользователь {target} заблокирован."
+        elif kind == "unblock":
+            unblock_user(target)
+            notice = f"✅ Блокировка пользователя {target} снята."
+        else:
+            raise ValueError("Неизвестное действие.")
+        await admin_panel(update, context, notice=notice)
+    else:
+        raise ValueError("Кнопка устарела. Откройте админ-панель заново.")
+
+
+def access_date(value):
+    return datetime.fromtimestamp(value, DISPLAY_TZ).strftime('%d.%m.%Y %H:%M %Z') if value else 'нет активного периода'
+
+
+class RocketError(ValueError):
+    pass
+
+
+class Billing:
+    def __init__(self, service):
+        self.service = service
+        self.token = os.getenv('XROCKET_API_TOKEN', '').strip()
+        self.network = 'testnet' if XROCKET_TESTNET else 'mainnet'
+        self.base = 'https://pay.api.testnet.xrocket.exchange' if XROCKET_TESTNET else 'https://pay.api.xrocket.exchange'
+        self.http = None
+        self.lock, self.api_lock = asyncio.Lock(), asyncio.Lock()
+        self.next_request = 0.0
+
+    async def request(self, method, path, **kwargs):
+        if not self.token:
+            raise RocketError('Оплата ещё не настроена. Обратитесь к владельцу.')
+        if self.http is None:
+            self.http = httpx.AsyncClient(timeout=15, trust_env=False, follow_redirects=False,
+                headers={'Authorization': 'Bearer ' + self.token, 'Accept': 'application/json'})
+        async with self.api_lock:
+            if self.next_request > time.monotonic() + 5:
+                raise RocketError('Платёжный сервис просит подождать. Повторите проверку позже.')
+            await asyncio.sleep(max(0, self.next_request - time.monotonic()))
+            self.next_request = time.monotonic() + 0.6
+            try:
+                response = await self.http.request(method, self.base + path, **kwargs)
+            except httpx.RequestError:
+                raise RocketError('Нет ответа от xRocket. Счёт сохранён, повторите проверку позже.') from None
+        if response.status_code == 429:
+            try:
+                delay = float(response.headers.get('Retry-After', '60'))
+            except ValueError:
+                delay = 60
+            self.next_request = time.monotonic() + (max(1, min(3600, delay)) if math.isfinite(delay) else 60)
+        if not 200 <= response.status_code < 300:
+            log.warning('[xrocket] HTTP %s method=%s', response.status_code, method)
+            raise RocketError(f'xRocket: HTTP {response.status_code}. Проверка доступна позже; владелец может посмотреть логи.')
+        try:
+            body = response.json()
+        except ValueError:
+            raise RocketError('Некорректный ответ xRocket.') from None
+        if not isinstance(body, dict):
+            raise RocketError('Некорректный формат ответа xRocket.')
+        # Current Pay API; варианты оболочки допускаются только с полями счёта.
+        for key in ('invoice', 'data'):
+            if isinstance(body.get(key), dict) and 'id' in body[key]:
+                body = body[key]
+                break
+        return body
+
+    def validate(self, order, invoice):
+        try:
+            valid = (isinstance(invoice, dict) and bool(invoice.get('id'))
+                and invoice.get('clientInvoiceId') == order['id']
+                and invoice.get('priceCurrency') == order['currency']
+                and Decimal(str(invoice.get('priceAmount'))) == Decimal(order['amount'])
+                and (not order['invoice'] or str(invoice['id']) == order['invoice']))
+        except (InvalidOperation, TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise RocketError('Счёт не прошёл проверку суммы, валюты или идентификатора. Доступ не изменён.')
+
+    async def create(self, chat, plan):
+        if not SUBSCRIPTIONS_ENABLED:
+            raise RocketError('Покупка подписок пока выключена.')
+        if not os.getenv('SUPPORT_USERNAME', '').strip():
+            raise RocketError('Владелец ещё не настроил контакт поддержки.')
+        if plan not in PLANS:
+            raise RocketError('Тариф отсутствует.')
+        async with self.lock:
+            db = self.service.db
+            row = db.execute("SELECT * FROM payment_orders WHERE chat=? AND plan=? AND network=? AND applied=0 AND status='pending' AND created>? ORDER BY created DESC LIMIT 1", (chat, plan, self.network, time.time()-1800)).fetchone()
+            existing = row is not None
+            if row is None:
+                hours, amount, _ = PLANS[plan]
+                order_id = secrets.token_hex(16)
+                with db:
+                    db.execute('INSERT INTO payment_orders(id,chat,plan,hours,amount,currency,created,network) VALUES (?,?,?,?,?,?,?,?)',
+                        (order_id, chat, plan, hours, amount, 'USDT', time.time(), self.network))
+                row = db.execute('SELECT * FROM payment_orders WHERE id=?', (order_id,)).fetchone()
+            order = dict(row)
+            if order['link']:
+                return order
+            invoice = None
+            if existing:
+                with suppress(RocketError):
+                    invoice = await self.request('GET', '/api/v1/invoice', params={'clientInvoiceId': order['id']})
+            if invoice is None:
+                payload = dict(priceAmount=order['amount'], priceCurrency='USDT', payoutCurrency='USDT',
+                    payCurrencies=['USDT'], numPayments=1, clientInvoiceId=order['id'], expiresIn=1800000,
+                    description='OpenSooq parser: ' + PLANS[plan][2], customer={'telegramId': str(chat)},
+                    isFeePaidByUser=False)
+                try:
+                    invoice = await self.request('POST', '/api/v1/invoices', json=payload)
+                except RocketError:
+                    invoice = await self.request('GET', '/api/v1/invoice', params={'clientInvoiceId': order['id']})
+            self.validate(order, invoice)
+            link = (invoice.get('links') or {}).get('telegramBotLink', '')
+            parsed = urlsplit(link)
+            if parsed.scheme != 'https' or parsed.hostname != 't.me' or parsed.username or parsed.password:
+                raise RocketError('xRocket не вернул корректную ссылку на оплату.')
+            with db:
+                db.execute('UPDATE payment_orders SET invoice=?, link=? WHERE id=?', (str(invoice['id']), link, order['id']))
+            return dict(db.execute('SELECT * FROM payment_orders WHERE id=?', (order['id'],)).fetchone())
+
+    async def check(self, order_id, chat=None):
+        async with self.lock:
+            db = self.service.db
+            row = db.execute('SELECT * FROM payment_orders WHERE id=? AND network=?', (order_id, self.network)).fetchone()
+            if row is None or (chat is not None and row['chat'] != chat):
+                raise RocketError('Счёт не найден для этого пользователя.')
+            order = dict(row)
+            if order['applied']:
+                return 'paid', False
+            if order['status'] in {'expired', 'cancelled'}:
+                return order['status'], False
+            with db:
+                db.execute('UPDATE payment_orders SET checked=? WHERE id=?', (time.time(), order_id))
+            invoice = await self.request('GET', '/api/v1/invoice', params={'clientInvoiceId': order_id})
+            self.validate(order, invoice)
+            status = invoice.get('status')
+            if status == 'paid':
+                # Одна транзакция: начисление и отметка счёта фиксируются вместе.
+                with db:
+                    fresh = db.execute('SELECT applied FROM payment_orders WHERE id=?', (order_id,)).fetchone()
+                    if fresh['applied']:
+                        return 'paid', False
+                    now = time.time()
+                    until = max(now, self.service.access_until(order['chat'])) + order['hours'] * 3600
+                    db.execute('INSERT INTO ' + self.service.subscription_table + ' VALUES (?,?) ON CONFLICT(chat) DO UPDATE SET until=excluded.until', (order['chat'], until))
+                    db.execute('INSERT INTO subscription_events VALUES (?,?,?,?,?)', ('pay:' + order_id, order['chat'], order['hours'], 0, now))
+                    db.execute("UPDATE payment_orders SET applied=1,status='paid',invoice=? WHERE id=?", (str(invoice['id']), order_id))
+                log.info('[subscription_paid] chat=%s plan=%s order=%s', order['chat'], order['plan'], order_id)
+                with suppress(TelegramError):
+                    await self.service.bot.send_message(chat_id=order['chat'], text='✅ Оплата подтверждена. Период начислен до ' + access_date(until) + '.\nОткройте /start. Настройки поиска сохранены. Если доступ отозван администратором, обратитесь в поддержку.')
+                return 'paid', True
+            if status in {'expired', 'cancelled'}:
+                with db:
+                    db.execute('UPDATE payment_orders SET status=? WHERE id=?', (status, order_id))
+            # unknown / active / partially_paid никогда не открывают доступ.
+            return str(status or 'unknown'), False
+
+    async def poll(self, context):
+        if not SUBSCRIPTIONS_ENABLED or not self.token or self.service.closing:
+            return
+        rows = list(self.service.db.execute("SELECT id FROM payment_orders WHERE applied=0 AND status='pending' AND network=? ORDER BY checked,created LIMIT 10", (self.network,)))
+        for row in rows:
+            try:
+                await self.check(row['id'])
+            except RocketError as exc:
+                log.warning('[payment_check] order=%s error=%s', row['id'], type(exc).__name__)
+        # Счета не удаляются по местным часам: поздний платёж сверяется с API.
+
+    async def close(self):
+        if self.http is not None:
+            await self.http.aclose()
+
+
+async def subscription_panel(update, context, notice=''):
+    service = context.application.bot_data['service']
+    user_id = update.effective_user.id
+    service.state(user_id)
+    status = '👑 Владелец: бесплатно и бессрочно.' if user_id == ADMIN_ID else 'Доступ до: ' + access_date(service.access_until(user_id))
+    support = os.getenv('SUPPORT_USERNAME', '').strip().lstrip('@')
+    text = '💳 <b>Подписка на парсер</b>\n\n' + escape(status) + '\n\n'
+    if XROCKET_TESTNET:
+        text += '🧪 <b>ТЕСТОВЫЙ РЕЖИМ: только тестовые средства.</b>\n\n'
+    if notice:
+        text += escape(notice) + '\n\n'
+    text += 'Оплата в USDT через xRocket. Разовая покупка, без автоматического списания.\nПродление добавляется к оставшемуся сроку. 30 дней = 720 часов.\n\n'
+    if support:
+        text += 'Поддержка: @' + escape(support) + '\n'
+    rows = [[(f'{label} · {amount} USDT', 'bill:buy:' + key)] for key, (_, amount, label) in PLANS.items()]
+    pending = service.db.execute("SELECT id FROM payment_orders WHERE chat=? AND applied=0 AND status='pending' AND network=? ORDER BY created DESC LIMIT 1", (user_id, service.billing.network)).fetchone()
+    if pending:
+        rows.append([('🔄 Проверить последний счёт', 'bill:check:' + pending['id'])])
+    if service.permitted(user_id):
+        rows.append([('‹ Главное меню', 'menu_home')])
+    await show_panel(update, text, ui_keyboard(rows))
+
+
+async def billing_message(update, context):
+    service = context.application.bot_data['service']
+    text, user_id = update.effective_message.text.strip(), update.effective_user.id
+    command = text.split(maxsplit=1)[0].split('@')[0].lower() if text else ''
+    form = context.user_data.get('panel_form') or {}
+    if command in {'/addhours', '/free'} or (form.get('action') == 'billing_gift' and not text.startswith('/')):
+        if user_id != ADMIN_ID:
+            await update.effective_message.reply_text('Только владелец может выдавать бесплатное время.')
+            return True
+        if form.get('action') == 'billing_gift' and not text.startswith('/'):
+            if form.get('expires', 0) < time.time():
+                context.user_data.pop('panel_form', None)
+                await update.effective_message.reply_text('Время ввода истекло. Откройте админ-панель снова.')
+                return True
+            payload = form['payload']
+            text = (str(payload['target']) + ' ' + text) if payload.get('target') else text
+            argument = text
+        else:
+            argument = text.partition(' ')[2]
+        try:
+            target_text, hours_text = argument.split()
+            target = admin_target(target_text)
+            hours = float(hours_text.replace(',', '.'))
+            if not math.isfinite(hours) or not 0 < hours <= 8760:
+                raise ValueError('Часы: число больше 0 и не больше 8760.')
+            nonce = secrets.token_hex(8)
+            context.user_data['billing_grant'] = {'id': nonce, 'target': target, 'hours': hours, 'expires': time.time()+600}
+            context.user_data.pop('panel_form', None)
+            await show_panel(update, f'🎁 Выдать <b>{hours:g} ч.</b> пользователю <code>{target}</code>?\n\nВремя прибавится к оставшемуся сроку. Оплата не требуется.', ui_keyboard([[('Выдать время', 'bill:grant:' + nonce)], [('Отмена', 'bill:cancel')]]))
+        except ValueError as exc:
+            await update.effective_message.reply_text(str(exc) if len(argument.split()) == 2 else 'Используйте /addhours ID ЧАСЫ или /free ID ЧАСЫ. Например: /free 123456789 24')
+        return True
+    if command in {'/subscription', '/buy', '/paysupport'}:
+        if is_blocked(user_id) or user_id in service.revoked:
+            await update.effective_message.reply_text('Доступ отозван. Обратитесь к владельцу.')
+        else:
+            await subscription_panel(update, context)
+        return True
+    if SUBSCRIPTIONS_ENABLED and not service.permitted(user_id) and command != '/id':
+        if is_blocked(user_id) or user_id in service.revoked:
+            await update.effective_message.reply_text('Доступ отозван. Обратитесь к владельцу.')
+        else:
+            await subscription_panel(update, context, 'Для запуска поиска нужна активная подписка. Ваши настройки сохраняются.')
+        return True
+    return False
+
+
+async def billing_callback(update, context):
+    query, user_id = update.callback_query, update.effective_user.id
+    service = context.application.bot_data['service']
+    await query.answer()
+    parts = (query.data or '').split(':')
+    try:
+        if parts[1] in {'gift', 'grant', 'cancel'}:
+            if user_id != ADMIN_ID:
+                raise ValueError('Только владелец может выдавать время.')
+            if parts[1] == 'cancel':
+                context.user_data.pop('billing_grant', None)
+                context.user_data.pop('panel_form', None)
+                await admin_panel(update, context)
+            elif parts[1] == 'gift':
+                target = admin_target(parts[2]) if len(parts) == 3 else None
+                prompt = '🎁 Сколько часов выдать бесплатно?' if target else '🎁 Отправьте Telegram ID и число бесплатных часов через пробел. Например: 123456789 24'
+                await ask_field(update, context, 'billing_gift', prompt, target=target)
+            else:
+                grant = context.user_data.get('billing_grant') or {}
+                if len(parts) != 3 or grant.get('id') != parts[2] or grant.get('expires', 0) < time.time():
+                    raise ValueError('Выдача уже выполнена или кнопка устарела.')
+                until = service.add_time(grant['target'], grant['hours'], ADMIN_ID, 'gift:' + grant['id'])
+                service.authorize(grant['target'])
+                service.state(grant['target'])
+                context.user_data.pop('billing_grant', None)
+                await admin_panel(update, context, notice=f"Выдано {grant['hours']:g} ч. для {grant['target']}. Доступ до {access_date(until)}. Блокировка, если была, остаётся.")
+            return
+        if is_blocked(user_id) or user_id in service.revoked:
+            raise ValueError('Доступ отозван. Обратитесь к владельцу.')
+        if parts[1] == 'plans':
+            await subscription_panel(update, context)
+        elif parts[1] == 'buy' and len(parts) == 3:
+            if user_id == ADMIN_ID:
+                await subscription_panel(update, context, 'Тебе покупать подписку не нужно 😄')
+                return
+            order = await service.billing.create(user_id, parts[2])
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton('Оплатить в xRocket', url=order['link'])], [InlineKeyboardButton('🔄 Проверить оплату', callback_data='bill:check:' + order['id'])], [InlineKeyboardButton('‹ Тарифы', callback_data='bill:plans')]])
+            await show_panel(update, f"💳 <b>Счёт xRocket</b>\n\n{escape(PLANS[order['plan']][2])}: <b>{order['amount']} USDT</b>\n\nОплатите и нажмите «Проверить оплату». Автопроверка тоже включена. Доступ выдаётся владельцу этого счёта в боте. Счёт действует 30 минут.", markup)
+        elif parts[1] == 'check' and len(parts) == 3:
+            state, _ = await service.billing.check(parts[2], user_id)
+            notices = {'paid': '✅ Оплата подтверждена. Период уже начислен.', 'expired': 'Срок счёта истёк. Создайте новый.', 'cancelled': 'Счёт отменён.'}
+            await subscription_panel(update, context, notices.get(state, 'Оплата пока не подтверждена полностью. Повторите проверку позже.'))
+        else:
+            raise ValueError('Кнопка устарела.')
+    except (ValueError, IndexError) as exc:
+        await query.message.reply_text(str(exc)[:500])
+
+
+def build_app(token, allowed, database):
+    async def setup(app):
+        if SUBSCRIPTIONS_ENABLED and not os.getenv("ADMIN_ID", "").strip():
+            raise RuntimeError("Для подписок явно задайте ADMIN_ID владельца в Environment.")
+        service = Service(app.bot, allowed, database)
+        app.bot_data["service"] = service
+        log.info("[startup] database=%s data_dir=%s browser=%s proxy=%s", Path(database).resolve(), DATA_DIR.resolve(), USE_BROWSER, bool(service.reader.proxy_url))
+        if os.getenv("PORT"):
+            class HealthHandler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(200 if self.path in {"/", "/healthz"} else 404)
+                    self.end_headers()
+                    self.wfile.write(b"ok")
+                def log_message(self, *args):
+                    pass
+            server = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT"])), HealthHandler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            app.bot_data["health_server"] = server
+        if app.job_queue is None:
+            raise RuntimeError('Установите python-telegram-bot с дополнением [job-queue].')
+        app.job_queue.run_repeating(service.tick, interval=15, first=5)
+        app.job_queue.run_repeating(service.billing.poll, interval=30, first=10)
+        await app.bot.set_my_commands([
+            BotCommand("start", "Меню"), BotCommand("check", "Проверить объявления"),
+            BotCommand("restart", "Перезапустить проверку"), BotCommand("pause", "Остановить"),
+            BotCommand("status", "Статус и отчёт"), BotCommand("help", "Справка"), BotCommand("id", "Мой ID"),
+            BotCommand("testproxy", "Проверить прокси и просмотры"),
+            BotCommand("saved", "Сохранённые поиски"), BotCommand("cancel", "Отменить ввод"),
+            BotCommand("subscription", "Подписка и оплата"),
+        ])
+    async def cleanup(app):
+        server = app.bot_data.pop("health_server", None)
+        if server:
+            await asyncio.to_thread(server.shutdown)
+            server.server_close()
+        service = app.bot_data.pop("service", None)
+        if service:
+            await service.close()
+    async def on_error(update, context):
+        error = context.error
+        log.error("Ошибка обработчика: %s", type(error).__name__, exc_info=(type(error), error, error.__traceback__))
+    app = (Application.builder().token(token).concurrent_updates(False)
+           .post_init(setup).post_stop(cleanup).post_shutdown(cleanup).build())
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, handle))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_error_handler(on_error)
+    return app
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    token = os.getenv("BOT_TOKEN", "").strip()
+    if not token:
+        raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
+    allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
+    build_app(token, allowed, DATABASE).run_polling(allowed_updates=["message", "callback_query"])
