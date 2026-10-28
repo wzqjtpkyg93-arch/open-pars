@@ -1993,77 +1993,115 @@ def card(ad):
 
         return escape(str(value))
 
-    desc = plain(
-        ad.get("description")
-    ) or "Без описания"
+    lines = [
+        f"📦 <b>{escape(ad['title'][:100])}</b>"
+    ]
 
-    if len(desc) > 400:
-        desc = desc[:397] + "..."
+    if ad.get("price") is not None:
+        price = (
+            f"{show('price')} "
+            f"{escape(ad.get('currency', ''))}"
+        ).strip()
+    else:
+        price = "Цена не указана"
 
-    timing = escape(
-        ad.get("published")
-        or ad.get("posted_label")
-        or "нет данных"
-    )
+    lines.append(f"<b>{price}</b>")
 
-    extra_time = ""
-
-    if ad.get("published") and ad.get("posted_label"):
-        extra_time = (
-            "• <b>Время в выдаче:</b> "
-            + escape(ad["posted_label"])
-            + "\n"
+    if ad.get("location"):
+        lines.append(
+            "📍 " + escape(ad["location"])
         )
 
-    listings = (
-        "• <b>Активных объявлений:</b> "
-        + show("listings_count")
-    )
+    if ad.get("published"):
+        lines.append(
+            "📅 Опубликовано: "
+            + escape(ad["published"])
+        )
+
+    if ad.get("posted_label"):
+        lines.append(
+            "🕓 В выдаче: "
+            + escape(ad["posted_label"])
+        )
+
+    desc = plain(ad.get("description"))
+
+    if desc:
+        if len(desc) > 260:
+            desc = desc[:257].rstrip() + "…"
+
+        lines.extend([
+            "",
+            f"<blockquote>{escape(desc)}</blockquote>",
+        ])
+
+    seller = (
+        ad.get("seller_name") or "Продавец"
+    )[:60]
+
+    lines.extend([
+        "",
+        f"👤 <b>{escape(seller)}</b>",
+        (
+            "👁 Просмотры профиля: "
+            f"<b>{show('seller_views')}</b>"
+        ),
+        (
+            "📦 Активных объявлений: "
+            f"<b>{show('listings_count')}</b>"
+        ),
+    ])
 
     if (
         ad.get("listings_count") is None
         and ad.get("seller_listings_hint") is not None
     ):
-        listings += (
-            "\n• <b>Объявлений по карточке:</b> "
-            + show("seller_listings_hint")
-            + " (активность не подтверждена)"
+        lines.append(
+            "По карточке продавца: "
+            f"{show('seller_listings_hint')} объявлений"
+            " — активность не подтверждена"
         )
 
-    return (
-        f"<b>Объявление №{show('id')}</b>\n\n"
-        f"📦 <b>{escape(ad['title'][:100])}</b>\n"
+    rating = []
 
-        f"🏷 <b>Цена:</b> {show('price')} "
-        f"{escape(ad.get('currency', ''))}\n"
+    if ad.get("rating") is not None:
+        rating.append(
+            f"⭐ Рейтинг: <b>{show('rating')}</b>"
+        )
 
-        f"📍 <b>Локация:</b> "
-        f"{escape(ad.get('location') or 'Не указана')}\n"
+    if ad.get("ratings") is not None:
+        rating.append(
+            f"Оценок: {show('ratings')}"
+        )
 
-        f"🕓 <b>Опубликовано:</b> {timing}\n"
-        f"{extra_time}\n"
+    if rating:
+        lines.append(" · ".join(rating))
 
-        f"📖 <b>Описание:</b>\n"
-        f"<blockquote>{escape(desc)}</blockquote>\n\n"
+    if ad.get("reviews") is not None:
+        lines.append(
+            f"💬 Отзывов: {show('reviews')}"
+        )
 
-        f"💼 <b>Продавец:</b> "
-        f"{escape((ad.get('seller_name') or 'Неизвестен')[:60])}"
-        f"\n\n"
+    if ad.get("sold") is not None:
+        lines.append(
+            f"✅ Продано: {show('sold')}"
+        )
 
-        f"• <b>Фото:</b> {show('photos')}\n"
+    footer = [
+        f"ID {show('id')}"
+    ]
 
-        f"• <b>Рейтинг:</b> {show('rating')} "
-        f"(оценок: {show('ratings')})\n"
+    if ad.get("photos") is not None:
+        footer.append(
+            f"Фото: {show('photos')}"
+        )
 
-        f"• <b>Отзывов:</b> {show('reviews')}\n"
+    lines.extend([
+        "",
+        " · ".join(footer),
+    ])
 
-        f"• <b>Продано:</b> {show('sold')}\n"
-
-        f"• <b>Просмотры профиля:</b> "
-        f"{show('seller_views')}\n"
-
-        f"{listings}"
-    )
+    return "\n".join(lines)
 
 
 async def telegram_call(method, **kwargs):
@@ -2122,7 +2160,13 @@ def get_main_menu():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "📊 Мои фильтры",
+                "🚀 Начать поиск",
+                callback_data="menu_check",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "⚙️ Фильтры",
                 callback_data="menu_filters",
             ),
             InlineKeyboardButton(
@@ -2132,13 +2176,17 @@ def get_main_menu():
         ],
         [
             InlineKeyboardButton(
-                "🚀 Начать парсинг",
-                callback_data="menu_check",
+                "📊 Статус",
+                callback_data="menu_status",
+            ),
+            InlineKeyboardButton(
+                "⏸ Остановить",
+                callback_data="menu_stop",
             ),
         ],
         [
             InlineKeyboardButton(
-                "⚙️ Помощь",
+                "❔ Помощь",
                 callback_data="menu_help",
             ),
         ],
@@ -2168,26 +2216,42 @@ def report_text(
     missing,
 ):
     titles = {
-        "complete": "✅ Проверка завершена",
-        "partial": "⚠️ Проверка завершена с замечаниями",
-        "error": "❌ Проверка прервана",
-        "stopped": "⏸ Проверка остановлена",
-        "limit": "⚠️ Достигнут лимит проверки",
+        "complete": "✅ Поиск завершён",
+        "partial": "⚠️ Поиск завершён с замечаниями",
+        "error": "❌ Поиск прерван",
+        "stopped": "⏸ Поиск остановлен",
+        "limit": "📦 Достигнут лимит поиска",
     }
+
+    seconds = max(0, round(elapsed))
+
+    if seconds >= 60:
+        duration = (
+            f"{seconds // 60} мин. "
+            f"{seconds % 60} сек."
+        )
+    else:
+        duration = f"{seconds} сек."
 
     text = (
         f"<b>{titles[outcome]}</b>\n\n"
-        f"📄 Загружено страниц: {stats['pages']}\n"
-        f"🔎 Найдено карточек: {stats['found']}\n"
-        f"👀 Обработано новых: {stats['checked']}\n"
-        f"✅ Отправлено объявлений: {stats['sent']}\n"
-        f"🔄 Уже отправлялись: {stats['duplicates']}\n"
-        f"🚫 Отсеяно фильтрами: {stats['filtered']}\n"
-        f"⚠️ Ошибок: {stats['errors']}\n"
-        f"👤 Карточек с неполной статистикой продавца: "
-        f"{stats['profiles']}\n"
-        f"⏱ Время: {round(elapsed)} сек."
+        "Отправлено объявлений: "
+        f"<b>{stats['sent']}</b>\n"
+        "Уже отправлялись: "
+        f"<b>{stats['duplicates']}</b>\n"
+        f"Время: <b>{duration}</b>\n\n"
+        f"Страниц: {stats['pages']} · "
+        f"Карточек: {stats['found']}\n"
+        f"Обработано новых: {stats['checked']}\n"
+        f"Отсеяно фильтрами: {stats['filtered']} · "
+        f"Ошибок: {stats['errors']}"
     )
+
+    if stats["profiles"]:
+        text += (
+            "\nНеполная статистика продавца: "
+            f"{stats['profiles']}"
+        )
 
     if missing:
         names = {
@@ -2196,7 +2260,7 @@ def report_text(
         }
 
         text += (
-            "\n\nНедоступные значения: "
+            "\n\nНедоступны: "
             + escape(", ".join(
                 names.get(key, key)
                 for key in sorted(missing)
@@ -2205,7 +2269,7 @@ def report_text(
 
     if warnings:
         text += (
-            "\n\n<b>Замечания:</b>\n"
+            "\n\n<b>Замечания</b>\n"
             + "\n".join(
                 "• " + escape(warning[:220])
                 for warning in list(warnings)[:4]
@@ -3320,9 +3384,7 @@ async def button_handler(
             return
 
         if data == "restart_scan":
-            await service.cancel_scan(
-                chat.id
-            )
+            await service.cancel_scan(chat.id)
 
         started = service.trigger(chat.id)
 
@@ -3330,6 +3392,54 @@ async def button_handler(
             "🚀 Проверка запущена."
             if started
             else "⏳ Проверка уже выполняется."
+        )
+
+    elif data == "menu_status":
+        active = (
+            chat.id in service.tasks
+            and not service.tasks[chat.id].done()
+        )
+
+        monitoring = (
+            "🟢 включён"
+            if state["enabled"]
+            else "⚪ выключен"
+        )
+
+        checking = (
+            "выполняется"
+            if active
+            else "не выполняется"
+        )
+
+        text = (
+            "📊 <b>Статус</b>\n\n"
+            f"Мониторинг: {monitoring}\n"
+            f"Проверка: {checking}\n"
+            f"Категорий: {len(state['urls'])} · "
+            f"Интервал: {state['minutes']} мин."
+        )
+
+        if state["last"]:
+            text += "\n\n" + state["last"]
+
+        await query.message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=get_main_menu(),
+        )
+
+    elif data == "menu_stop":
+        service.save(
+            chat.id,
+            enabled=0,
+        )
+
+        await service.cancel_scan(chat.id)
+
+        await query.message.reply_text(
+            "⏸ Поиск и мониторинг остановлены.",
+            reply_markup=get_main_menu(),
         )
 
     elif data == "menu_filters":
