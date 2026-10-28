@@ -19,11 +19,16 @@ from email.utils import parsedate_to_datetime
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import (
+    parse_qsl,
+    urlencode,
+    urljoin,
+    urlsplit,
+    urlunsplit,
+)
 from zoneinfo import ZoneInfo
 
 import httpx
-
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
@@ -33,20 +38,18 @@ from telegram import (
     InlineKeyboardMarkup,
     Update,
 )
-
 from telegram.error import (
     BadRequest,
     Forbidden,
     RetryAfter,
     TelegramError,
 )
-
 from telegram.ext import (
     Application,
-    MessageHandler,
     CallbackQueryHandler,
-    filters,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 
@@ -102,38 +105,15 @@ CDN = "https://opensooq-imagesv2.os-cdn.com/previews/700x0/"
 log = logging.getLogger("opensooq")
 
 EXCLUDED_WORDS = [
-    "car",
-    "cars",
-    "auto",
-    "autos",
-    "kia",
-    "gmc",
-    "toyota",
-    "nissan",
-    "chevrolet",
-    "ford",
-    "bmw",
-    "mercedes",
-    "audi",
-    "hyundai",
-    "apartment",
-    "flat",
-    "real estate",
-    "rent",
-    "rental",
-    "delivery",
-    "service",
-    "job",
-    "vacancy",
-    "سيارة",
-    "سيارات",
-    "شقة",
-    "شقق",
-    "عقار",
-    "ايجار",
-    "تأجير",
-    "خدمة",
-    "وظيفة",
+    "car", "cars", "auto", "autos",
+    "kia", "gmc", "toyota", "nissan",
+    "chevrolet", "ford", "bmw",
+    "mercedes", "audi", "hyundai",
+    "apartment", "flat", "real estate",
+    "rent", "rental", "delivery",
+    "service", "job", "vacancy",
+    "سيارة", "سيارات", "شقة", "شقق",
+    "عقار", "ايجار", "تأجير", "خدمة", "وظيفة",
 ]
 
 EXCLUDED_RE = re.compile(
@@ -175,15 +155,13 @@ def safe_url(value, base=""):
             "Нужна веб-ссылка на категорию OpenSooq."
         ) from None
 
-    return urlunsplit(
-        (
-            "https",
-            parsed.hostname,
-            parsed.path or "/",
-            parsed.query,
-            "",
-        )
-    )
+    return urlunsplit((
+        "https",
+        parsed.hostname,
+        parsed.path or "/",
+        parsed.query,
+        "",
+    ))
 
 
 def photo_url(value, base=CDN):
@@ -217,15 +195,13 @@ def photo_url(value, base=CDN):
     ):
         return ""
 
-    return urlunsplit(
-        (
-            "https",
-            parsed.hostname,
-            parsed.path,
-            parsed.query,
-            "",
-        )
-    )
+    return urlunsplit((
+        "https",
+        parsed.hostname,
+        parsed.path,
+        parsed.query,
+        "",
+    ))
 
 
 def number(value):
@@ -235,7 +211,6 @@ def number(value):
     if isinstance(value, (int, float)):
         if value >= 0 and math.isfinite(value):
             return float(value)
-
         return None
 
     text = "".join(
@@ -260,7 +235,8 @@ def number(value):
     )
 
     match = re.search(
-        r"(\d+(?:\.\d+)?)(?:\s*(k|m|b|ألف|الف|مليون)(?!\w))?",
+        r"(\d+(?:\.\d+)?)"
+        r"(?:\s*(k|m|b|ألف|الف|مليون)(?!\w))?",
         text,
         re.I,
     )
@@ -293,7 +269,6 @@ def count(value):
 def walk(value):
     if isinstance(value, dict):
         yield value
-
         for child in value.values():
             yield from walk(child)
 
@@ -309,9 +284,8 @@ def props(soup):
         return {}
 
     try:
-        return json.loads(
-            tag.string or tag.get_text()
-        )["props"]["pageProps"]
+        data = json.loads(tag.string or tag.get_text())
+        return data["props"]["pageProps"]
 
     except (ValueError, KeyError, TypeError):
         raise SourceError(
@@ -363,14 +337,14 @@ def flight(soup):
 def parse_profile(raw, expected_id):
     soup = BeautifulSoup(raw, "html.parser")
 
-    result = {
-        "rating": None,
-        "ratings": None,
-        "reviews": None,
-        "seller_views": None,
-        "sold": None,
-        "listings_count": None,
-    }
+    result = dict.fromkeys((
+        "rating",
+        "ratings",
+        "reviews",
+        "seller_views",
+        "sold",
+        "listings_count",
+    ))
 
     def put(key, value, convert=count):
         if result[key] is None and value is not None:
@@ -388,14 +362,17 @@ def parse_profile(raw, expected_id):
     for obj in walk(documents):
         member = obj.get("member")
 
-        if isinstance(member, dict) and any(
-            key in member
-            for key in (
-                "views_count",
-                "views",
-                "posts_count",
-                "member_info",
-                "rating",
+        if (
+            isinstance(member, dict)
+            and any(
+                key in member
+                for key in (
+                    "views_count",
+                    "views",
+                    "posts_count",
+                    "member_info",
+                    "rating",
+                )
             )
         ):
             members.append(member)
@@ -421,10 +398,8 @@ def parse_profile(raw, expected_id):
 
         if matching:
             members = matching
-
         elif without_id:
             members = without_id
-
         elif members:
             raise SourceError(
                 "Открыт профиль другого продавца."
@@ -433,7 +408,6 @@ def parse_profile(raw, expected_id):
     for member in members:
         put("seller_views", member.get("views_count"))
         put("seller_views", member.get("views"))
-        put("listings_count", member.get("posts_count"))
 
         rating = member.get("rating")
 
@@ -460,9 +434,12 @@ def parse_profile(raw, expected_id):
                 info.get("sold_listings_count"),
             )
 
-    for tag in soup(
-        ["script", "style", "template", "noscript"]
-    ):
+    for tag in soup([
+        "script",
+        "style",
+        "template",
+        "noscript",
+    ]):
         tag.decompose()
 
     def clean_text(value):
@@ -481,7 +458,9 @@ def parse_profile(raw, expected_id):
         r"(?:\s*(?:[kmb]|ألف|الف|مليون))?"
     )
 
-    view_label = r"(?:Views?|مشاهدة|مشاهدات|المشاهدات)"
+    view_label = (
+        r"(?:Views?|مشاهدة|مشاهدات|المشاهدات)"
+    )
 
     follower_label = (
         r"(?:Followers?|المتابعون|المتابعين|"
@@ -511,15 +490,15 @@ def parse_profile(raw, expected_id):
                     re.I,
                 )
 
-                if match and re.search(
-                    follower_label,
-                    text,
-                    re.I,
-                ):
-                    put(
-                        "seller_views",
-                        match.group(1),
+                if (
+                    match
+                    and re.search(
+                        follower_label,
+                        text,
+                        re.I,
                     )
+                ):
+                    put("seller_views", match.group(1))
 
                     if result["seller_views"] is not None:
                         break
@@ -556,7 +535,8 @@ def parse_profile(raw, expected_id):
                 continue
 
             match = re.fullmatch(
-                rf"{label}\s*[（(]\s*({numeric})\s*[)）]",
+                rf"{label}\s*[（(]\s*"
+                rf"({numeric})\s*[)）]",
                 text,
                 re.I,
             )
@@ -581,18 +561,18 @@ def parse_profile(raw, expected_id):
 
     if result["rating"] is None:
         match = re.search(
-            r"(\d[.٫]\d+)\s*(?:★|stars?|نجوم)",
+            r"(\d[.٫]\d+)\s*"
+            r"(?:★|stars?|نجوم)",
             page_text,
             re.I,
         )
 
         if match:
-            put(
-                "rating",
-                match.group(1),
-                number,
-            )
+            put("rating", match.group(1), number)
 
+    # listings_count читается из Live Listings.
+    # Число карточек одной страницы не равно общему счётчику.
+    # Неизвестные значения остаются None, а не превращаются в 0.
     return result
 
 
@@ -603,21 +583,20 @@ def update_filters(current, text):
         key, separator, value = pair.partition("=")
         metric, _, bound = key.rpartition("_")
 
-        if (
-            not separator
+        valid = (
+            key in {
+                "keywords",
+                "exclude",
+                "currency",
+                "unknown",
+            }
             or (
-                key not in {
-                    "keywords",
-                    "exclude",
-                    "currency",
-                    "unknown",
-                }
-                and not (
-                    metric in METRICS
-                    and bound in {"min", "max"}
-                )
+                metric in METRICS
+                and bound in {"min", "max"}
             )
-        ):
+        )
+
+        if not separator or not valid:
             raise ValueError(
                 f"Неизвестный фильтр: {pair[:60]}"
             )
@@ -629,8 +608,8 @@ def update_filters(current, text):
             if (
                 len(value) > 500
                 or not any(
-                    item.strip()
-                    for item in value.split(",")
+                    term.strip()
+                    for term in value.split(",")
                 )
             ):
                 raise ValueError(
@@ -640,10 +619,7 @@ def update_filters(current, text):
             result[key] = value
 
         elif key == "currency":
-            if not re.fullmatch(
-                "[A-Za-z]{3}",
-                value,
-            ):
+            if not re.fullmatch("[A-Za-z]{3}", value):
                 raise ValueError(
                     "Валюта: код из 3 букв."
                 )
@@ -672,7 +648,8 @@ def update_filters(current, text):
                 )
             ):
                 raise ValueError(
-                    "Числа должны быть неотрицательными."
+                    "Числа должны быть неотрицательными; "
+                    "рейтинг — не больше 5."
                 )
 
             if (
@@ -711,9 +688,10 @@ def matches(ad, rules):
             if value.strip()
         ]
 
-    if terms("keywords") and not any(
-        value in text
-        for value in terms("keywords")
+    keywords = terms("keywords")
+
+    if keywords and not any(
+        value in text for value in keywords
     ):
         return False, set()
 
@@ -729,7 +707,6 @@ def matches(ad, rules):
     if rules.get("currency"):
         if not ad.get("currency"):
             missing.add("currency")
-
         elif ad["currency"] != rules["currency"]:
             accepted = False
 
@@ -744,7 +721,6 @@ def matches(ad, rules):
 
         if value is None:
             missing.add(metric)
-
         elif (
             (low is not None and value < low)
             or (high is not None and value > high)
@@ -763,7 +739,10 @@ def save_user_password(user_id, password):
     data = {}
 
     if PASSWORD_FILE.exists():
-        with open(PASSWORD_FILE, "r") as file:
+        with PASSWORD_FILE.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
             for line in file:
                 if ":" in line:
                     uid, pwd = line.strip().split(":", 1)
@@ -771,7 +750,10 @@ def save_user_password(user_id, password):
 
     data[str(user_id)] = password
 
-    with open(PASSWORD_FILE, "w") as file:
+    with PASSWORD_FILE.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
         for uid, pwd in data.items():
             file.write(f"{uid}:{pwd}\n")
 
@@ -780,16 +762,21 @@ def check_user_password(user_id, password):
     if not PASSWORD_FILE.exists():
         return False
 
-    with open(PASSWORD_FILE, "r") as file:
+    with PASSWORD_FILE.open(
+        "r",
+        encoding="utf-8",
+    ) as file:
         for line in file:
-            if ":" in line:
-                uid, pwd = line.strip().split(":", 1)
+            if ":" not in line:
+                continue
 
-                if (
-                    uid == str(user_id)
-                    and pwd == password
-                ):
-                    return True
+            uid, pwd = line.strip().split(":", 1)
+
+            if (
+                uid == str(user_id)
+                and secrets.compare_digest(pwd, password)
+            ):
+                return True
 
     return False
 
@@ -798,28 +785,42 @@ def is_blocked(user_id):
     if not BLOCKED_FILE.exists():
         return False
 
-    with open(BLOCKED_FILE, "r") as file:
-        return str(user_id) in [
-            line.strip()
+    with BLOCKED_FILE.open(
+        "r",
+        encoding="utf-8",
+    ) as file:
+        return any(
+            line.strip() == str(user_id)
             for line in file
-        ]
+        )
 
 
 def block_user(user_id):
     if not is_blocked(user_id):
-        with open(BLOCKED_FILE, "a") as file:
+        with BLOCKED_FILE.open(
+            "a",
+            encoding="utf-8",
+        ) as file:
             file.write(f"{user_id}\n")
 
 
 def unblock_user(user_id):
-    if BLOCKED_FILE.exists():
-        with open(BLOCKED_FILE, "r") as file:
-            lines = file.readlines()
+    if not BLOCKED_FILE.exists():
+        return
 
-        with open(BLOCKED_FILE, "w") as file:
-            for line in lines:
-                if line.strip() != str(user_id):
-                    file.write(line)
+    with BLOCKED_FILE.open(
+        "r",
+        encoding="utf-8",
+    ) as file:
+        lines = file.readlines()
+
+    with BLOCKED_FILE.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+        for line in lines:
+            if line.strip() != str(user_id):
+                file.write(line)
 
 
 def plain(value):
@@ -827,7 +828,6 @@ def plain(value):
         for key in ("content", "text", "value"):
             if key in value:
                 return plain(value[key])
-
         return ""
 
     if isinstance(value, list):
@@ -857,7 +857,6 @@ def publication(value):
                 text,
                 fmt,
             ).strftime("%d.%m.%Y")
-
         except ValueError:
             pass
 
@@ -868,10 +867,7 @@ def publication(value):
 
         if parsed.tzinfo is not None:
             parsed = parsed.astimezone(DISPLAY_TZ)
-
-            return parsed.strftime(
-                "%d.%m.%Y %H:%M %Z"
-            )
+            return parsed.strftime("%d.%m.%Y %H:%M %Z")
 
         return (
             parsed.strftime("%d.%m.%Y %H:%M")
@@ -885,17 +881,19 @@ def publication(value):
 def relative_label(value):
     text = plain(value).split("•", 1)[0].strip()
 
-    translations = {
+    labels = {
         "today": "Сегодня",
         "yesterday": "Вчера",
         "just now": "Только что",
     }
 
-    if text.lower() in translations:
-        return translations[text.lower()]
+    if text.lower() in labels:
+        return labels[text.lower()]
 
     match = re.fullmatch(
-        r"(\d+)\s*(minutes?|mins?|hours?|hrs?|days?)\s+ago",
+        r"(\d+)\s*"
+        r"(minutes?|mins?|hours?|hrs?|days?)"
+        r"\s+ago",
         text,
         re.I,
     )
@@ -913,6 +911,56 @@ def relative_label(value):
         return f"{match[1]} {label} назад"
 
     return text[:100]
+
+
+def next_category_url(data, block, url):
+    next_path = (
+        data.get("seoPage") or {}
+    ).get("nextPageUrl")
+
+    if next_path:
+        return safe_url(next_path, url)
+
+    # У /en/find может отсутствовать SEO-ссылка.
+    # Тогда используем метаданные пагинации.
+    meta = block.get("meta") or {}
+
+    if (
+        not isinstance(meta, dict)
+        or not block.get("items")
+    ):
+        return None
+
+    current = count(meta.get("current_page"))
+    pages = count(meta.get("pages"))
+
+    if (
+        current is None
+        or pages is None
+        or not 1 <= current < pages
+    ):
+        return None
+
+    parsed = urlsplit(safe_url(url))
+
+    query = [
+        (key, value)
+        for key, value in parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+        )
+        if key != "page"
+    ]
+
+    query.append(("page", str(current + 1)))
+
+    return safe_url(urlunsplit((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        urlencode(query),
+        "",
+    )))
 
 
 def parse_category(raw, url):
@@ -960,18 +1008,17 @@ def parse_category(raw, url):
         ):
             continue
 
-        path = row.get("post_url") or f"/search/{row['id']}"
+        path = (
+            row.get("post_url")
+            or f"/search/{row['id']}"
+        )
 
         if path.startswith("/search/"):
             locale = urlsplit(url).path.split("/")[1]
 
             path = (
                 "/"
-                + (
-                    locale
-                    if locale in {"ar", "en"}
-                    else "en"
-                )
+                + (locale if locale in {"ar", "en"} else "en")
                 + path
             )
 
@@ -993,15 +1040,10 @@ def parse_category(raw, url):
             seller_url="",
             rating=number(row.get("member_rating_avg")),
             ratings=count(row.get("member_rating_count")),
-            location=", ".join(
-                filter(
-                    None,
-                    [
-                        plain(row.get("nhood_label")),
-                        plain(row.get("city_label")),
-                    ],
-                )
-            ),
+            location=", ".join(filter(None, [
+                plain(row.get("nhood_label")),
+                plain(row.get("city_label")),
+            ])),
             published=publication(row.get("inserted_date")),
             posted_label=relative_label(row.get("posted_at")),
         )
@@ -1027,17 +1069,7 @@ def parse_category(raw, url):
             "Карточки категории имеют неизвестную структуру."
         )
 
-    next_path = data.get(
-        "seoPage", {}
-    ).get("nextPageUrl")
-
-    next_url = (
-        safe_url(next_path, url)
-        if next_path
-        else None
-    )
-
-    return ads, next_url
+    return ads, next_category_url(data, block, url)
 
 
 def parse_listing(raw, ad):
@@ -1048,7 +1080,6 @@ def parse_listing(raw, ad):
         documents.append(props(soup))
 
     documents.extend(flight(soup))
-
     data = None
 
     for obj in walk(documents):
@@ -1058,7 +1089,8 @@ def parse_listing(raw, ad):
             isinstance(candidate, dict)
             and str(
                 candidate.get(
-                    "commonInfo", {}
+                    "commonInfo",
+                    {},
                 ).get("postId")
             ) == ad["id"]
         ):
@@ -1088,10 +1120,15 @@ def parse_listing(raw, ad):
         ("seller_name", "fullName", plain),
         ("rating", "ratingAvg", number),
         ("ratings", "numberOfRatings", count),
-        ("listings_count", "numberOfListings", count),
     ):
         if owner.get(key) is not None:
             ad[target] = convert(owner[key])
+
+    # Этот счётчик может отличаться от Live Listings.
+    # Не подставляем его вместо подтверждённых активных.
+    ad["seller_listings_hint"] = count(
+        owner.get("numberOfListings")
+    )
 
     if owner.get("memberLink"):
         ad["seller_url"] = safe_url(
@@ -1151,20 +1188,14 @@ def parse_listing(raw, ad):
     ]
 
     ad["images"] = (
-        list(
-            dict.fromkeys(
-                filter(None, images)
-            )
-        )
+        list(dict.fromkeys(filter(None, images)))
         or ad.get("images", [])
     )
 
-    if (
-        gallery.get("chips") or {}
-    ).get("imagesCount") is not None:
-        ad["photos"] = count(
-            gallery["chips"]["imagesCount"]
-        )
+    chips = gallery.get("chips") or {}
+
+    if chips.get("imagesCount") is not None:
+        ad["photos"] = count(chips["imagesCount"])
 
     for key in (
         "viewsCount",
@@ -1176,9 +1207,7 @@ def parse_listing(raw, ad):
             break
 
     prices = (
-        (
-            data.get("listing") or {}
-        ).get("price") or {}
+        (data.get("listing") or {}).get("price") or {}
     ).get("prices", [])
 
     if prices:
@@ -1228,7 +1257,6 @@ class Reader:
                     self.last + 2 - time.monotonic(),
                 )
             )
-
             self.last = time.monotonic()
 
     def status_error(self, status, headers, host):
@@ -1237,16 +1265,12 @@ class Reader:
 
             try:
                 delay = float(retry)
-
             except ValueError:
                 try:
                     delay = (
-                        parsedate_to_datetime(
-                            retry
-                        ).timestamp()
+                        parsedate_to_datetime(retry).timestamp()
                         - time.time()
                     )
-
                 except (
                     ValueError,
                     TypeError,
@@ -1271,7 +1295,11 @@ class Reader:
     @staticmethod
     def check_html(raw):
         if re.search(
-            r"<title>\s*(?:Just a moment|Access Denied|Attention Required)",
+            r"<title>\s*(?:"
+            r"Just a moment|"
+            r"Access Denied|"
+            r"Access Restricted|"
+            r"Attention Required)",
             raw[:20000],
             re.I,
         ):
@@ -1285,7 +1313,10 @@ class Reader:
         for _ in range(6):
             host = urlsplit(url).hostname
 
-            if self.pauses.get(host, 0) > time.monotonic():
+            if (
+                self.pauses.get(host, 0)
+                > time.monotonic()
+            ):
                 raise RateLimit(
                     "Пауза после ограничения OpenSooq "
                     "ещё не закончилась."
@@ -1338,9 +1369,7 @@ class Reader:
             if response.status_code in {
                 301, 302, 303, 307, 308
             }:
-                location = response.headers.get(
-                    "location"
-                )
+                location = response.headers.get("location")
 
                 if not location:
                     raise SourceError(
@@ -1357,7 +1386,6 @@ class Reader:
             )
 
             self.check_html(raw)
-
             return raw, url
 
         raise SourceError(
@@ -1405,7 +1433,6 @@ class Reader:
                             "font",
                         }:
                             await route.abort()
-
                         else:
                             await route.continue_()
 
@@ -1424,9 +1451,7 @@ class Reader:
                         timeout=25000,
                         wait_until="domcontentloaded",
                     )
-
                 except PlaywrightTimeout:
-                    # DOM может содержать данные и после тайм-аута.
                     response = None
 
                 safe_url(page.url)
@@ -1458,7 +1483,20 @@ class Reader:
                         seller_id,
                     )
 
-                    if profile["seller_views"] is not None:
+                    if all(
+                        profile.get(key) is not None
+                        for key in (
+                            "seller_views",
+                            "listings_count",
+                        )
+                    ):
+                        log.info(
+                            "[profile_browser] "
+                            "seller=%s views=%s live=%s",
+                            seller_id,
+                            profile["seller_views"],
+                            profile["listings_count"],
+                        )
                         return profile
 
                     if attempt < 3:
@@ -1482,13 +1520,14 @@ class Reader:
             except Exception as exc:
                 self.browser_failures += 1
 
-                if isinstance(exc, SourceError):
-                    raise
-
                 log.warning(
-                    "Браузер профиля: %s",
+                    "[profile_browser] seller=%s error=%s",
+                    seller_id,
                     str(exc)[:1200],
                 )
+
+                if isinstance(exc, SourceError):
+                    raise
 
                 raise SourceError(
                     "Не удалось загрузить профиль браузером; "
@@ -1508,7 +1547,7 @@ class Reader:
             return cached[1], cached[2]
 
         profile = None
-        issue = ""
+        problems = []
 
         try:
             raw, _ = await self.get(url)
@@ -1519,15 +1558,31 @@ class Reader:
                 seller_id,
             )
 
+            log.info(
+                "[profile_http] seller=%s views=%s live=%s",
+                seller_id,
+                profile.get("seller_views"),
+                profile.get("listings_count"),
+            )
+
         except RateLimit:
             raise
 
         except (SourceError, ValueError) as exc:
-            issue = str(exc)
+            problems.append("HTTP: " + str(exc))
 
-        if (
-            profile is None
-            or profile["seller_views"] is None
+            log.warning(
+                "[profile_http] seller=%s error=%s",
+                seller_id,
+                str(exc)[:500],
+            )
+
+        if profile is None or any(
+            profile.get(name) is None
+            for name in (
+                "seller_views",
+                "listings_count",
+            )
         ):
             try:
                 rendered = await self.browser_profile(
@@ -1538,8 +1593,8 @@ class Reader:
                 profile = profile or {}
 
                 profile.update({
-                    key: value
-                    for key, value in rendered.items()
+                    name: value
+                    for name, value in rendered.items()
                     if value is not None
                 })
 
@@ -1551,22 +1606,39 @@ class Reader:
                 ValueError,
                 ImportError,
             ) as exc:
-                issue = issue or str(exc)
+                problems.append(
+                    "Браузер: " + str(exc)
+                )
 
-        if (
-            profile
-            and profile.get("seller_views") is not None
-        ):
-            issue = ""
+        absent = [
+            name
+            for name in (
+                "seller_views",
+                "listings_count",
+            )
+            if (
+                not profile
+                or profile.get(name) is None
+            )
+        ]
 
-        else:
+        if absent:
+            labels = {
+                "seller_views": "просмотры",
+                "listings_count": "активные объявления",
+            }
+
             issue = (
-                "Просмотры профиля недоступны: "
+                "Недоступны "
+                + ", ".join(labels[name] for name in absent)
+                + ". "
                 + (
-                    issue
-                    or "счётчик не найден."
+                    "; ".join(problems)
+                    or "Счётчики не найдены в профиле."
                 )
             )
+        else:
+            issue = ""
 
         ttl = 300 if not issue else 60
 
@@ -1578,8 +1650,8 @@ class Reader:
 
         if len(self.cache) > 2000:
             self.cache = {
-                key: value
-                for key, value in self.cache.items()
+                cache_key: value
+                for cache_key, value in self.cache.items()
                 if value[0] > time.monotonic()
             }
 
@@ -1622,8 +1694,8 @@ class Reader:
 
         if profile:
             ad.update({
-                key: value
-                for key, value in profile.items()
+                name: value
+                for name, value in profile.items()
                 if value is not None
             })
 
@@ -1648,19 +1720,17 @@ def card(ad):
         if value is None:
             return "нет данных"
 
-        return escape(
-            f"{value:g}"
-            if isinstance(value, float)
-            else str(value)
-        )
+        if isinstance(value, float):
+            return escape(f"{value:g}")
 
-    description = (
-        plain(ad.get("description"))
-        or "Без описания"
-    )
+        return escape(str(value))
 
-    if len(description) > 400:
-        description = description[:397] + "..."
+    desc = plain(
+        ad.get("description")
+    ) or "Без описания"
+
+    if len(desc) > 400:
+        desc = desc[:397] + "..."
 
     timing = escape(
         ad.get("published")
@@ -1673,13 +1743,9 @@ def card(ad):
     if ad.get("published") and ad.get("posted_label"):
         extra_time = (
             "• <b>Время в выдаче:</b> "
-            f"{escape(ad['posted_label'])}\n"
+            + escape(ad["posted_label"])
+            + "\n"
         )
-
-    seller = (
-        ad.get("seller_name")
-        or "Неизвестен"
-    )[:60]
 
     return (
         f"<b>Объявление №{show('id')}</b>\n\n"
@@ -1691,15 +1757,19 @@ def card(ad):
         f"🕓 <b>Опубликовано:</b> {timing}\n"
         f"{extra_time}\n"
         f"📖 <b>Описание:</b>\n"
-        f"<blockquote>{escape(description)}</blockquote>\n\n"
-        f"💼 <b>Продавец:</b> {escape(seller)}\n\n"
+        f"<blockquote>{escape(desc)}</blockquote>\n\n"
+        f"💼 <b>Продавец:</b> "
+        f"{escape((ad.get('seller_name') or 'Неизвестен')[:60])}"
+        f"\n\n"
         f"• <b>Фото:</b> {show('photos')}\n"
         f"• <b>Рейтинг:</b> {show('rating')} "
         f"(оценок: {show('ratings')})\n"
         f"• <b>Отзывов:</b> {show('reviews')}\n"
         f"• <b>Продано:</b> {show('sold')}\n"
-        f"• <b>Просмотры профиля:</b> {show('seller_views')}\n"
-        f"• <b>Активных объявлений:</b> {show('listings_count')}"
+        f"• <b>Просмотры профиля:</b> "
+        f"{show('seller_views')}\n"
+        f"• <b>Активных объявлений:</b> "
+        f"{show('listings_count')}"
     )
 
 
@@ -1710,10 +1780,7 @@ async def telegram_call(method, **kwargs):
     except RetryAfter as exc:
         delay = (
             exc.retry_after.total_seconds()
-            if hasattr(
-                exc.retry_after,
-                "total_seconds",
-            )
+            if hasattr(exc.retry_after, "total_seconds")
             else float(exc.retry_after)
         )
 
@@ -1721,7 +1788,6 @@ async def telegram_call(method, **kwargs):
             raise
 
         await asyncio.sleep(delay + 1)
-
         return await method(**kwargs)
 
 
@@ -1729,12 +1795,13 @@ HELP_TEXT = """ℹ️ Команды
 
 /sources — категории
 /remove 1 — удалить категорию
+
 /filters — текущие фильтры
 /filters price_max=500 currency=AED
 /filters keywords="iphone,samsung" exclude="broken,parts"
 /filters seller_views_min=100 listings_count_max=10
-/filters unknown=include — пропускать объявления с неизвестными счётчиками
-/filters unknown=exclude — исключать их при активных ограничениях
+/filters unknown=include — разрешать неизвестные счётчики
+/filters unknown=exclude — исключать их при ограничениях
 /reset — сбросить фильтры
 
 /check — проверить объявления
@@ -1769,13 +1836,13 @@ def get_main_menu():
             InlineKeyboardButton(
                 "🚀 Начать парсинг",
                 callback_data="menu_check",
-            )
+            ),
         ],
         [
             InlineKeyboardButton(
                 "⚙️ Помощь",
                 callback_data="menu_help",
-            )
+            ),
         ],
     ])
 
@@ -1787,9 +1854,11 @@ def filters_text(state):
     ) or "не заданы"
 
     return (
-        "⚙️ <b>Текущие фильтры:</b>\n<pre>"
+        "⚙️ <b>Текущие фильтры:</b>\n"
+        "<pre>"
         + escape(text)
-        + "</pre>\nИзменение: <code>/filters ...</code>"
+        + "</pre>\n"
+        "Изменение: <code>/filters ...</code>"
     )
 
 
@@ -1830,12 +1899,10 @@ def report_text(
 
         text += (
             "\n\nНедоступные значения: "
-            + escape(
-                ", ".join(
-                    names.get(key, key)
-                    for key in sorted(missing)
-                )
-            )
+            + escape(", ".join(
+                names.get(key, key)
+                for key in sorted(missing)
+            ))
         )
 
     if warnings:
@@ -1941,7 +2008,7 @@ class Service:
         return row
 
     def save(self, chat, **changes):
-        allowed_fields = {
+        valid_fields = {
             "urls",
             "rules",
             "enabled",
@@ -1952,7 +2019,7 @@ class Service:
 
         if (
             not changes
-            or not changes.keys() <= allowed_fields
+            or not changes.keys() <= valid_fields
         ):
             raise ValueError(
                 "Некорректные настройки."
@@ -1965,14 +2032,15 @@ class Service:
             for key, value in changes.items()
         ]
 
+        query = (
+            "UPDATE users SET "
+            + ",".join(key + "=?" for key in changes)
+            + " WHERE chat=?"
+        )
+
         with self.db:
             self.db.execute(
-                "UPDATE users SET "
-                + ",".join(
-                    key + "=?"
-                    for key in changes
-                )
-                + " WHERE chat=?",
+                query,
                 values + [chat],
             )
 
@@ -2005,13 +2073,11 @@ class Service:
         return True
 
     async def tick(self, context):
-        rows = list(
-            self.db.execute(
-                "SELECT chat FROM users "
-                "WHERE enabled=1 AND next_check<=?",
-                (time.time(),),
-            )
-        )
+        rows = list(self.db.execute(
+            "SELECT chat FROM users "
+            "WHERE enabled=1 AND next_check<=?",
+            (time.time(),),
+        ))
 
         for row in rows:
             self.trigger(row["chat"])
@@ -2044,11 +2110,13 @@ class Service:
         markup = InlineKeyboardMarkup(buttons)
         text = card(ad)
 
+        visible_text = BeautifulSoup(
+            text,
+            "html.parser",
+        ).get_text()
+
         size = len(
-            BeautifulSoup(
-                text,
-                "html.parser",
-            ).get_text().encode("utf-16-le")
+            visible_text.encode("utf-16-le")
         ) // 2
 
         if ad.get("images"):
@@ -2086,6 +2154,38 @@ class Service:
             reply_markup=markup,
         )
 
+    async def live_progress(self, message, stats):
+        previous = ""
+
+        while True:
+            await asyncio.sleep(20)
+
+            text = (
+                "⏳ Проверка продолжается…\n"
+                f"Страниц: {stats['pages']}\n"
+                f"Обработано новых: {stats['checked']}\n"
+                f"Отправлено: {stats['sent']}\n"
+                f"Уже отправлялись: {stats['duplicates']}\n"
+                f"Отсеяно: {stats['filtered']}\n"
+                f"Ошибок: {stats['errors']}\n\n"
+                "Итоговый отчёт появится после завершения.\n"
+                "Остановка: /pause"
+            )
+
+            if text != previous:
+                try:
+                    await telegram_call(
+                        message.edit_text,
+                        text=text,
+                    )
+                    previous = text
+
+                except TelegramError:
+                    log.warning(
+                        "[scan_progress] "
+                        "Не удалось обновить прогресс"
+                    )
+
     async def scan(self, chat):
         stats = Counter()
         warnings = {}
@@ -2095,14 +2195,24 @@ class Service:
         outcome = "complete"
         started = time.monotonic()
         stop = False
+
         report_allowed = True
+        progress_task = None
 
         try:
-            await telegram_call(
+            progress_message = await telegram_call(
                 self.bot.send_message,
                 chat_id=chat,
                 text="🚀 Начинаю проверку объявлений…",
             )
+
+            if progress_message is not None:
+                progress_task = asyncio.create_task(
+                    self.live_progress(
+                        progress_message,
+                        stats,
+                    )
+                )
 
             async with self.lock:
                 self.reader.browser_failures = 0
@@ -2143,6 +2253,15 @@ class Service:
                             )
 
                             stats["pages"] += 1
+
+                            log.info(
+                                "[scan_page] chat=%s page=%s "
+                                "cards=%s has_next=%s",
+                                chat,
+                                stats["pages"],
+                                len(ads),
+                                bool(next_url),
+                            )
 
                         except RateLimit as exc:
                             warnings[str(exc)] = True
@@ -2204,12 +2323,12 @@ class Service:
                                 ad, warning = await self.reader.enrich(ad)
 
                                 absent_profile = {
-                                    key
-                                    for key in (
+                                    name
+                                    for name in (
                                         "seller_views",
                                         "listings_count",
                                     )
-                                    if ad.get(key) is None
+                                    if ad.get(name) is None
                                 }
 
                                 missing.update(absent_profile)
@@ -2326,6 +2445,12 @@ class Service:
             )
 
         finally:
+            if progress_task is not None:
+                progress_task.cancel()
+
+                with suppress(asyncio.CancelledError):
+                    await progress_task
+
             if outcome == "complete" and warnings:
                 outcome = "partial"
 
@@ -2335,6 +2460,18 @@ class Service:
                 outcome,
                 warnings,
                 missing,
+            )
+
+            log.info(
+                "[scan_done] chat=%s outcome=%s pages=%s "
+                "sent=%s duplicates=%s filtered=%s errors=%s",
+                chat,
+                outcome,
+                stats["pages"],
+                stats["sent"],
+                stats["duplicates"],
+                stats["filtered"],
+                stats["errors"],
             )
 
             with suppress(sqlite3.Error):
@@ -2472,10 +2609,7 @@ async def handle(
                     for _ in range(12)
                 )
 
-                save_user_password(
-                    target,
-                    password,
-                )
+                save_user_password(target, password)
 
                 await message.reply_text(
                     f"Пароль для {target}: "
@@ -2490,7 +2624,6 @@ async def handle(
                     )
 
                 block_user(target)
-
                 service.state(target)
                 service.save(target, enabled=0)
 
@@ -2518,7 +2651,6 @@ async def handle(
                     "Отправьте ссылку на категорию.",
                     reply_markup=get_main_menu(),
                 )
-
             else:
                 await message.reply_text(
                     "🔒 Бот приватный. "
@@ -2531,8 +2663,8 @@ async def handle(
 
         if command == "/start":
             await message.reply_text(
-                "👋 Отправьте ссылку на категорию "
-                "OpenSooq или выберите действие.",
+                "👋 Отправьте ссылку на категорию OpenSooq "
+                "или выберите действие.",
                 reply_markup=get_main_menu(),
             )
 
@@ -2575,8 +2707,7 @@ async def handle(
             await message.reply_text(
                 (
                     sources
-                    or "Категории не добавлены. "
-                    "Отправьте ссылку."
+                    or "Категории не добавлены. Отправьте ссылку."
                 )[:3900],
                 disable_web_page_preview=True,
             )
@@ -2621,7 +2752,6 @@ async def handle(
 
         elif command in {"/pause", "/stop"}:
             service.save(chat.id, enabled=0)
-
             await service.cancel_scan(chat.id)
 
             await message.reply_text(
@@ -2661,14 +2791,14 @@ async def handle(
             }
             or text.startswith(("https://", "http://"))
         ):
-            if (
-                command == "/add"
-                or text.startswith(("https://", "http://"))
-            ):
+            is_link = text.startswith((
+                "https://",
+                "http://",
+            ))
+
+            if command == "/add" or is_link:
                 url = safe_url(
-                    argument
-                    if command == "/add"
-                    else text
+                    argument if command == "/add" else text
                 )
 
                 if re.search(
@@ -2746,7 +2876,6 @@ async def button_handler(
                 "Доступ закрыт.",
                 show_alert=True,
             )
-
         return
 
     await query.answer()
@@ -2818,15 +2947,23 @@ def build_app(token, allowed, database):
 
         app.bot_data["service"] = service
 
+        log.info(
+            "[startup] database=%s data_dir=%s browser=%s",
+            Path(database).resolve(),
+            DATA_DIR.resolve(),
+            USE_BROWSER,
+        )
+
         if os.getenv("PORT"):
             class HealthHandler(BaseHTTPRequestHandler):
                 def do_GET(self):
-                    self.send_response(
+                    status = (
                         200
                         if self.path in {"/", "/healthz"}
                         else 404
                     )
 
+                    self.send_response(status)
                     self.end_headers()
                     self.wfile.write(b"ok")
 
@@ -2834,10 +2971,7 @@ def build_app(token, allowed, database):
                     pass
 
             server = ThreadingHTTPServer(
-                (
-                    "0.0.0.0",
-                    int(os.environ["PORT"]),
-                ),
+                ("0.0.0.0", int(os.environ["PORT"])),
                 HealthHandler,
             )
 
@@ -2880,7 +3014,6 @@ def build_app(token, allowed, database):
             await asyncio.to_thread(
                 server.shutdown
             )
-
             server.server_close()
 
         service = app.bot_data.pop(
