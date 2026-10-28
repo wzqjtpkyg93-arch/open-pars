@@ -421,6 +421,68 @@ def next_category_url(data, block, url):
     return safe_url(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), "")))
 
 
+def parse_category_dom(soup, url, documents):
+    section = soup.select_one("section[data-testid='serp-results']")
+    if section is None:
+        raise SourceError("Не найдены данные категории OpenSooq.")
+    metadata = {}
+    for obj in walk(documents):
+        listing = obj.get("listings")
+        if isinstance(listing, dict) and isinstance(listing.get("items"), list):
+            for item in listing["items"]:
+                post = item.get("post") if isinstance(item, dict) else None
+                if isinstance(post, dict) and post.get("id"):
+                    metadata[str(post["id"])] = post
+    ads, seen = [], set()
+    cards = section.select("a.postListItemData[data-id1][href]")
+    for node in cards:
+        ad_id = str(node.get("data-id1", ""))
+        heading = node.find(["h2", "h3"])
+        if not ad_id.isdecimal() or heading is None or ad_id in seen:
+            continue
+        ad_url = safe_url(node["href"], url)
+        if not re.search(r"/(?:search|lists)/" + re.escape(ad_id) + r"(?:/|$)", urlsplit(ad_url).path):
+            continue
+        seen.add(ad_id)
+        post = metadata.get(ad_id, {})
+        price_node = heading.find_previous_sibling("span")
+        price_text = price_node.get_text(" ", strip=True) if price_node else ""
+        currency_match = re.search(r"\b([A-Z]{3})\b", price_text)
+        media = node.select_one("[data-testid='serp-listing-carousel'] img")
+        image = photo_url(media.get("src", "")) if media else ""
+        status = node.find("span", recursive=False)
+        camera = node.select_one("svg[data-name='iconCamera2']")
+        ad = dict.fromkeys(METRICS)
+        ad.update(id=ad_id, url=ad_url, title=heading.get_text(" ", strip=True), description="",
+            price=number(price_text) if currency_match else None,
+            currency=currency_match[1] if currency_match else "",
+            images=[image] if image else [],
+            photos=count(camera.parent.get_text(" ", strip=True)) if camera else None,
+            seller_id=str(post.get("member_id") or ""), seller_name="", seller_url="",
+            location=", ".join(filter(None, [plain(post.get("neighborhoodName") or node.get("data-nhood")),
+                                            plain(post.get("city_reporting") or node.get("data-city"))])),
+            published="", posted_label=relative_label(status.get_text(" ", strip=True)) if status else "")
+        ads.append(ad)
+    if cards and not ads:
+        raise SourceError("Новый формат карточек категории не удалось прочитать.")
+    next_link = soup.select_one("a[aria-label='Go to next page'][href], a[rel~='next'][href], link[rel~='next'][href]")
+    next_url = safe_url(next_link["href"], url) if next_link and ads else None
+    if ads and not next_url:
+        parsed = urlsplit(url)
+        params = parse_qsl(parsed.query, keep_blank_values=True)
+        current = int(dict(params).get("page", "1"))
+        expected = sorted((key, value) for key, value in params if key != "page")
+        for link in soup.find_all("a", href=True):
+            candidate = urlsplit(urljoin(url, link["href"]))
+            query = parse_qsl(candidate.query, keep_blank_values=True)
+            if (candidate.hostname == parsed.hostname and candidate.path == parsed.path
+                    and dict(query).get("page") == str(current + 1)
+                    and sorted((key, value) for key, value in query if key != "page") == expected):
+                next_url = safe_url(link["href"], url)
+                break
+    return ads, next_url
+
+
 def parse_category(raw, url):
     soup = BeautifulSoup(raw, "html.parser")
     documents = []
@@ -430,7 +492,7 @@ def parse_category(raw, url):
     data = next((o for o in walk(documents) if isinstance(o.get("serpApiResponse"), dict)), None)
     block = data.get("serpApiResponse", {}).get("listings") if data else None
     if not isinstance(block, dict) or not isinstance(block.get("items"), list):
-        raise SourceError("Не найдены данные категории OpenSooq.")
+        return parse_category_dom(soup, url, documents)
     ads = []
     for row in block["items"]:
         if not isinstance(row, dict) or not row.get("id") or not row.get("title"):
