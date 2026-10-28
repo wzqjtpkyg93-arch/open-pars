@@ -37,6 +37,10 @@ PASSWORD_FILE = DATA_DIR / "passwords.txt"
 BLOCKED_FILE = DATA_DIR / "blocked.txt"
 DISPLAY_TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "Europe/Moscow"))
 USE_BROWSER = os.getenv("PROFILE_BROWSER", "1") == "1"
+# Можно вернуть прежний темп, установив REQUEST_INTERVAL=2 в Environment.
+REQUEST_INTERVAL = float(os.getenv("REQUEST_INTERVAL", "1.2"))
+if not math.isfinite(REQUEST_INTERVAL) or not 1 <= REQUEST_INTERVAL <= 30:
+    raise ValueError("REQUEST_INTERVAL: число от 1 до 30 секунд.")
 COUNTRIES = "kw ae bh sa".split()
 HOSTS = {"opensooq.com", "www.opensooq.com"} | {c + ".opensooq.com" for c in COUNTRIES}
 METRICS = {"price", "views", "seller_views", "rating", "ratings", "reviews", "sold", "photos", "listings_count"}
@@ -599,7 +603,7 @@ class Reader:
 
     async def throttle(self):
         async with self.lock:
-            await asyncio.sleep(max(0, self.last + 2 - time.monotonic()))
+            await asyncio.sleep(max(0, self.last + REQUEST_INTERVAL - time.monotonic()))
             self.last = time.monotonic()
 
     def status_error(self, status, headers, host):
@@ -755,12 +759,25 @@ class Reader:
             self.cache = dict(list(self.cache.items())[-1000:])
         return profile, issue
 
-    async def enrich(self, ad):
+    async def enrich(self, ad, rules=None):
         raw, final = await self.get(ad["url"])
         if urlsplit(final).hostname != urlsplit(ad["url"]).hostname:
             raise SourceError("Объявление перенаправило на другую страну.")
         ad["url"] = final
         ad = await asyncio.to_thread(parse_listing, raw, ad)
+        if rules:
+            # Эти поля уже окончательны после загрузки объявления и не меняются
+            # профилем. Неизвестное поле здесь не является причиной отказа.
+            early_keys = {"keywords", "exclude", "currency"} | {
+                metric + "_" + bound
+                for metric in ("price", "photos", "views")
+                for bound in ("min", "max")
+            }
+            early_rules = {k: v for k, v in rules.items() if k in early_keys}
+            early_rules["unknown"] = "include"
+            if not matches(ad, early_rules)[0]:
+                ad["_filtered_before_profile"] = True
+                return ad, ""
         if not ad.get("seller_url"):
             return ad, "В объявлении отсутствует ссылка на профиль продавца."
         profile, warning = await self.profile(ad["seller_url"], ad["seller_id"])
@@ -1014,6 +1031,7 @@ class Service:
         outcome, started, stop = "complete", time.monotonic(), False
         report_allowed = True
         progress_task = None
+        last_delivery = 0.0
         try:
             progress_message = await telegram_call(self.bot.send_message, chat_id=chat, text="🚀 Начинаю проверку объявлений…")
             if progress_message is not None:
@@ -1066,23 +1084,30 @@ class Service:
                                 stats["filtered"] += 1
                                 continue
                             try:
-                                ad, warning = await self.reader.enrich(ad)
+                                rules = self.state(chat)["rules"]
+                                ad, warning = await self.reader.enrich(ad, rules=rules)
+                                if ad.pop("_filtered_before_profile", False):
+                                    stats["filtered"] += 1
+                                    continue
                                 absent_profile = {k for k in ("seller_views", "listings_count") if ad.get(k) is None}
                                 missing.update(absent_profile)
                                 if absent_profile:
                                     stats["profiles"] += 1
                                 if warning:
                                     warnings[warning] = True
-                                accepted, absent = matches(ad, self.state(chat)["rules"])
+                                accepted, absent = matches(ad, rules)
                                 missing.update(absent)
                                 if not accepted:
                                     stats["filtered"] += 1
                                     continue
+                                # Загрузка следующей карточки занимает время сама;
+                                # ждём только остаток интервала между отправками.
+                                await asyncio.sleep(max(0, last_delivery + 1.1 - time.monotonic()))
                                 await self.send(chat, ad)
                                 with self.db:
                                     self.db.execute("INSERT OR IGNORE INTO delivered VALUES (?,?)", (chat, key))
                                 stats["sent"] += 1
-                                await asyncio.sleep(1.1)
+                                last_delivery = time.monotonic()
                             except Forbidden:
                                 raise
                             except RateLimit as exc:
