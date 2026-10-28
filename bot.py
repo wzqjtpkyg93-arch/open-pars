@@ -15,6 +15,7 @@ import unicodedata
 from collections import Counter
 from contextlib import suppress
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,6 +38,10 @@ PASSWORD_FILE = DATA_DIR / "passwords.txt"
 BLOCKED_FILE = DATA_DIR / "blocked.txt"
 DISPLAY_TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "Europe/Moscow"))
 USE_BROWSER = os.getenv("PROFILE_BROWSER", "1") == "1"
+SUBSCRIPTIONS_ENABLED = os.getenv("SUBSCRIPTIONS_ENABLED", "0") == "1"
+XROCKET_TESTNET = os.getenv("XROCKET_TESTNET", "0") == "1"
+PLANS = {"d1": (24, "0.90", "1 день"), "d3": (72, "2.40", "3 дня"),
+         "d7": (168, "4.90", "7 дней"), "d30": (720, "16.90", "30 дней")}
 # Можно вернуть прежний темп, установив REQUEST_INTERVAL=2 в Environment.
 REQUEST_INTERVAL = float(os.getenv("REQUEST_INTERVAL", "1.2"))
 if not math.isfinite(REQUEST_INTERVAL) or not 1 <= REQUEST_INTERVAL <= 30:
@@ -969,6 +974,15 @@ class Service:
             CREATE TABLE IF NOT EXISTS delivered(chat INTEGER NOT NULL, key TEXT NOT NULL, PRIMARY KEY(chat,key));
             CREATE TABLE IF NOT EXISTS authorized(chat INTEGER PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS revoked(chat INTEGER PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS subscriptions(chat INTEGER PRIMARY KEY, until REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS subscriptions_test(chat INTEGER PRIMARY KEY, until REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS subscription_events(id TEXT PRIMARY KEY, chat INTEGER NOT NULL, hours REAL NOT NULL, actor INTEGER NOT NULL, created REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS payment_orders(
+                id TEXT PRIMARY KEY, chat INTEGER NOT NULL, plan TEXT NOT NULL, hours INTEGER NOT NULL,
+                amount TEXT NOT NULL, currency TEXT NOT NULL, invoice TEXT NOT NULL DEFAULT '',
+                link TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', applied INTEGER NOT NULL DEFAULT 0,
+                created REAL NOT NULL, checked REAL NOT NULL DEFAULT 0, network TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS saved_searches(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat INTEGER NOT NULL,
@@ -984,9 +998,32 @@ class Service:
         self.allowed.difference_update(self.revoked)
         self.reader, self.tasks, self.lock = Reader(), {}, asyncio.Lock()
         self.closing = False
+        self.subscription_table = "subscriptions_test" if XROCKET_TESTNET else "subscriptions"
+        self.billing = Billing(self)
 
     def permitted(self, chat):
+        if chat == ADMIN_ID:
+            return True
+        if SUBSCRIPTIONS_ENABLED:
+            return (chat not in self.revoked and not is_blocked(chat) and self.access_until(chat) > time.time())
         return chat in self.allowed and chat not in self.revoked and not is_blocked(chat)
+
+    def access_until(self, chat):
+        row = self.db.execute("SELECT until FROM " + self.subscription_table + " WHERE chat=?", (chat,)).fetchone()
+        return row["until"] if row else 0
+
+    def add_time(self, chat, hours, actor, event):
+        hours = float(hours)
+        if not math.isfinite(hours) or not 0 < hours <= 8760:
+            raise ValueError("Часы: число больше 0 и не больше 8760.")
+        now = time.time()
+        with self.db:
+            if self.db.execute("SELECT 1 FROM subscription_events WHERE id=?", (event,)).fetchone():
+                return self.access_until(chat)
+            until = max(now, self.access_until(chat)) + hours * 3600
+            self.db.execute("INSERT INTO " + self.subscription_table + " VALUES (?,?) ON CONFLICT(chat) DO UPDATE SET until=excluded.until", (chat, until))
+            self.db.execute("INSERT INTO subscription_events VALUES (?,?,?,?,?)", (event, chat, hours, actor, now))
+        return until
 
     def authorize(self, chat):
         self.allowed.add(chat)
@@ -1032,6 +1069,12 @@ class Service:
         return True
 
     async def tick(self, context):
+        if SUBSCRIPTIONS_ENABLED:
+            active = set(self.tasks) | {r["chat"] for r in self.db.execute("SELECT chat FROM users WHERE enabled=1")}
+            for chat in active:
+                if not self.permitted(chat):
+                    self.save(chat, enabled=0)
+                    await self.cancel_scan(chat)
         for row in list(self.db.execute("SELECT chat FROM users WHERE enabled=1 AND next_check<=?", (time.time(),))):
             self.trigger(row["chat"])
 
@@ -1159,6 +1202,9 @@ class Service:
                                 # Загрузка следующей карточки занимает время сама;
                                 # ждём только остаток интервала между отправками.
                                 await asyncio.sleep(max(0, last_delivery + 1.1 - time.monotonic()))
+                                if not self.permitted(chat):
+                                    outcome, stop = "stopped", True
+                                    break
                                 await self.send(chat, ad)
                                 with self.db:
                                     self.db.execute("INSERT OR IGNORE INTO delivered VALUES (?,?)", (chat, key))
@@ -1238,6 +1284,7 @@ class Service:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await self.reader.close()
+        await self.billing.close()
         self.db.close()
 
 
@@ -1452,6 +1499,7 @@ def get_main_menu():
         [("💾 Мои поиски", "ui:saved"), ("🌍 Страна", "ui:countries")],
         [("⏱ Мониторинг", "ui:monitor"), ("📊 Статус", "menu_status")],
         [("⏸ Остановить", "menu_stop"), ("❔ Помощь", "menu_help")],
+        [("💳 Подписка", "bill:plans")],
     ])
 
 
@@ -1582,479 +1630,3 @@ async def panel(update, context, screen="home", notice=""):
         keyboard = get_main_menu()
     else:
         active = chat in service.tasks and not service.tasks[chat].done()
-        countries = ", ".join(dict.fromkeys(source_country(url) for url in state["urls"])) or "не выбрана"
-        text = ("🔎 <b>Панель поиска OpenSooq</b>\n\n"
-            f"🌍 {countries}\n"
-            f"🔗 Категорий: <b>{len(state['urls'])}/5</b>\n"
-            f"⚙️ Настроек фильтров: <b>{len(state['rules'])}</b>\n"
-            f"💾 Сохранённых поисков: <b>{len(saved_rows(service, chat))}</b>\n"
-            f"⏱ Мониторинг: {'включён' if state['enabled'] else 'выключен'} · {state['minutes']} мин.\n"
-            f"{'⏳ Поиск выполняется или ожидает очереди.' if active else 'Готов к запуску.'}\n\n"
-            "Выберите действие ниже.")
-        keyboard = get_main_menu()
-    if screen == "home" and update.effective_user.id == ADMIN_ID:
-        keyboard = InlineKeyboardMarkup(list(keyboard.inline_keyboard) + [[InlineKeyboardButton("👑 Пользователи", callback_data="ui:admin")]])
-    if notice:
-        text = escape(notice) + "\n\n" + text
-    await show_panel(update, text, keyboard)
-
-
-async def ask_field(update, context, action, prompt, **payload):
-    context.user_data["panel_form"] = dict(action=action, payload=payload, expires=time.time() + 600)
-    await show_panel(update, prompt + "\n\nОтправьте ответ одним сообщением. Отмена: /cancel",
-        ui_keyboard([[ ("Отмена", "ui:cancel") ]]))
-
-
-async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message, user, chat = update.effective_message, update.effective_user, update.effective_chat
-    service = context.application.bot_data["service"]
-    if not message or not message.text or not user or not chat or chat.type != "private":
-        return
-    if not service.permitted(user.id):
-        await handle_commands(update, context)
-        return
-    text = message.text.strip()
-    command = text.split(maxsplit=1)[0].split("@")[0].lower() if text else ""
-    form = context.user_data.get("panel_form")
-    if text.startswith("/"):
-        context.user_data.pop("panel_form", None)
-        if command in {"/admin", "/users", "/revokepass", "/revoke"}:
-            if user.id != ADMIN_ID:
-                await message.reply_text("Эта команда доступна только администратору.")
-                return
-            if command in {"/revokepass", "/revoke"}:
-                try:
-                    target = admin_target(text.split(maxsplit=1)[1])
-                    await service.revoke_access(target)
-                    await message.reply_text(f"🚫 Пароль и доступ пользователя {target} отозваны. Мониторинг остановлен.")
-                except (ValueError, IndexError) as exc:
-                    await message.reply_text(str(exc) if isinstance(exc, ValueError) else "Используйте /revokepass ID")
-            else:
-                await admin_panel(update, context)
-            return
-        if command in {"/start", "/cancel", "/sources", "/saved", "/status"}:
-            await panel(update, context, {"/sources": "sources", "/saved": "saved", "/status": "status"}.get(command, "home"))
-            return
-        if command == "/filters" and len(text.split(maxsplit=1)) == 1:
-            await panel(update, context, "filters")
-            return
-        await handle_commands(update, context)
-        return
-    if form:
-        if form["expires"] < time.time():
-            context.user_data.pop("panel_form", None)
-            await panel(update, context, notice="Время ввода истекло. Выберите действие заново.")
-            return
-        action, payload = form["action"], form["payload"]
-        state = service.state(chat.id)
-        screen, notice = "home", "✅ Сохранено."
-        try:
-            if action in {"add", "replace"}:
-                url = checked_source(text)
-                urls = list(state["urls"])
-                if action == "replace":
-                    old = payload["url"]
-                    if old not in urls:
-                        raise ValueError("Категория уже изменена. Отмените ввод и откройте список заново.")
-                    if url in urls and url != old:
-                        raise ValueError("Такая категория уже есть.")
-                    urls[urls.index(old)] = url
-                else:
-                    if url in urls:
-                        raise ValueError("Эта категория уже добавлена.")
-                    if len(urls) >= 5:
-                        raise ValueError("Максимум 5 категорий. Сначала удалите одну.")
-                    urls.append(url)
-                service.save(chat.id, urls=urls)
-                screen = "sources"
-            elif action in {"filter", "range"}:
-                if action == "range":
-                    metric = payload["metric"]
-                    rules = metric_input(state["rules"], metric, text)
-                    notice = f"✅ {FILTER_LABELS[metric]}: {ui_range(rules, metric)}. Фильтр сохранён."
-                else:
-                    field = payload["field"]
-                    metric, _, bound = field.rpartition("_")
-                    range_text = re.fullmatch(r"(?:от\s*)?\d+(?:[.,]\d+)?\s*(?:-|–|—|\.\.|до)\s*\d+(?:[.,]\d+)?", text, re.I)
-                    if metric in FILTER_LABELS and bound in {"min", "max"} and range_text:
-                        rules = metric_input(state["rules"], metric, text)
-                        notice = f"✅ {FILTER_LABELS[metric]}: {ui_range(rules, metric)}. Фильтр сохранён."
-                    else:
-                        rules = update_filters(state["rules"], field + "=" + shlex.quote(text))
-                        label = TEXT_LABELS.get(field, FILTER_LABELS.get(metric, field))
-                        display = ui_range(rules, metric) if metric in FILTER_LABELS else str(rules.get(field) or "не задано")
-                        notice = f"✅ {label}: {display}. Фильтр сохранён."
-                service.save(chat.id, rules=rules)
-                screen = "filters"
-            elif action == "save":
-                save_search(service, chat.id, text)
-                screen, notice = "saved", "💾 Поиск сохранён."
-            elif action == "admin_target":
-                if user.id != ADMIN_ID:
-                    raise ValueError("Доступ закрыт.")
-                target = admin_target(text)
-                context.user_data.pop("panel_form", None)
-                await admin_confirmation(update, context, payload["kind"], target)
-                return
-            elif action == "interval":
-                minutes = int(text)
-                if not 5 <= minutes <= 1440:
-                    raise ValueError("Введите число от 5 до 1440.")
-                service.save(chat.id, minutes=minutes, next_check=time.time() + minutes * 60)
-                screen = "monitor"
-            context.user_data.pop("panel_form", None)
-            await panel(update, context, screen, notice)
-        except ValueError as exc:
-            await message.reply_text(str(exc)[:800] + "\nПопробуйте ещё раз или /cancel.")
-        return
-    if text.startswith(("http://", "https://")):
-        try:
-            url = checked_source(text)
-            urls = service.state(chat.id)["urls"]
-            if url in urls:
-                await panel(update, context, "sources", "Эта категория уже есть.")
-                return
-            if len(urls) >= 5:
-                raise ValueError("Максимум 5 категорий. Удалите одну или замените её.")
-            service.save(chat.id, urls=urls + [url])
-            await panel(update, context, "sources", "✅ Категория добавлена. Для запуска нажмите «Начать поиск».")
-        except ValueError as exc:
-            await message.reply_text(str(exc))
-        return
-    await panel(update, context)
-
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query, user, chat = update.callback_query, update.effective_user, update.effective_chat
-    service = context.application.bot_data["service"]
-    if not query or not user or not chat or chat.type != "private" or not service.permitted(user.id):
-        if query:
-            await query.answer("Доступ закрыт.", show_alert=True)
-        return
-    await query.answer()
-    context.user_data.pop("panel_form", None)
-    data, state = query.data or "", service.state(chat.id)
-    back = [("‹ Главное меню", "menu_home")]
-    try:
-        navigation = {"menu_home": "home", "menu_sources": "sources", "menu_filters": "filters",
-                      "menu_status": "status", "ui:saved": "saved", "ui:monitor": "monitor", "ui:cancel": "home"}
-        if data.startswith("ui:admin"):
-            if user.id != ADMIN_ID:
-                raise ValueError("Админ-панель доступна только владельцу.")
-            await admin_callback(update, context, data)
-        elif data in navigation:
-            await panel(update, context, navigation[data])
-        elif data in {"menu_check", "restart_scan", "ui:watch"}:
-            if not state["urls"]:
-                await panel(update, context, "sources", "Сначала добавьте категорию.")
-                return
-            if data == "restart_scan":
-                await service.cancel_scan(chat.id)
-            if data == "ui:watch":
-                service.save(chat.id, enabled=1)
-            started = service.trigger(chat.id)
-            await panel(update, context, notice="🚀 Поиск запущен." if started else "⏳ Поиск уже выполняется.")
-        elif data == "menu_stop":
-            service.save(chat.id, enabled=0)
-            await service.cancel_scan(chat.id)
-            await panel(update, context, notice="⏸ Поиск и мониторинг остановлены.")
-        elif data == "menu_help":
-            await show_panel(update, HELP_TEXT + "\n/saved — сохранённые поиски\n/cancel — отменить ввод\n\nСсылки можно добавлять, заменять и удалять кнопками в разделе «Категории».\nОтправленная ссылка сохраняется; запуск выполняется кнопкой «Начать поиск».", get_main_menu())
-        elif data == "ui:add":
-            await ask_field(update, context, "add", "🔗 <b>Добавить категорию</b>\nОтправьте ссылку на категорию или выдачу OpenSooq.")
-        elif data.startswith(("ui:replace:", "ui:delete:", "ui:delete_yes:")):
-            key = data.rsplit(":", 1)[1]
-            url = next((url for url in state["urls"] if source_key(url) == key), None)
-            if url is None:
-                raise ValueError("Эта категория уже изменена или удалена.")
-            if data.startswith("ui:replace:"):
-                await ask_field(update, context, "replace", "✏️ <b>Заменить категорию</b>\nТекущая ссылка:\n" + ui_url(url) + "\n\nОтправьте новую ссылку.", url=url)
-            elif data.startswith("ui:delete_yes:"):
-                service.save(chat.id, urls=[item for item in state["urls"] if item != url])
-                if len(state["urls"]) == 1:
-                    service.save(chat.id, enabled=0)
-                    await service.cancel_scan(chat.id)
-                await panel(update, context, "sources", "🗑 Категория удалена.")
-            else:
-                await show_panel(update, "🗑 <b>Удалить эту категорию?</b>\n\n" + ui_url(url),
-                    ui_keyboard([[ ("Да, удалить", "ui:delete_yes:" + key) ], [("Отмена", "menu_sources")]]))
-        elif data == "ui:countries":
-            await show_panel(update, "🌍 <b>Выберите страну</b>\n\nБудет предложена общая выдача выбранной страны.",
-                ui_keyboard([[(label, "ui:country:" + code)] for code, label in COUNTRY_LABELS.items()] + [back]))
-        elif data.startswith("ui:country:"):
-            code = data.rsplit(":", 1)[1]
-            if code not in COUNTRY_LABELS:
-                raise ValueError("Неизвестная страна.")
-            await show_panel(update, f"🌍 <b>{COUNTRY_LABELS[code]}</b>\n\nЗаменить текущие категории общей выдачей этой страны?\nФильтры сохранятся — проверьте выбранную валюту.\nМониторинг будет остановлен. Сохраните текущий поиск заранее, если он нужен.",
-                ui_keyboard([[("Заменить категории", "ui:country_yes:" + code)], [("Отмена", "menu_sources")]]))
-        elif data.startswith("ui:country_yes:"):
-            code = data.rsplit(":", 1)[1]
-            if code not in COUNTRY_LABELS:
-                raise ValueError("Неизвестная страна.")
-            service.save(chat.id, enabled=0)
-            await service.cancel_scan(chat.id)
-            service.save(chat.id, urls=[f"https://{code}.opensooq.com/en/find?search=true&sort_code=recent"])
-            await panel(update, context, "sources", "✅ Страна изменена. Проверьте фильтры и нажмите «Начать поиск».")
-        elif data.startswith("ui:metric:"):
-            metric = data.rsplit(":", 1)[1]
-            if metric not in FILTER_LABELS:
-                raise ValueError("Неизвестный фильтр.")
-            context.user_data["panel_form"] = dict(action="range", payload={"metric": metric}, expires=time.time() + 600)
-            await show_panel(update, f"⚙️ <b>{FILTER_LABELS[metric]}</b>\n\nСейчас: <b>{escape(ui_range(state['rules'], metric))}</b>\n\nОтправьте диапазон одним сообщением: <code>1-99999</code>.\nОдно число задаёт максимум.\nФильтр сохранится автоматически.\n\nТакже можно отдельно выбрать минимум или максимум кнопками ниже.\nСнять обе границы: <code>off</code>. Отмена: /cancel.", ui_keyboard([
-                [("Минимум", "ui:field:" + metric + "_min"), ("Максимум", "ui:field:" + metric + "_max")],
-                [("Убрать ограничение", "ui:clear:" + metric)], [("‹ Все фильтры", "menu_filters")]]))
-        elif data.startswith("ui:field:"):
-            field = data.rsplit(":", 1)[1]
-            metric, _, bound = field.rpartition("_")
-            if field in TEXT_LABELS:
-                label = TEXT_LABELS[field]
-                hint = "Слова через запятую, например: iphone,samsung." if field != "currency" else "Код из трёх букв, например AED."
-            elif metric in FILTER_LABELS and bound in {"min", "max"}:
-                label = FILTER_LABELS[metric] + (" — минимум" if bound == "min" else " — максимум")
-                hint = "Одно число. Для снятия ограничения: off."
-            else:
-                raise ValueError("Неизвестное поле.")
-            await ask_field(update, context, "filter", f"⚙️ <b>{label}</b>\n{hint}\nТекущее значение: {escape(str(state['rules'].get(field, 'не задано')))}\nДля удаления значения отправьте off.", field=field)
-        elif data.startswith("ui:clear:"):
-            metric = data.rsplit(":", 1)[1]
-            if metric not in FILTER_LABELS:
-                raise ValueError("Неизвестный фильтр.")
-            rules = dict(state["rules"])
-            rules.pop(metric + "_min", None)
-            rules.pop(metric + "_max", None)
-            service.save(chat.id, rules=rules)
-            await panel(update, context, "filters", "✅ Ограничение снято.")
-        elif data == "ui:currency":
-            await show_panel(update, "💱 <b>Валюта цены</b>\n\nОбъявления с другой валютой будут исключаться. Пересчёта валют нет.", ui_keyboard([
-                [(code, "ui:currency_set:" + code) for code in ("KWD", "AED", "SAR", "BHD")],
-                [("Любая валюта", "ui:currency_set:off"), ("Другая", "ui:field:currency")], [("‹ Фильтры", "menu_filters")]]))
-        elif data.startswith("ui:currency_set:"):
-            rules = update_filters(state["rules"], "currency=" + data.rsplit(":", 1)[1])
-            service.save(chat.id, rules=rules)
-            await panel(update, context, "filters", "✅ Валюта сохранена.")
-        elif data == "ui:unknown":
-            await show_panel(update, "❔ <b>Если значение неизвестно</b>\n\nПример: задан минимум просмотров, но профиль недоступен.\n«Исключать» — такое объявление не отправляется.\n«Разрешать» — может отправиться, если остальные фильтры подходят.", ui_keyboard([
-                [("Исключать", "ui:unknown_set:exclude"), ("Разрешать", "ui:unknown_set:include")], [("‹ Фильтры", "menu_filters")]]))
-        elif data.startswith("ui:unknown_set:"):
-            rules = update_filters(state["rules"], "unknown=" + data.rsplit(":", 1)[1])
-            service.save(chat.id, rules=rules)
-            await panel(update, context, "filters", "✅ Настройка сохранена.")
-        elif data == "ui:reset":
-            await show_panel(update, "↺ <b>Сбросить все пользовательские фильтры?</b>\nКатегории и сохранённые поиски останутся.", ui_keyboard([
-                [("Сбросить", "ui:reset_yes"), ("Отмена", "menu_filters")]]))
-        elif data == "ui:reset_yes":
-            service.save(chat.id, rules={})
-            await panel(update, context, "filters", "✅ Фильтры сброшены.")
-        elif data == "ui:save":
-            if not state["urls"]:
-                raise ValueError("Сначала добавьте категорию.")
-            await ask_field(update, context, "save", "💾 <b>Сохранить текущий поиск</b>\nВведите название, например: ОАЭ · телефоны.\nСохранятся категории, фильтры и интервал.")
-        elif data.startswith(("ui:search:", "ui:load:", "ui:load_yes:", "ui:drop:", "ui:drop_yes:")):
-            search_id = int(data.rsplit(":", 1)[1])
-            row = saved_row(service, chat.id, search_id)
-            if data.startswith("ui:load_yes:"):
-                name = await load_search(service, chat.id, search_id)
-                await panel(update, context, notice=f"✅ Загружен поиск «{name}». Для запуска нажмите «Начать поиск».")
-            elif data.startswith("ui:drop_yes:"):
-                with service.db:
-                    service.db.execute("DELETE FROM saved_searches WHERE chat=? AND id=?", (chat.id, search_id))
-                await panel(update, context, "saved", "🗑 Сохранённый поиск удалён. Текущие настройки не менялись.")
-            elif data.startswith("ui:load:"):
-                await show_panel(update, "💾 <b>Загрузить поиск «" + escape(row["name"]) + "»?</b>\n\nТекущие категории и фильтры будут заменены. Мониторинг остановится. История отправок сохранится.", ui_keyboard([
-                    [("Загрузить", f"ui:load_yes:{search_id}"), ("Отмена", "ui:saved")]]))
-            elif data.startswith("ui:drop:"):
-                await show_panel(update, "🗑 Удалить сохранённый поиск «" + escape(row["name"]) + "»?", ui_keyboard([
-                    [("Удалить", f"ui:drop_yes:{search_id}"), ("Отмена", "ui:saved")]]))
-            else:
-                config = json.loads(row["config"])
-                detail = "💾 <b>" + escape(row["name"]) + "</b>\n\n"
-                detail += "\n".join(ui_url(url) for url in config["urls"])
-                detail += f"\n\nИнтервал: {config['minutes']} мин.\n\n" + filters_text(config)
-                await show_panel(update, detail, ui_keyboard([
-                    [("📂 Загрузить", f"ui:load:{search_id}"), ("🗑 Удалить", f"ui:drop:{search_id}")], [("‹ Мои поиски", "ui:saved")]]))
-        elif data == "ui:custom_interval":
-            await ask_field(update, context, "interval", "⏱ <b>Интервал мониторинга</b>\nВведите количество минут: от 5 до 1440.")
-        elif data.startswith("ui:interval:"):
-            minutes = int(data.rsplit(":", 1)[1])
-            if not 5 <= minutes <= 1440:
-                raise ValueError("Интервал: 5–1440 минут.")
-            service.save(chat.id, minutes=minutes, next_check=time.time() + minutes * 60)
-            await panel(update, context, "monitor", "✅ Интервал сохранён.")
-        else:
-            await panel(update, context)
-    except ValueError as exc:
-        await query.message.reply_text(str(exc)[:800], reply_markup=get_main_menu())
-
-
-
-def admin_target(value):
-    try:
-        target = int(str(value).strip())
-    except (ValueError, TypeError):
-        raise ValueError("Укажите Telegram ID пользователя числом.") from None
-    if target <= 0:
-        raise ValueError("Telegram ID должен быть положительным.")
-    if target == ADMIN_ID:
-        raise ValueError("Доступ администратора изменять нельзя.")
-    return target
-
-
-async def admin_panel(update, context, page=0, notice=""):
-    if update.effective_user.id != ADMIN_ID:
-        raise ValueError("Доступ закрыт.")
-    service = context.application.bot_data["service"]
-    known = set(service.allowed) | set(service.revoked)
-    for table in ("users", "authorized"):
-        known.update(row["chat"] for row in service.db.execute("SELECT chat FROM " + table))
-    users = sorted(target for target in known if target > 0 and target != ADMIN_ID)
-    pages = max(1, (len(users) + 9) // 10)
-    page = max(0, min(page, pages - 1))
-    lines = ["👑 <b>Пользователи</b>", "", f"Известных пользователей: <b>{len(users)}</b>",
-             "🟢 доступ открыт · 🚫 отозван · ⛔ заблокирован · ⚪ ожидает входа", ""]
-    rows = []
-    for target in users[page * 10:(page + 1) * 10]:
-        badge = "⛔" if is_blocked(target) else "🚫" if target in service.revoked else "🟢" if service.permitted(target) else "⚪"
-        lines.append(f"{badge} <code>{target}</code>")
-        rows.append([(f"{badge} {target}", f"ui:admin:user:{target}")])
-    navigation = []
-    if page:
-        navigation.append(("‹ Назад", f"ui:admin:page:{page-1}"))
-    if page + 1 < pages:
-        navigation.append(("Далее ›", f"ui:admin:page:{page+1}"))
-    if navigation:
-        rows.append(navigation)
-    rows.extend([
-        [("🔑 Выдать пароль", "ui:admin:choose:create"), ("🚫 Отозвать доступ", "ui:admin:choose:revoke")],
-        [("⛔ Блокировать", "ui:admin:choose:block"), ("✅ Разблокировать", "ui:admin:choose:unblock")],
-        [("‹ Главное меню", "menu_home")],
-    ])
-    text = "\n".join(lines)
-    if notice:
-        text = escape(notice) + "\n\n" + text
-    await show_panel(update, text, ui_keyboard(rows))
-
-
-async def admin_confirmation(update, context, kind, target):
-    if update.effective_user.id != ADMIN_ID:
-        raise ValueError("Доступ закрыт.")
-    target = admin_target(target)
-    descriptions = {
-        "create": "Выдать новый пароль? Старый пароль и текущая авторизация будут отозваны, мониторинг остановится.",
-        "revoke": "Отозвать пароль и доступ? Пользователь потеряет авторизацию, его мониторинг остановится. Для возврата доступа нужно выдать новый пароль.",
-        "block": "Заблокировать пользователя и остановить его мониторинг?",
-        "unblock": "Снять блокировку пользователя? Отозванный пароль этим действием не восстанавливается.",
-    }
-    if kind not in descriptions:
-        raise ValueError("Неизвестное действие.")
-    await show_panel(update, f"👤 <code>{target}</code>\n\n" + descriptions[kind], ui_keyboard([
-        [("Подтвердить", f"ui:admin:apply:{kind}:{target}"), ("Отмена", "ui:admin")],
-    ]))
-
-
-async def admin_callback(update, context, data):
-    if update.effective_user.id != ADMIN_ID:
-        raise ValueError("Доступ закрыт.")
-    service = context.application.bot_data["service"]
-    parts = data.split(":")
-    if data == "ui:admin":
-        await admin_panel(update, context)
-    elif len(parts) == 4 and parts[2] == "page":
-        await admin_panel(update, context, int(parts[3]))
-    elif len(parts) == 4 and parts[2] == "choose":
-        kind = parts[3]
-        if kind not in {"create", "revoke", "block", "unblock"}:
-            raise ValueError("Неизвестное действие.")
-        await ask_field(update, context, "admin_target", "👤 <b>Telegram ID пользователя</b>\nПопросите пользователя отправить боту /id и пришлите полученное число.", kind=kind)
-    elif len(parts) == 4 and parts[2] == "user":
-        target = admin_target(parts[3])
-        state = service.state(target)
-        status = "заблокирован" if is_blocked(target) else "доступ отозван" if target in service.revoked else "доступ открыт" if service.permitted(target) else "ожидает входа"
-        await show_panel(update, f"👤 <b>Пользователь</b> <code>{target}</code>\n\nСтатус: {status}\nКатегорий: {len(state['urls'])}\nМониторинг: {'включён' if state['enabled'] else 'выключен'}", ui_keyboard([
-            [("🔑 Новый пароль", f"ui:admin:confirm:create:{target}"), ("🚫 Отозвать", f"ui:admin:confirm:revoke:{target}")],
-            [("⛔ Блокировать", f"ui:admin:confirm:block:{target}"), ("✅ Разблокировать", f"ui:admin:confirm:unblock:{target}")],
-            [("‹ Пользователи", "ui:admin")],
-        ]))
-    elif len(parts) == 5 and parts[2] == "confirm":
-        await admin_confirmation(update, context, parts[3], admin_target(parts[4]))
-    elif len(parts) == 5 and parts[2] == "apply":
-        kind, target = parts[3], admin_target(parts[4])
-        if kind == "create":
-            await service.revoke_access(target)
-            password = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12))
-            save_user_password(target, password)
-            await update.callback_query.message.reply_text(
-                f"🔑 Новый пароль для <code>{target}</code>:\n<code>{password}</code>\n\nПередайте пароль пользователю. Его старый доступ отозван.", parse_mode="HTML")
-            notice = f"Пароль для {target} создан."
-        elif kind == "revoke":
-            await service.revoke_access(target)
-            notice = f"🚫 Пароль и доступ пользователя {target} отозваны."
-        elif kind == "block":
-            block_user(target)
-            service.state(target)
-            service.save(target, enabled=0)
-            await service.cancel_scan(target)
-            notice = f"⛔ Пользователь {target} заблокирован."
-        elif kind == "unblock":
-            unblock_user(target)
-            notice = f"✅ Блокировка пользователя {target} снята."
-        else:
-            raise ValueError("Неизвестное действие.")
-        await admin_panel(update, context, notice=notice)
-    else:
-        raise ValueError("Кнопка устарела. Откройте админ-панель заново.")
-
-
-def build_app(token, allowed, database):
-    async def setup(app):
-        service = Service(app.bot, allowed, database)
-        app.bot_data["service"] = service
-        log.info("[startup] database=%s data_dir=%s browser=%s proxy=%s", Path(database).resolve(), DATA_DIR.resolve(), USE_BROWSER, bool(service.reader.proxy_url))
-        if os.getenv("PORT"):
-            class HealthHandler(BaseHTTPRequestHandler):
-                def do_GET(self):
-                    self.send_response(200 if self.path in {"/", "/healthz"} else 404)
-                    self.end_headers()
-                    self.wfile.write(b"ok")
-                def log_message(self, *args):
-                    pass
-            server = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT"])), HealthHandler)
-            threading.Thread(target=server.serve_forever, daemon=True).start()
-            app.bot_data["health_server"] = server
-        if app.job_queue is None:
-            raise RuntimeError('Установите python-telegram-bot с дополнением [job-queue].')
-        app.job_queue.run_repeating(service.tick, interval=15, first=5)
-        await app.bot.set_my_commands([
-            BotCommand("start", "Меню"), BotCommand("check", "Проверить объявления"),
-            BotCommand("restart", "Перезапустить проверку"), BotCommand("pause", "Остановить"),
-            BotCommand("status", "Статус и отчёт"), BotCommand("help", "Справка"), BotCommand("id", "Мой ID"),
-            BotCommand("testproxy", "Проверить прокси и просмотры"),
-            BotCommand("saved", "Сохранённые поиски"), BotCommand("cancel", "Отменить ввод"),
-        ])
-    async def cleanup(app):
-        server = app.bot_data.pop("health_server", None)
-        if server:
-            await asyncio.to_thread(server.shutdown)
-            server.server_close()
-        service = app.bot_data.pop("service", None)
-        if service:
-            await service.close()
-    async def on_error(update, context):
-        error = context.error
-        log.error("Ошибка обработчика: %s", type(error).__name__, exc_info=(type(error), error, error.__traceback__))
-    app = (Application.builder().token(token).concurrent_updates(False)
-           .post_init(setup).post_stop(cleanup).post_shutdown(cleanup).build())
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, handle))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_error_handler(on_error)
-    return app
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-    token = os.getenv("BOT_TOKEN", "").strip()
-    if not token:
-        raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
-    allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    build_app(token, allowed, DATABASE).run_polling(allowed_updates=["message", "callback_query"])
