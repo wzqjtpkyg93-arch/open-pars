@@ -808,7 +808,7 @@ listings_count — активные объявления продавца
 
 
 def report_text(stats, elapsed, outcome, warnings, missing):
-    titles = {"complete": "✅ Поиск завершён", "partial": "⚠️ Поиск завершён с замечаниями",
+    titles = {"complete": "✅ Поиск завершён", "partial": "⏹ Поиск завершён",
               "error": "❌ Поиск прерван", "stopped": "⏸ Поиск остановлен", "limit": "📦 Достигнут лимит поиска"}
     seconds = max(0, round(elapsed))
     duration = f"{seconds // 60} мин. {seconds % 60} сек." if seconds >= 60 else f"{seconds} сек."
@@ -819,13 +819,6 @@ def report_text(stats, elapsed, outcome, warnings, missing):
         f"Страниц: {stats['pages']} · Карточек: {stats['found']}\n"
         f"Обработано новых: {stats['checked']}\n"
         f"Отсеяно фильтрами: {stats['filtered']} · Ошибок: {stats['errors']}")
-    if stats['profiles']:
-        text += f"\nНеполная статистика продавца: {stats['profiles']}"
-    if missing:
-        names = {"seller_views": "просмотры профиля", "listings_count": "активные объявления"}
-        text += "\n\nНедоступны: " + escape(", ".join(names.get(k, k) for k in sorted(missing)))
-    if warnings:
-        text += "\n\n<b>Замечания</b>\n" + "\n".join("• " + escape(w[:220]) for w in list(warnings)[:4])
     return text
 
 
@@ -1072,6 +1065,10 @@ class Service:
                     await progress_task
             if outcome == "complete" and warnings:
                 outcome = "partial"
+            for warning in warnings:
+                log.warning("[scan_detail] chat=%s %s", chat, error_text(warning))
+            if missing:
+                log.warning("[scan_missing] chat=%s fields=%s", chat, ",".join(sorted(missing)))
             report = report_text(stats, time.monotonic() - started, outcome, warnings, missing)
             log.info("[scan_done] chat=%s outcome=%s pages=%s sent=%s duplicates=%s filtered=%s errors=%s", chat, outcome, stats["pages"], stats["sent"], stats["duplicates"], stats["filtered"], stats["errors"])
             with suppress(sqlite3.Error):
@@ -1269,6 +1266,24 @@ def ui_range(rules, metric):
 
 def ui_url(url):
     return escape(url if len(url) <= 180 else url[:177] + "…")
+
+
+def metric_input(rules, metric, text):
+    if metric not in FILTER_LABELS:
+        raise ValueError("Неизвестный фильтр.")
+    text = unicodedata.normalize("NFKC", text).strip()
+    if text.lower() in {"off", "none"}:
+        result = dict(rules)
+        result.pop(metric + "_min", None)
+        result.pop(metric + "_max", None)
+        return result
+    match = re.fullmatch(
+        r"(?:от\s*)?(\d+(?:[.,]\d+)?)\s*(?:-|–|—|\.\.|до)\s*(\d+(?:[.,]\d+)?)", text, re.I)
+    if match:
+        return update_filters(rules, f"{metric}_min={match[1]} {metric}_max={match[2]}")
+    if not re.fullmatch(r"\d+(?:[.,]\d+)?", text):
+        raise ValueError("Введите диапазон, например 1-99999, либо одно число для максимума. Убрать ограничение: off.")
+    return update_filters(rules, f"{metric}_max={text}")
 
 
 def source_key(url):
@@ -1509,9 +1524,23 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     urls.append(url)
                 service.save(chat.id, urls=urls)
                 screen = "sources"
-            elif action == "filter":
-                field = payload["field"]
-                rules = update_filters(state["rules"], field + "=" + shlex.quote(text))
+            elif action in {"filter", "range"}:
+                if action == "range":
+                    metric = payload["metric"]
+                    rules = metric_input(state["rules"], metric, text)
+                    notice = f"✅ {FILTER_LABELS[metric]}: {ui_range(rules, metric)}. Фильтр сохранён."
+                else:
+                    field = payload["field"]
+                    metric, _, bound = field.rpartition("_")
+                    range_text = re.fullmatch(r"(?:от\s*)?\d+(?:[.,]\d+)?\s*(?:-|–|—|\.\.|до)\s*\d+(?:[.,]\d+)?", text, re.I)
+                    if metric in FILTER_LABELS and bound in {"min", "max"} and range_text:
+                        rules = metric_input(state["rules"], metric, text)
+                        notice = f"✅ {FILTER_LABELS[metric]}: {ui_range(rules, metric)}. Фильтр сохранён."
+                    else:
+                        rules = update_filters(state["rules"], field + "=" + shlex.quote(text))
+                        label = TEXT_LABELS.get(field, FILTER_LABELS.get(metric, field))
+                        display = ui_range(rules, metric) if metric in FILTER_LABELS else str(rules.get(field) or "не задано")
+                        notice = f"✅ {label}: {display}. Фильтр сохранён."
                 service.save(chat.id, rules=rules)
                 screen = "filters"
             elif action == "save":
@@ -1627,7 +1656,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             metric = data.rsplit(":", 1)[1]
             if metric not in FILTER_LABELS:
                 raise ValueError("Неизвестный фильтр.")
-            await show_panel(update, f"⚙️ <b>{FILTER_LABELS[metric]}</b>\n\nСейчас: <b>{escape(ui_range(state['rules'], metric))}</b>\nВыберите нижнюю или верхнюю границу.", ui_keyboard([
+            context.user_data["panel_form"] = dict(action="range", payload={"metric": metric}, expires=time.time() + 600)
+            await show_panel(update, f"⚙️ <b>{FILTER_LABELS[metric]}</b>\n\nСейчас: <b>{escape(ui_range(state['rules'], metric))}</b>\n\nОтправьте диапазон одним сообщением: <code>1-99999</code>.\nОдно число задаёт максимум.\nФильтр сохранится автоматически.\n\nТакже можно отдельно выбрать минимум или максимум кнопками ниже.\nСнять обе границы: <code>off</code>. Отмена: /cancel.", ui_keyboard([
                 [("Минимум", "ui:field:" + metric + "_min"), ("Максимум", "ui:field:" + metric + "_max")],
                 [("Убрать ограничение", "ui:clear:" + metric)], [("‹ Все фильтры", "menu_filters")]]))
         elif data.startswith("ui:field:"):
