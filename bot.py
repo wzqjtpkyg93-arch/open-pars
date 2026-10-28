@@ -9,6 +9,7 @@ import secrets
 import shlex
 import sqlite3
 import string
+import sys
 import threading
 import time
 import unicodedata
@@ -123,6 +124,10 @@ def proxy_settings(value):
 
 def error_text(error):
     text = str(error)
+    for key in ("BOT_TOKEN", "XROCKET_API_TOKEN"):
+        secret = os.getenv(key, "").strip()
+        if secret:
+            text = text.replace(secret, "[hidden]")
     value = os.getenv("OPENSOOQ_PROXY_URL", "").strip()
     if value:
         text = text.replace(value, "[proxy]")
@@ -2362,14 +2367,19 @@ def build_app(token, allowed, database):
             raise RuntimeError('Установите python-telegram-bot с дополнением [job-queue].')
         app.job_queue.run_repeating(service.tick, interval=15, first=5)
         app.job_queue.run_repeating(service.billing.poll, interval=30, first=10)
-        await app.bot.set_my_commands([
-            BotCommand("start", "Меню"), BotCommand("check", "Проверить объявления"),
-            BotCommand("restart", "Перезапустить проверку"), BotCommand("pause", "Остановить"),
-            BotCommand("status", "Статус и отчёт"), BotCommand("help", "Справка"), BotCommand("id", "Мой ID"),
-            BotCommand("testproxy", "Проверить прокси и просмотры"),
-            BotCommand("saved", "Сохранённые поиски"), BotCommand("cancel", "Отменить ввод"),
-            BotCommand("subscription", "Подписка и оплата"),
-        ])
+        try:
+            await app.bot.set_my_commands([
+                BotCommand("start", "Меню"), BotCommand("check", "Проверить объявления"),
+                BotCommand("restart", "Перезапустить проверку"), BotCommand("pause", "Остановить"),
+                BotCommand("status", "Статус и отчёт"), BotCommand("help", "Справка"), BotCommand("id", "Мой ID"),
+                BotCommand("testproxy", "Проверить прокси и просмотры"),
+                BotCommand("saved", "Сохранённые поиски"), BotCommand("cancel", "Отменить ввод"),
+                BotCommand("subscription", "Подписка и оплата"),
+            ])
+        except TelegramError as exc:
+            # Список команд — оформление меню; временная ошибка этого вызова
+            # не должна останавливать уже инициализированный парсер.
+            log.warning("[startup_commands] %s", error_text(exc))
     async def cleanup(app):
         server = app.bot_data.pop("health_server", None)
         if server:
@@ -2389,12 +2399,105 @@ def build_app(token, allowed, database):
     return app
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+class StartupCheckError(Exception):
+    def __init__(self, code, message):
+        self.code = code
+        super().__init__(message)
+
+
+def check_startup(network=True, client=None):
+    """Без polling, платежей и записи в БД. Безопасно для Pre-Deploy Command."""
+    token = os.getenv("BOT_TOKEN", "").strip()
+    if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", token):
+        raise StartupCheckError(11, "BOT_TOKEN_FORMAT: нужен токен Telegram от BotFather, а не ключ xRocket.")
+    if ADMIN_ID <= 0 or (SUBSCRIPTIONS_ENABLED and not os.getenv("ADMIN_ID", "").strip()):
+        raise StartupCheckError(12, "ADMIN_ID: укажите положительный числовой Telegram ID владельца.")
+    try:
+        {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
+        proxy_settings(os.getenv("OPENSOOQ_PROXY_URL", ""))
+        if os.getenv("PORT") and not 0 <= int(os.environ["PORT"]) <= 65535:
+            raise ValueError()
+    except ValueError:
+        raise StartupCheckError(13, "CONFIG: проверьте формат ALLOWED_TELEGRAM_IDS, PORT и OPENSOOQ_PROXY_URL.") from None
+    if SUBSCRIPTIONS_ENABLED:
+        if not os.getenv("XROCKET_API_TOKEN", "").strip():
+            raise StartupCheckError(14, "XROCKET_API_TOKEN: ключ отсутствует при включённых подписках.")
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", os.getenv("SUPPORT_USERNAME", "").strip().lstrip("@")):
+            raise StartupCheckError(15, "SUPPORT_USERNAME: нужен Telegram username поддержки, без ссылки.")
+    print("[startup_check] CONFIG_OK", flush=True)
+    if not network:
+        return
+
+    owned = client is None
+    if owned:
+        client = httpx.Client(timeout=httpx.Timeout(15, connect=10), trust_env=False, follow_redirects=False)
+    try:
+        # Единственный запрос к Telegram — getMe. Второй getUpdates не запускается.
+        try:
+            response = client.get("https://api.telegram.org/bot" + token + "/getMe")
+        except httpx.RequestError:
+            raise StartupCheckError(22, "TELEGRAM_NETWORK: нет соединения с api.telegram.org из нового контейнера.") from None
+        if response.status_code in {401, 404}:
+            raise StartupCheckError(21, "TELEGRAM_AUTH: Telegram отверг BOT_TOKEN. Проверьте его у BotFather.")
+        if response.status_code != 200:
+            raise StartupCheckError(23, f"TELEGRAM_HTTP: HTTP {response.status_code} при getMe.")
+        try:
+            if response.json().get("ok") is not True:
+                raise ValueError()
+        except (ValueError, AttributeError):
+            raise StartupCheckError(23, "TELEGRAM_RESPONSE: некорректный ответ getMe.") from None
+        print("[startup_check] TELEGRAM_OK", flush=True)
+
+        if SUBSCRIPTIONS_ENABLED:
+            base = "https://pay.api.testnet.xrocket.exchange" if XROCKET_TESTNET else "https://pay.api.xrocket.exchange"
+            try:
+                # Только сведения о приложении; счетов, переводов и списаний нет.
+                response = client.get(base + "/api/v1/app-info", headers={
+                    "Authorization": "Bearer " + os.getenv("XROCKET_API_TOKEN", "").strip()})
+            except httpx.RequestError:
+                raise StartupCheckError(32, "XROCKET_NETWORK: нет соединения с xRocket Pay API.") from None
+            if response.status_code in {401, 403}:
+                raise StartupCheckError(31, "XROCKET_AUTH: проверьте Current Pay API Token и соответствие XROCKET_TESTNET выбранному приложению.")
+            if response.status_code != 200:
+                raise StartupCheckError(33, f"XROCKET_HTTP: HTTP {response.status_code} при чтении сведений о приложении.")
+            print("[startup_check] XROCKET_OK", flush=True)
+        print("[startup_check] CHECK_COMPLETE", flush=True)
+    finally:
+        if owned:
+            client.close()
+
+
+class SecretFormatter(logging.Formatter):
+    def format(self, record):
+        return error_text(super().format(record))
+
+
+def main():
+    handler = logging.StreamHandler()
+    handler.setFormatter(SecretFormatter("%(asctime)s %(levelname)s %(message)s"))
+    logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    if "--check-startup" in sys.argv:
+        try:
+            check_startup()
+            return 0
+        except StartupCheckError as exc:
+            print(f"[startup_check_failed] EXIT={exc.code} {error_text(exc)}", flush=True)
+            return exc.code
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    build_app(token, allowed, DATABASE).run_polling(allowed_updates=["message", "callback_query"])
+    log.info("[boot_v10] Создание Telegram Application")
+    app = build_app(token, allowed, DATABASE)
+    try:
+        app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
+    except Exception:
+        log.exception("[startup_failed] Бот остановился при запуске")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
