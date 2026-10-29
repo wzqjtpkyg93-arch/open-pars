@@ -1808,18 +1808,26 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message or not message.text or not user or not chat or chat.type != "private":
         return
     command = message.text.strip().split(maxsplit=1)[0].split("@")[0].lower() if message.text.strip() else ""
-    if command in {"/account","/account_off"}:
+    if command in {"/account","/account_off","/account_diag"}:
         if user.id!=ADMIN_ID:
             await message.reply_text("Подключение личного аккаунта доступно только владельцу.")
             return
         try:
+            if command=="/account_diag":
+                await message.reply_text(service.account_login.diagnostic_text())
+                return
             if command=="/account":
+                parts=message.text.strip().split()
+                country=parts[1].lower() if len(parts)==2 else "sa"
+                if len(parts)>2 or country not in COUNTRIES:
+                    await message.reply_text("Выберите страну аккаунта: /account sa, /account kw, /account ae или /account bh. Без параметра — Саудовская Аравия.")
+                    return
                 origin=account_origin()
                 if not os.getenv('PORT'):
                     raise ValueError('Включите Web Service с PORT на Render для страницы входа.')
-                token=await service.account_login.issue()
+                token=await service.account_login.issue(country)
                 keyboard=InlineKeyboardMarkup([[InlineKeyboardButton('🔐 Войти в OpenSooq',url=origin+'/account#'+token)]])
-                await message.reply_text("🔐 Личная страница входа на 15 минут. Откройте кнопку на iPhone, войдите в OpenSooq, откройте существующий чат и нажмите «Сохранить вход». Ссылку не пересылайте. Коды в Telegram вводить не нужно. Сам вход не начинает переписку.",reply_markup=keyboard)
+                await message.reply_text("Страна входа: "+COUNTRY_LABELS[country]+"\n\n🔐 Личная страница входа на 15 минут. Откройте кнопку на iPhone, войдите в OpenSooq, откройте существующий чат и нажмите «Сохранить вход». Ссылку не пересылайте. Коды в Telegram вводить не нужно. Сам вход не начинает переписку.",reply_markup=keyboard)
             else:
                 dialogs=service.dialogues
                 dialogs.cancelled.update(r['id'] for r in dialogs.db.execute('SELECT id FROM seller_dialogues WHERE chat=?',(ADMIN_ID,)))
@@ -3122,10 +3130,72 @@ class AccountLogin:
         self.active=False
         self.lock=asyncio.Lock()
         self.pw=self.browser=self.context=self.page=None
+        self.country='sa'
+        self.diag_flags=set()
+        self.diag_http=Counter()
+        self.diag_failures=Counter()
+        self.diag_exists=False
+        self.last_diag_check=0.0
 
-    async def issue(self):
+    def diagnostic_text(self):
+        if not self.diag_exists:
+            return 'Диагностика пуста: эта версия ещё не наблюдала вход. Команда /account_diag сама не открывает сайт и не повторяет вход. Старые попытки из предыдущих версий не записаны.'
+        lines=['Диагностика последнего сеанса /account',
+               'Страна: '+COUNTRY_LABELS.get(self.country,self.country),
+               'Доступ к странице: '+('активен' if self.active and time.monotonic()<self.expires else 'закрыт или истёк')]
+        flags={'captcha_failed':'Сайт сообщил: reCAPTCHA verification failed.',
+               'unauthorized':'Сайт сообщил: Unauthorized — точная причина не раскрыта.',
+               'wait':'Сайт просит подождать перед повторным входом.',
+               'browser_error':'Браузер на сервере не удалось открыть.'}
+        lines.extend(flags[k] for k in sorted(self.diag_flags) if k in flags)
+        for (provider,status),count in sorted(self.diag_http.items()):
+            lines.append(f'{provider}: HTTP {status}, ответов {count}')
+        for provider,count in sorted(self.diag_failures.items()):
+            lines.append(f'{provider}: запросов без ответа {count}')
+        if not self.diag_flags and not any(status>=400 for _,status in self.diag_http):
+            lines.append('Причина отказа не зафиксирована; это не подтверждение успешного входа.')
+        lines.append('Здесь нет паролей, номеров, кодов, cookie, URL и содержимого запросов. Отчёт собирается с момента /account и хранится до нового сеанса или перезапуска.')
+        return '\n'.join(lines)
+
+    @staticmethod
+    def diagnostic_provider(url):
+        host=urlsplit(url).hostname or ''
+        if host=='opensooq.com' or host.endswith('.opensooq.com'):
+            return 'OpenSooq'
+        if host in {'www.google.com','recaptcha.google.com','www.recaptcha.net','recaptcha.net','www.gstatic.com'} and urlsplit(url).path.startswith('/recaptcha/'):
+            return 'reCAPTCHA'
+        return ''
+
+    def response_seen(self,response):
+        provider=self.diagnostic_provider(response.url)
+        if provider:
+            self.diag_http[(provider,int(response.status))]+=1
+
+    def request_failed(self,request):
+        provider=self.diagnostic_provider(request.url)
+        if provider:
+            self.diag_failures[provider]+=1
+
+    async def collect_flags(self):
+        if self.page is None or time.monotonic()-self.last_diag_check<3:
+            return
+        self.last_diag_check=time.monotonic()
+        for key,pattern in [('captcha_failed',r'^recaptcha verification failed$'),
+                            ('unauthorized',r'^unauthorized$'),
+                            ('wait',r'^please wait before trying again(?: or contact us)?$')]:
+            with suppress(Exception):
+                if await self.page.get_by_text(re.compile(pattern,re.I)).first.is_visible():
+                    self.diag_flags.add(key)
+
+    async def issue(self,country='sa'):
+        if country not in COUNTRIES:
+            raise ValueError('Неизвестная страна аккаунта.')
         async with self.lock:
             await self._close()
+            self.country=country
+            self.diag_flags.clear();self.diag_http.clear();self.diag_failures.clear()
+            self.diag_exists=True
+            self.last_diag_check=0.0
             self.token=secrets.token_urlsafe(32)
             self.expires=time.monotonic()+900
             self.active=True
@@ -3150,6 +3220,8 @@ class AccountLogin:
             self.context=await self.browser.new_context(viewport={'width':420,'height':820},locale='en-US')
             self.page=await self.context.new_page()
             self.page.set_default_timeout(12000)
+            self.page.on('response',self.response_seen)
+            self.page.on('requestfailed',self.request_failed)
             # Управление только официальным OpenSooq, без произвольного браузерного прокси.
             async def restrict(route):
                 req=route.request
@@ -3163,11 +3235,12 @@ class AccountLogin:
                         return
                 await route.continue_()
             await self.context.route('**/*',restrict)
-            await self.page.goto('https://kw.opensooq.com/en',wait_until='domcontentloaded',timeout=30000)
+            await self.page.goto(f'https://{self.country}.opensooq.com/en',wait_until='domcontentloaded',timeout=30000)
         except asyncio.CancelledError:
             await self._close()
             raise
         except Exception:
+            self.diag_flags.add('browser_error')
             await self._close()
             raise DialogueUnavailable('Не удалось открыть браузер входа. Проверьте установку Chromium и доступную память Render.') from None
 
@@ -3175,6 +3248,7 @@ class AccountLogin:
         async with self.lock:
             if not self.authorized(authorization):raise PermissionError()
             await self._open()
+            await self.collect_flags()
             return await self.page.screenshot(type='png')
 
     async def action(self, authorization, data):
@@ -3207,6 +3281,7 @@ class AccountLogin:
                 await self._close()
                 return {'finished':True,'message':'Браузер закрыт. Новый вход не сохранён.'}
             else:raise ValueError('Действие не поддерживается.')
+            await self.collect_flags()
             return {'message':'Готово'}
 
     async def _save(self):
@@ -3468,7 +3543,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v14] Создание Telegram Application")
+    log.info("[boot_v15] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
