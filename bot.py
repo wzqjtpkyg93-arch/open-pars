@@ -206,11 +206,59 @@ def flight(soup):
             with suppress(ValueError): result.append(json.loads(value))
     return result
 
+def registration_date(value):
+    """Только дата аккаунта из явно названного поля, без выдуманного дня."""
+    text = unicodedata.normalize("NFKC", plain(value))
+    text = "".join(str(unicodedata.digit(c)) if c.isdecimal() else c for c in text)
+    for pattern, fmt in ((r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)", "%Y-%m-%d"),
+                         (r"(?<!\d)\d{2}-\d{2}-\d{4}(?!\d)", "%d-%m-%Y"),
+                         (r"(?<!\d)\d{2}/\d{2}/\d{4}(?!\d)", "%d/%m/%Y"),
+                         (r"(?<!\d)\d{2}\.\d{2}\.\d{4}(?!\d)", "%d.%m.%Y")):
+        match = re.search(pattern, text)
+        if match:
+            with suppress(ValueError):
+                return datetime.strptime(match[0], fmt).strftime("%d.%m.%Y")
+    # Дата с названием месяца: поддерживаем лишь явные английские форматы.
+    for fmt in ("%d %B %Y", "%d %b %Y", "%B %d, %Y", "%b %d, %Y", "%B %Y", "%b %Y"):
+        candidate = re.sub(r"^(?:Member\s+Since|Joined|Registered)\s*:?\s*", "", text, flags=re.I).strip()
+        with suppress(ValueError):
+            parsed = datetime.strptime(candidate, fmt)
+            return parsed.strftime("%m.%Y" if "%d" not in fmt else "%d.%m.%Y")
+    if re.fullmatch(r"(?:Member\s+Since\s*:?\s*)?(?:19|20)\d{2}", text, re.I):
+        return text[-4:]
+    return ""
+
+
+def seller_keys(ad):
+    """ID и точная ссылка профиля; имя продавца не является идентификатором."""
+    keys = []
+    seller_id = str(ad.get("seller_id") or "").strip()
+    if seller_id and seller_id != "0":
+        keys.append(f"id:{seller_id}")
+    if ad.get("seller_url"):
+        with suppress(ValueError):
+            profile = urlsplit(safe_url(ad["seller_url"], ad["url"]))
+            keys.append(f"{profile.hostname}:url:{unquote(profile.path).rstrip('/')}")
+    return keys
+
+
+def rules_key(rules):
+    normalized = {k: int(v) if isinstance(v, float) and v.is_integer() else v for k, v in rules.items()}
+    return hashlib.sha256(json.dumps(normalized, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def recent_source(url):
+    parsed = urlsplit(safe_url(url))
+    query = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k not in {"page", "sort_code"}]
+    query.append(("sort_code", "recent"))
+    return safe_url(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), "")))
+
+
 def parse_profile(raw, expected_id):
     """Счётчики профиля; listings_count — общее число Live Listings."""
     soup = BeautifulSoup(raw, "html.parser")
     result = {key: None for key in (
-        "rating", "ratings", "reviews", "seller_views", "sold", "listings_count"
+        "rating", "ratings", "reviews", "seller_views", "sold", "listings_count", "seller_registered"
     )}
 
     def put(key, value, convert=count):
@@ -229,7 +277,7 @@ def parse_profile(raw, expected_id):
     for obj in walk(documents):
         member = obj.get("member")
         if isinstance(member, dict) and any(key in member for key in (
-            "views_count", "views", "posts_count", "member_info", "rating"
+            "views_count", "views", "posts_count", "member_info", "rating", "member_since"
         )):
             members.append(member)
 
@@ -246,6 +294,10 @@ def parse_profile(raw, expected_id):
             raise SourceError("Открыт профиль другого продавца.")
 
     for member in members:
+        for field in ("member_since", "registration_date", "registered_at", "joined_at"):
+            registered = registration_date(member.get(field))
+            if registered and result["seller_registered"] is None:
+                result["seller_registered"] = registered
         put("seller_views", member.get("views_count"))
         put("seller_views", member.get("views"))
         # posts_count не считаем подтверждённым числом активных объявлений.
@@ -307,6 +359,10 @@ def parse_profile(raw, expected_id):
                     put(key, match.group(1))
 
     page_text = clean_text(soup.get_text(" ", strip=True))
+    if result["seller_registered"] is None:
+        match = re.search(r"(?:Member\s+Since|Joined|Registered|عضو\s+منذ|تاريخ\s+التسجيل|تاريخ\s+الانضمام)\s*:?\s*([^|•]{1,55})", page_text, re.I)
+        if match:
+            result["seller_registered"] = registration_date(match[1]) or None
     if result["reviews"] is None:
         match = re.search(r"(?:\(|^|\s)(\d+)\s*(?:reviews?|تقييمات|مراجعات)", page_text, re.I)
         if match:
@@ -611,6 +667,9 @@ def parse_listing(raw, ad):
     ):
         if owner.get(key) is not None:
             ad[target] = convert(owner[key])
+    registered = registration_date(owner.get("member_since") or owner.get("memberSince") or owner.get("registrationDate"))
+    if registered:
+        ad["seller_registered"] = registered
     # Это неподтверждённый общий счётчик карточки. Не выдаём его за Live Listings.
     ad["seller_listings_hint"] = count(owner.get("numberOfListings"))
     if owner.get("memberLink"):
@@ -818,7 +877,7 @@ class Reader:
             self.cache = dict(list(self.cache.items())[-1000:])
         return profile, issue
 
-    async def enrich(self, ad, rules=None):
+    async def enrich(self, ad, rules=None, seller_seen=None):
         if excluded_topic(ad):
             ad["_filtered_before_profile"] = True
             return ad, ""
@@ -843,6 +902,9 @@ class Reader:
             if not matches(ad, early_rules)[0]:
                 ad["_filtered_before_profile"] = True
                 return ad, ""
+        if seller_seen is not None and seller_seen(ad):
+            ad["_seller_already_sent"] = True
+            return ad, ""
         if not ad.get("seller_url"):
             return ad, "В объявлении отсутствует ссылка на профиль продавца."
         profile, warning = await self.profile(ad["seller_url"], ad["seller_id"])
@@ -884,7 +946,8 @@ def card(ad):
         lines.extend(["", f"<blockquote>{escape(desc)}</blockquote>"])
     lines.extend(["", "👤 <b>" + escape((ad.get("seller_name") or "Продавец")[:60]) + "</b>",
         f"👁 Просмотры профиля: <b>{show('seller_views')}</b>",
-        f"📦 Активных объявлений: <b>{show('listings_count')}</b>"])
+        f"📦 Активных объявлений: <b>{show('listings_count')}</b>",
+        "📅 Регистрация продавца: <b>" + escape(str(ad.get("seller_registered") or "нет данных")) + "</b>"])
     if ad.get("listings_count") is None and ad.get("seller_listings_hint") is not None:
         lines.append(f"По карточке продавца: {show('seller_listings_hint')} объявлений — активность не подтверждена")
     rating = []
@@ -926,7 +989,8 @@ HELP_TEXT = """ℹ️ Команды
 /filters unknown=include — пропускать объявления с неизвестными счётчиками
 /filters unknown=exclude — исключать их при активных ограничениях
 /reset — сбросить фильтры
-/check — проверить объявления
+/check — проверить ещё не просмотренные объявления
+/deepcheck — пройти старые страницы, пропуская проверенные карточки
 /restart — перезапустить проверку
 /watch — регулярная проверка
 /interval 15 — интервал 5–1440 минут
@@ -943,7 +1007,10 @@ seller_views — просмотры профиля продавца
 listings_count — активные объявления продавца
 
 Для добавления категории отправьте её ссылку.
-Повторная проверка сохраняет историю уже отправленных объявлений.
+Повторная проверка пропускает уже проверенные карточки с теми же фильтрами.
+От одного продавца отправляется одно объявление.
+После двух страниц только со знакомыми карточками быстрый поиск останавливается.
+/deepcheck продолжает поиск глубже: полезно, если свежая карточка попала ниже закреплённых.
 """
 
 
@@ -959,10 +1026,14 @@ def report_text(stats, elapsed, outcome, warnings, missing):
     text = (f"<b>{titles[outcome]}</b>\n\n"
         f"Отправлено объявлений: <b>{stats['sent']}</b>\n"
         f"Уже отправлялись: <b>{stats['duplicates']}</b>\n"
+        f"Проверены ранее: <b>{stats['previously_checked']}</b>\n"
+        f"Повторы продавцов: <b>{stats['seller_duplicates']}</b>\n"
         f"Время: <b>{duration}</b>\n\n"
         f"Страниц: {stats['pages']} · Карточек: {stats['found']}\n"
-        f"Обработано новых: {stats['checked']}\n"
+        f"Проверено карточек: {stats['checked']}\n"
         f"Отсеяно фильтрами: {stats['filtered']} · Ошибок: {stats['errors']}")
+    if stats["history_boundary"]:
+        text += "\n\nСвежая часть выдачи проверена; дальше знакомые карточки. Глубокая проверка: /deepcheck."
     return text
 
 
@@ -977,6 +1048,13 @@ class Service:
             PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS users(chat INTEGER PRIMARY KEY, urls TEXT NOT NULL DEFAULT '[]', rules TEXT NOT NULL DEFAULT '{}', enabled INTEGER NOT NULL DEFAULT 0, minutes INTEGER NOT NULL DEFAULT 15, next_check REAL NOT NULL DEFAULT 0, last TEXT NOT NULL DEFAULT '');
             CREATE TABLE IF NOT EXISTS delivered(chat INTEGER NOT NULL, key TEXT NOT NULL, PRIMARY KEY(chat,key));
+            CREATE TABLE IF NOT EXISTS checked_ads(
+                chat INTEGER NOT NULL, rules TEXT NOT NULL, key TEXT NOT NULL,
+                PRIMARY KEY(chat,rules,key)
+            );
+            CREATE TABLE IF NOT EXISTS delivered_sellers(
+                chat INTEGER NOT NULL, key TEXT NOT NULL, PRIMARY KEY(chat,key)
+            );
             CREATE TABLE IF NOT EXISTS authorized(chat INTEGER PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS revoked(chat INTEGER PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS subscriptions(chat INTEGER PRIMARY KEY, until REAL NOT NULL);
@@ -1064,13 +1142,24 @@ class Service:
         with self.db:
             self.db.execute("UPDATE users SET " + ",".join(k + "=?" for k in changes) + " WHERE chat=?", values + [chat])
 
-    def trigger(self, chat):
+    def seller_seen(self, chat, ad):
+        return any(self.db.execute("SELECT 1 FROM delivered_sellers WHERE chat=? AND key=?", (chat, key)).fetchone()
+                   for key in seller_keys(ad))
+
+    def remember_seller(self, chat, ad):
+        self.db.executemany("INSERT OR IGNORE INTO delivered_sellers VALUES (?,?)", [(chat, key) for key in seller_keys(ad)])
+
+    def mark_checked(self, chat, signature, key):
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO checked_ads VALUES (?,?,?)", (chat, signature, key))
+
+    def trigger(self, chat, deep=False):
         if self.closing or not self.permitted(chat) or not self.state(chat)["urls"]:
             return False
         if chat in self.tasks and not self.tasks[chat].done():
             return False
         self.save(chat, next_check=time.time() + self.state(chat)["minutes"] * 60)
-        self.tasks[chat] = asyncio.create_task(self.scan(chat))
+        self.tasks[chat] = asyncio.create_task(self.scan(chat, deep=deep))
         return True
 
     async def tick(self, context):
@@ -1115,9 +1204,11 @@ class Service:
             text = (
                 "⏳ Проверка продолжается…\n"
                 f"Страниц: {stats['pages']}\n"
-                f"Обработано новых: {stats['checked']}\n"
+                f"Проверено карточек: {stats['checked']}\n"
                 f"Отправлено: {stats['sent']}\n"
                 f"Уже отправлялись: {stats['duplicates']}\n"
+                f"Проверены ранее: {stats['previously_checked']}\n"
+                f"Повторы продавцов: {stats['seller_duplicates']}\n"
                 f"Отсеяно: {stats['filtered']}\n"
                 f"Ошибок: {stats['errors']}\n\n"
                 "Итоговый отчёт появится после завершения.\nОстановка: /pause"
@@ -1129,7 +1220,7 @@ class Service:
                 except TelegramError:
                     log.warning("[scan_progress] Не удалось обновить прогресс")
 
-    async def scan(self, chat):
+    async def scan(self, chat, deep=False):
         stats, warnings, missing, seen = Counter(), {}, set(), set()
         outcome, started, stop = "complete", time.monotonic(), False
         report_allowed = True
@@ -1142,7 +1233,10 @@ class Service:
             async with self.lock:
                 self.reader.browser_failures = 0
                 for source in list(self.state(chat)["urls"]):
-                    url, pages_seen = source, set()
+                    url, pages_seen = recent_source(source), set()
+                    known_pages = 0
+                    scan_rules = self.state(chat)["rules"]
+                    signature = rules_key(scan_rules)
                     for page_index in range(MAX_PAGES):
                         if stop or source not in self.state(chat)["urls"]:
                             break
@@ -1168,7 +1262,21 @@ class Service:
                             stats["errors"] += 1
                             outcome = "partial"
                             break
+                        # Определяем границу по истории ДО обработки этой страницы.
+                        page_known = bool(ads)
+                        for candidate in ads:
+                            candidate_key = urlsplit(candidate["url"]).hostname + ":" + candidate["id"]
+                            known = (self.db.execute("SELECT 1 FROM delivered WHERE chat=? AND key=?", (chat, candidate_key)).fetchone()
+                                     or self.db.execute("SELECT 1 FROM checked_ads WHERE chat=? AND rules=? AND key=?", (chat, signature, candidate_key)).fetchone()
+                                     or self.seller_seen(chat, candidate))
+                            if not known:
+                                page_known = False
+                                break
                         for ad in ads:
+                            if self.state(chat)["rules"] != scan_rules:
+                                warnings["Фильтры изменены во время проверки. Запустите поиск заново."] = True
+                                outcome, stop = "partial", True
+                                break
                             key = urlsplit(ad["url"]).hostname + ":" + ad["id"]
                             if key in seen:
                                 continue
@@ -1176,6 +1284,14 @@ class Service:
                             stats["found"] += 1
                             if self.db.execute("SELECT 1 FROM delivered WHERE chat=? AND key=?", (chat, key)).fetchone():
                                 stats["duplicates"] += 1
+                                with self.db:
+                                    self.remember_seller(chat, ad)
+                                continue
+                            if self.seller_seen(chat, ad):
+                                stats["seller_duplicates"] += 1
+                                continue
+                            if self.db.execute("SELECT 1 FROM checked_ads WHERE chat=? AND rules=? AND key=?", (chat, signature, key)).fetchone():
+                                stats["previously_checked"] += 1
                                 continue
                             if stats["checked"] >= MAX_ADS or stats["sent"] >= MAX_SEND:
                                 outcome, stop = "limit", True
@@ -1186,12 +1302,22 @@ class Service:
                             if excluded_topic(ad):
                                 stats["filtered"] += 1
                                 stats["topic_skipped"] += 1
+                                self.mark_checked(chat, signature, key)
                                 continue
                             try:
-                                rules = self.state(chat)["rules"]
-                                ad, warning = await self.reader.enrich(ad, rules=rules)
+                                rules = scan_rules
+                                ad, warning = await self.reader.enrich(ad, rules=rules, seller_seen=lambda item: self.seller_seen(chat, item))
+                                if self.state(chat)["rules"] != scan_rules:
+                                    warnings["Фильтры изменены во время проверки. Запустите поиск заново."] = True
+                                    outcome, stop = "partial", True
+                                    break
+                                if ad.pop("_seller_already_sent", False) or self.seller_seen(chat, ad):
+                                    stats["seller_duplicates"] += 1
+                                    self.mark_checked(chat, signature, key)
+                                    continue
                                 if ad.pop("_filtered_before_profile", False):
                                     stats["filtered"] += 1
+                                    self.mark_checked(chat, signature, key)
                                     continue
                                 absent_profile = {k for k in ("seller_views", "listings_count") if ad.get(k) is None}
                                 missing.update(absent_profile)
@@ -1203,6 +1329,9 @@ class Service:
                                 missing.update(absent)
                                 if not accepted:
                                     stats["filtered"] += 1
+                                    # Не закрепляем отказ из-за временно недоступных данных.
+                                    if not absent and not warning:
+                                        self.mark_checked(chat, signature, key)
                                     continue
                                 # Загрузка следующей карточки занимает время сама;
                                 # ждём только остаток интервала между отправками.
@@ -1213,6 +1342,8 @@ class Service:
                                 await self.send(chat, ad)
                                 with self.db:
                                     self.db.execute("INSERT OR IGNORE INTO delivered VALUES (?,?)", (chat, key))
+                                    self.remember_seller(chat, ad)
+                                    self.db.execute("INSERT OR IGNORE INTO checked_ads VALUES (?,?,?)", (chat, signature, key))
                                 stats["sent"] += 1
                                 last_delivery = time.monotonic()
                             except Forbidden:
@@ -1230,6 +1361,10 @@ class Service:
                                 stats["errors"] += 1
                                 warnings[f"Объявление {ad['id']}: ошибка обработки; подробности в логах Render."] = True
                                 log.exception("Ошибка обработки объявления %s", ad["id"])
+                        known_pages = known_pages + 1 if page_known else 0
+                        if not deep and known_pages >= 2:
+                            stats["history_boundary"] += 1
+                            break
                         if stop or not next_url:
                             break
                         if urlsplit(next_url).hostname != urlsplit(final).hostname:
@@ -1402,7 +1537,7 @@ async def handle_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
             active = chat.id in service.tasks and not service.tasks[chat.id].done()
             status = f"Мониторинг: {'включён' if state['enabled'] else 'выключен'}\nПроверка: {'выполняется' if active else 'не выполняется'}\nИнтервал: {state['minutes']} мин.\nКатегорий: {len(state['urls'])}\n\n"
             await message.reply_text(escape(status) + (state["last"] or "Проверок ещё не было."), parse_mode="HTML")
-        elif command in {"/check", "/watch", "/restart", "/add"} or text.startswith(("https://", "http://")):
+        elif command in {"/check", "/deepcheck", "/watch", "/restart", "/add"} or text.startswith(("https://", "http://")):
             if command == "/add" or text.startswith(("https://", "http://")):
                 url = safe_url(argument if command == "/add" else text)
                 if re.search(r"/(?:search|lists)/\d+", urlsplit(url).path):
@@ -1418,7 +1553,7 @@ async def handle_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 service.save(chat.id, enabled=1)
             if command == "/restart":
                 await service.cancel_scan(chat.id)
-            started = service.trigger(chat.id)
+            started = service.trigger(chat.id, deep=command == "/deepcheck")
             await message.reply_text("🚀 Проверка запущена." if started else "⏳ Проверка уже выполняется.")
         else:
             await message.reply_text("Отправьте ссылку на категорию или /help.")
@@ -1621,7 +1756,7 @@ async def panel(update, context, screen="home", notice=""):
         text = ("⏱ <b>Мониторинг</b>\n\n"
                 f"Состояние: {'🟢 включён' if state['enabled'] else '⚪ выключен'}\n"
                 f"Интервал: <b>{state['minutes']} мин.</b>\n\n"
-                "Регулярный поиск отправляет только ещё не доставленные объявления.")
+                "Поиск начинается со свежих объявлений и пропускает уже проверенные карточки с теми же фильтрами. Один продавец — одно объявление. Глубокая проверка: /deepcheck.")
         keyboard = ui_keyboard([[("🟢 Включить", "ui:watch"), ("⏸ Остановить", "menu_stop")],
             [(f"{n} мин.", f"ui:interval:{n}") for n in (5, 15, 30, 60)],
             [("Другой интервал", "ui:custom_interval")], back])
@@ -2489,7 +2624,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v10] Создание Telegram Application")
+    log.info("[boot_v11] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
