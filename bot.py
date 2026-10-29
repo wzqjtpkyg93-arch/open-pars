@@ -11,6 +11,7 @@ import sqlite3
 import string
 import sys
 import threading
+import tempfile
 import time
 import unicodedata
 from collections import Counter
@@ -1083,6 +1084,8 @@ class Service:
         self.closing = False
         self.subscription_table = "subscriptions_test" if XROCKET_TESTNET else "subscriptions"
         self.billing = Billing(self)
+        self.dialogues = SellerDialogues(self)
+        self.account_login = AccountLogin(self)
 
     def permitted(self, chat):
         if chat == ADMIN_ID:
@@ -1183,6 +1186,10 @@ class Service:
         buttons = [[InlineKeyboardButton("🔗 Ссылка на товар", url=ad["url"])]]
         if ad.get("seller_url"):
             buttons.append([InlineKeyboardButton("👤 Профиль продавца", url=ad["seller_url"])])
+        if chat == ADMIN_ID:
+            token = self.dialogues.register(chat, ad)
+            if token:
+                buttons.append([InlineKeyboardButton("💬 Начать диалог", callback_data="talk:start:"+token)])
         markup = InlineKeyboardMarkup(buttons)
         text = card(ad)
         size = len(BeautifulSoup(text, "html.parser").get_text().encode("utf-16-le")) // 2
@@ -1425,6 +1432,8 @@ class Service:
         await asyncio.gather(*tasks, return_exceptions=True)
         await self.reader.close()
         await self.billing.close()
+        await self.account_login.close()
+        await self.dialogues.close()
         self.db.close()
 
 
@@ -1781,7 +1790,7 @@ async def panel(update, context, screen="home", notice=""):
             "Выберите действие ниже.")
         keyboard = get_main_menu()
     if screen == "home" and update.effective_user.id == ADMIN_ID:
-        keyboard = InlineKeyboardMarkup(list(keyboard.inline_keyboard) + [[InlineKeyboardButton("👑 Пользователи", callback_data="ui:admin")]])
+        keyboard = InlineKeyboardMarkup(list(keyboard.inline_keyboard) + [[InlineKeyboardButton("👑 Пользователи", callback_data="ui:admin"), InlineKeyboardButton("💬 Диалоги",callback_data="talk:list")]])
     if notice:
         text = escape(notice) + "\n\n" + text
     await show_panel(update, text, keyboard)
@@ -1797,6 +1806,75 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, user, chat = update.effective_message, update.effective_user, update.effective_chat
     service = context.application.bot_data["service"]
     if not message or not message.text or not user or not chat or chat.type != "private":
+        return
+    command = message.text.strip().split(maxsplit=1)[0].split("@")[0].lower() if message.text.strip() else ""
+    if command in {"/account","/account_off"}:
+        if user.id!=ADMIN_ID:
+            await message.reply_text("Подключение личного аккаунта доступно только владельцу.")
+            return
+        try:
+            if command=="/account":
+                origin=account_origin()
+                if not os.getenv('PORT'):
+                    raise ValueError('Включите Web Service с PORT на Render для страницы входа.')
+                token=await service.account_login.issue()
+                keyboard=InlineKeyboardMarkup([[InlineKeyboardButton('🔐 Войти в OpenSooq',url=origin+'/account#'+token)]])
+                await message.reply_text("🔐 Личная страница входа на 15 минут. Откройте кнопку на iPhone, войдите в OpenSooq, откройте существующий чат и нажмите «Сохранить вход». Ссылку не пересылайте. Коды в Telegram вводить не нужно. Сам вход не начинает переписку.",reply_markup=keyboard)
+            else:
+                dialogs=service.dialogues
+                dialogs.cancelled.update(r['id'] for r in dialogs.db.execute('SELECT id FROM seller_dialogues WHERE chat=?',(ADMIN_ID,)))
+                await service.account_login.close()
+                async with dialogs.lock:
+                    dialogs.transport.disabled=True
+                    dialogs.transport.saved_enabled=False
+                    await dialogs.transport.close()
+                    path=DATA_DIR/'opensooq-chat.json'
+                    if path.is_file():
+                        state=json.loads(path.read_text(encoding='utf-8'))
+                        state['_opensooq_chat_enabled']=False
+                        fd,temp=tempfile.mkstemp(prefix='.opensooq-',suffix='.json',dir=DATA_DIR)
+                        try:
+                            with os.fdopen(fd,'w',encoding='utf-8') as out:json.dump(state,out)
+                            os.replace(temp,path)
+                        finally:
+                            with suppress(FileNotFoundError):os.unlink(temp)
+                    with dialogs.db:dialogs.db.execute("UPDATE seller_dialogues SET state='paused' WHERE chat=? AND state IN ('queued','waiting','sending','approved')",(ADMIN_ID,))
+                await message.reply_text("⏸ Аккаунт отключён от автоответчика, активные диалоги остановлены. Парсер работает как раньше.")
+        except (ValueError,OSError):
+            await message.reply_text('Не удалось открыть подключение аккаунта. Проверьте HTTPS-адрес RENDER_EXTERNAL_URL, PORT и доступ на запись в DATA_DIR. Секреты в чат не присылайте.')
+        return
+    if command in {"/dialogs", "/chatstatus", "/dialog", "/stopdialogs"}:
+        if user.id != ADMIN_ID:
+            await message.reply_text("Переписка с личного аккаунта доступна только владельцу.")
+            return
+        if command == "/stopdialogs":
+            dialogs=service.dialogues
+            dialogs.cancelled.update(r['id'] for r in dialogs.db.execute('SELECT id FROM seller_dialogues WHERE chat=?',(ADMIN_ID,)))
+            async with dialogs.lock:
+                with dialogs.db:
+                    dialogs.db.execute("UPDATE seller_dialogues SET state='paused',note='Остановлен владельцем' WHERE chat=? AND state IN ('queued','waiting','sending','approved')",(ADMIN_ID,))
+            await message.reply_text("⏸ Автоответы во всех диалогах остановлены.")
+        elif command == "/chatstatus":
+            worker=service.dialogues.transport
+            await message.reply_text("Переписка на Render: "+("настройки заданы; вход проверяется при запуске диалога." if worker.configured() else "не подключена.")+"\nПодключить аккаунт с телефона: /account. Отключить: /account_off. Коды и файлы сессии в Telegram не присылайте.")
+        elif command == "/dialog":
+            try:
+                url=safe_url(message.text.split(maxsplit=1)[1])
+                match=re.fullmatch(r"/(?:en|ar)/(?:search|lists)/(\d+)(?:/.*)?",urlsplit(url).path)
+                if not match:
+                    raise ValueError("Нужна ссылка на конкретное объявление OpenSooq.")
+                raw,final=await service.reader.get(url)
+                ad=dict.fromkeys(METRICS)
+                ad.update(id=match[1],url=final,title="",description="",seller_id="",seller_name="",seller_url="",images=[])
+                ad=await asyncio.to_thread(parse_listing,raw,ad)
+                token=service.dialogues.register(chat.id,ad)
+                if not token:
+                    raise ValueError("Не удалось подтвердить профиль продавца.")
+                await message.reply_text("Начать сценарий по этому товару?\n"+ad['seller_name']+" · "+ad['title'],reply_markup=ui_keyboard([[('💬 Начать диалог','talk:start:'+token)]]))
+            except (ValueError,IndexError,SourceError) as exc:
+                await message.reply_text(str(exc)[:800] if not isinstance(exc,IndexError) else "Используйте /dialog ССЫЛКА_НА_ОБЪЯВЛЕНИЕ")
+        else:
+            await dialogue_panel(update,context)
         return
     if await billing_message(update, context):
         return
@@ -1917,6 +1995,9 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query, user, chat = update.callback_query, update.effective_user, update.effective_chat
     service = context.application.bot_data["service"]
+    if query and (query.data or "").startswith("talk:"):
+        await dialogue_callback(update,context)
+        return
     if query and user and chat and chat.type == "private" and (query.data or "").startswith("bill:"):
         await billing_callback(update, context)
         return
@@ -2480,6 +2561,753 @@ async def billing_callback(update, context):
         await query.message.reply_text(str(exc)[:500])
 
 
+# Переписка с продавцами: один выбранный товар, один вопрос после нового ответа.
+DIALOG_QUESTIONS = (
+    "Hi! I'm interested in this item. Is it still available?",
+    "Is everything in good condition?",
+    "How long have you been using it?",
+    "Why are you selling it?",
+    "Do you still have the receipt?",
+    "Is that your final price?",
+)
+
+
+def dialogue_answer(text, stage, answered):
+    """Консервативный сценарий. Неясный ответ отдаём владельцу, не угадываем."""
+    text = unicodedata.normalize('NFKC', text).casefold().strip()
+    text = re.sub(r'\s+', ' ', text.replace('’', "'"))
+    answered = set(answered)
+    if re.search(r"\b(sold|not available|no longer available|already gone|stop messaging|do not contact|don't contact|leave me alone)\b|مباع|لا تراسل", text):
+        return 'stopped', answered, None
+    if not text or re.fullmatch(r'(hi|hello|hey|good morning|good evening|مرحبا|السلام عليكم)[.! ]*', text):
+        return 'wait', answered, None
+    # Вопрос продавца или предложение перевода/внешнего перехода требует человека.
+    if re.search(r'https?://|\?|\b(pay|deposit|transfer|whatsapp|telegram|ignore previous|send money|delivery fee|you want|do you|are you|can you|will you)\b', text):
+        return 'review', answered, None
+    yes = bool(re.search(r'\b(yes|yeah|yep|sure|ok|okay|available|of course)\b|نعم|متوفر', text))
+    no = bool(re.search(r"\b(no|nope|not|isn't|doesn't|don't|broken|damaged|faulty)\b|ليس|لا يوجد", text))
+    if stage == 0 and re.fullmatch(r'(no|nope|sorry no)[.! ]*', text):
+        return 'stopped', answered, None
+    if re.search(r'\b(good|excellent|perfect|mint|working|brand new|like new)\b', text) and not no:
+        answered.add(1)
+    if re.search(r'\b\d+\s*(days?|weeks?|months?|years?|hrs?|hours?)\b|\b(never used|unused|brand new)\b', text):
+        answered.add(2)
+    if re.search(r'\b(because|moving|upgrad\w*|bought another|no longer need|need money)\b', text):
+        answered.add(3)
+    if re.search(r'\b(receipt|invoice|proof of purchase)\b', text):
+        if yes or no or re.search(r'\b(have|lost|included|missing)\b', text):
+            answered.add(4)
+    if re.search(r'\b(price is firm|price is final|final price|no negotiation)\b', text):
+        answered.add(5)
+    if stage == 0 and yes and not no:
+        answered.add(0)
+    elif stage == 1 and yes and not no:
+        answered.add(1)
+    elif stage == 4 and (yes or no):
+        answered.add(4)
+    elif stage == 5 and (yes or no or re.search(r'\d|\b(final|firm|lowest|negotiable)\b', text)):
+        answered.add(5)
+    if stage not in answered:
+        return 'review', answered, None
+    next_stage = next((i for i in range(stage + 1, len(DIALOG_QUESTIONS)) if i not in answered), None)
+    return ('complete' if next_stage is None else 'next'), answered, next_stage
+
+
+class DialogueUnavailable(ValueError):
+    pass
+
+
+class OpenSooqChatBrowser:
+    """Обычный интерфейс сайта. Секрет сессии создаёт владелец вне чата Telegram."""
+    def __init__(self):
+        self.pw = self.browser = self.context = self.page = None
+        self.account = os.getenv('OPENSOOQ_CHAT_ACCOUNT_ID', '').strip()
+        self.state_file = Path(os.getenv('OPENSOOQ_CHAT_STATE_FILE', '/etc/secrets/opensooq-chat.json'))
+        self.saved_enabled=False
+        self.disabled=False
+        local=DATA_DIR/'opensooq-chat.json'
+        if local.is_file():
+            with suppress(ValueError,OSError,TypeError):
+                meta=json.loads(local.read_text(encoding='utf-8'))
+                self.state_file=local
+                self.account=str(meta.get('_opensooq_account_id',''))
+                self.saved_enabled=meta.get('_opensooq_chat_enabled') is True
+                self.disabled=meta.get('_opensooq_chat_enabled') is False
+        self.blocked = False
+        self.guard = lambda: True
+
+    def configured(self):
+        return (not self.disabled and (self.saved_enabled or os.getenv('OPENSOOQ_CHAT_ENABLED','0')=='1')
+                and self.state_file.is_file() and self.account.isdecimal())
+
+    async def ready(self):
+        if self.blocked:
+            raise DialogueUnavailable('Чат остановлен после проверки доступа сайта. Нужен ручной вход.')
+        if not self.configured():
+            raise DialogueUnavailable('Аккаунт ещё не подключён. Откройте /account и войдите с телефона через личную страницу.')
+        if self.page is not None and not self.page.is_closed():
+            return
+        from playwright.async_api import async_playwright
+        self.pw = await async_playwright().start()
+        try:
+            self.browser = await self.pw.chromium.launch(headless=True, args=['--disable-dev-shm-usage'])
+            state = json.loads(self.state_file.read_text(encoding='utf-8'))
+            if state.get('_opensooq_account_id') != self.account:
+                raise DialogueUnavailable('Файл сессии не привязан к указанному аккаунту. Создайте его через --chat-login.')
+            state = {key:state[key] for key in ('cookies','origins') if key in state}
+            self.context = await self.browser.new_context(storage_state=state, locale='en-US')
+            self.page = await self.context.new_page()
+            self.page.set_default_timeout(12000)
+        except Exception:
+            await self.close()
+            raise DialogueUnavailable('Не удалось запустить браузер переписки. Проверьте файл сессии и установку Chromium.') from None
+
+    async def goto(self, url):
+        await self.ready()
+        parsed = urlsplit(url)
+        if parsed.scheme != 'https' or parsed.hostname not in HOSTS | {'my.opensooq.com'}:
+            raise DialogueUnavailable('Некорректный адрес диалога.')
+        await self.page.goto(url, wait_until='domcontentloaded', timeout=30000)
+        title = await self.page.title()
+        if re.search(r'just a moment|access denied|access restricted|verify.*human', title, re.I):
+            self.blocked = True
+            raise DialogueUnavailable('OpenSooq показал проверку доступа. Автоматическая переписка остановлена.')
+        if urlsplit(self.page.url).hostname not in HOSTS | {'my.opensooq.com'}:
+            raise DialogueUnavailable('OpenSooq перенаправил на вход. Обновите сессию вручную.')
+
+    async def room(self, url, ad):
+        parsed = urlsplit(url)
+        query = dict(parse_qsl(parsed.query))
+        match = re.fullmatch(r'(\d+)-(\d+)-(\d+)', query.get('selectedRoom', ''))
+        if (parsed.hostname != 'my.opensooq.com' or parsed.path != '/chats'
+                or not match or match[1] != str(ad['id']) or match[3] != self.account
+                or (str(ad.get('seller_id') or '').isdecimal() and match[2] != str(ad['seller_id']))):
+            raise DialogueUnavailable('Диалог не совпадает с объявлением, продавцом или подключённым аккаунтом.')
+        await self.goto(url)
+        textarea = self.page.get_by_placeholder('Message Text...', exact=True)
+        await textarea.wait_for(state='visible')
+        # Проверяем ссылку объявления именно в заголовке открытого диалога.
+        header_links = self.page.locator('main a[href*="/search/"]')
+        links = await header_links.evaluate_all('(els) => els.map(el => el.href)')
+        if not any(urlsplit(h).path.rstrip('/').endswith('/search/' + str(ad['id'])) for h in links):
+            raise DialogueUnavailable('Не удалось подтвердить товар в заголовке чата.')
+        return self.page.url
+
+    async def locate(self, ad):
+        await self.goto('https://my.opensooq.com/chats')
+        search = self.page.get_by_role('textbox', name='Search', exact=True)
+        await search.wait_for(state='visible')
+        await self.page.locator('li').first.wait_for(state='visible')
+        if not ad.get('seller_name') or not ad.get('title'):
+            raise DialogueUnavailable('Для начала диалога нужны имя продавца и заголовок товара.')
+        await search.fill(ad['seller_name'])
+        rows = self.page.locator('li').filter(has_text=ad['seller_name']).filter(has_text=ad['title'])
+        # Поиск списка асинхронный; ждём стабилизации списка, а не повторяем отправку.
+        await asyncio.sleep(1)
+        count_rows = await rows.count()
+        if count_rows > 1:
+            raise DialogueUnavailable('Найдено несколько похожих чатов. Нужна ручная проверка получателя.')
+        if count_rows == 0:
+            return ''
+        await rows.click()
+        await self.page.get_by_placeholder('Message Text...', exact=True).wait_for(state='visible')
+        return await self.room(self.page.url, ad)
+
+    async def messages(self):
+        rows = await self.page.locator('[id^="msg-"]').evaluate_all('''els => els.map(el => ({
+            id: el.id, classes: el.className,
+            text: Array.from(el.querySelectorAll('p')).map(p => p.innerText).join('\\n')
+        }))''')
+        messages = []
+        for item in rows:
+            match = re.fullmatch(r'msg-(\d+)', item['id'])
+            classes = str(item['classes']).split()
+            if not match:
+                continue
+            direction = 'out' if 'tw-justify-end' in classes else 'in' if 'tw-justify-start' in classes else 'unknown'
+            messages.append({'id': int(match[1]), 'direction': direction, 'text': item['text'].strip()})
+        return sorted(messages, key=lambda m: m['id'])
+
+    async def send(self, text, after):
+        # Только заранее заданные вопросы; произвольный текст продавца не исполняется.
+        if text not in DIALOG_QUESTIONS:
+            raise DialogueUnavailable('Вопрос отсутствует в согласованном сценарии.')
+        box = self.page.get_by_placeholder('Message Text...', exact=True)
+        await box.fill(text)
+        send = self.page.locator('button').filter(has=self.page.locator('svg[data-icon="paper-plane"]'))
+        if await send.count() != 1:
+            raise DialogueUnavailable('Не удалось однозначно найти кнопку отправки.')
+        if not self.guard():
+            raise DialogueUnavailable('Диалог остановлен владельцем.')
+        await send.click()
+        for _ in range(4):
+            for message in await self.messages():
+                if message['id'] > after and message['direction'] == 'out' and message['text'] == text:
+                    return message['id']
+            await asyncio.sleep(.5)
+        raise DialogueUnavailable('Результат отправки пока неизвестен. Повторная отправка автоматически не выполняется.')
+
+    async def first(self, ad):
+        await self.goto(ad['url'])
+        if urlsplit(self.page.url).path.rstrip('/') != urlsplit(ad['url']).path.rstrip('/'):
+            raise DialogueUnavailable('Объявление перенаправило на другую страницу.')
+        # Проверяем продавца по точной ссылке профиля из карточки парсера.
+        profiles = await self.page.locator('a[href*="/mid/"]').evaluate_all('(els) => els.map(el => el.href)')
+        expected = urlsplit(safe_url(ad['seller_url'], ad['url']))
+        if not any(urlsplit(u).hostname == expected.hostname and unquote(urlsplit(u).path).rstrip('/') == unquote(expected.path).rstrip('/') for u in profiles):
+            raise DialogueUnavailable('Профиль продавца в объявлении изменился. Отправка остановлена.')
+        box = self.page.get_by_placeholder('Message...', exact=True)
+        await box.wait_for(state='visible')
+        await box.fill(DIALOG_QUESTIONS[0])
+        if not self.guard():
+            raise DialogueUnavailable('Диалог остановлен владельцем.')
+        await self.page.get_by_role('button', name='Send Message', exact=True).click()
+        for _ in range(30):
+            if not await box.input_value():
+                break
+            await asyncio.sleep(.5)
+        else:
+            raise DialogueUnavailable('Форма не подтвердила первую отправку. Проверьте историю вручную, автоматического повтора нет.')
+        room_url = await self.locate(ad)
+        if not room_url:
+            raise DialogueUnavailable('Первая отправка не подтверждена в истории. Нужна ручная проверка; повтор запрещён.')
+        messages = await self.messages()
+        outgoing = [m for m in messages if m['direction'] == 'out' and m['text'] == DIALOG_QUESTIONS[0]]
+        if not outgoing:
+            raise DialogueUnavailable('Первая отправка не подтверждена. Проверьте чат вручную.')
+        return room_url, outgoing[-1]['id']
+
+    async def close(self):
+        if self.context is not None:
+            with suppress(Exception):
+                await self.context.close()
+        if self.browser is not None:
+            with suppress(Exception):
+                await self.browser.close()
+        if self.pw is not None:
+            with suppress(Exception):
+                await self.pw.stop()
+        self.pw = self.browser = self.context = self.page = None
+
+
+class SellerDialogues:
+    def __init__(self, service):
+        self.service, self.db = service, service.db
+        self.transport = OpenSooqChatBrowser()
+        self.lock = asyncio.Lock()
+        self.cancelled = set()
+        self.db.executescript('''
+            CREATE TABLE IF NOT EXISTS dialogue_ads(
+                token TEXT PRIMARY KEY, chat INTEGER NOT NULL, ad_key TEXT NOT NULL,
+                seller TEXT NOT NULL, data TEXT NOT NULL, UNIQUE(chat,ad_key));
+            CREATE TABLE IF NOT EXISTS dialogue_events(
+                dialogue TEXT NOT NULL, message_id INTEGER NOT NULL, direction TEXT NOT NULL,
+                text TEXT NOT NULL, observed REAL NOT NULL, PRIMARY KEY(dialogue,message_id));
+            CREATE TABLE IF NOT EXISTS seller_dialogues(
+                id TEXT PRIMARY KEY, chat INTEGER NOT NULL, seller TEXT NOT NULL UNIQUE,
+                ad TEXT NOT NULL, room TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'queued',
+                stage INTEGER NOT NULL DEFAULT -1, cursor INTEGER NOT NULL DEFAULT 0,
+                answered TEXT NOT NULL DEFAULT '[]', pending_stage INTEGER, pending_text TEXT NOT NULL DEFAULT '',
+                pending_after INTEGER NOT NULL DEFAULT 0, updated REAL NOT NULL, note TEXT NOT NULL DEFAULT '');
+        ''')
+        self.db.commit()
+
+    def register(self, chat, ad):
+        if chat != ADMIN_ID:
+            return ''
+        seller = next(iter(seller_keys(ad)), '')
+        if not seller or not ad.get('seller_url') or not ad.get('seller_name'):
+            return ''
+        key = urlsplit(ad['url']).hostname + ':' + str(ad['id'])
+        with self.db:
+            self.db.execute('INSERT OR IGNORE INTO dialogue_ads VALUES (?,?,?,?,?)',
+                (secrets.token_hex(8), chat, key, seller, json.dumps(ad, ensure_ascii=False)))
+        return self.db.execute('SELECT token FROM dialogue_ads WHERE chat=? AND ad_key=?', (chat,key)).fetchone()['token']
+
+    def row(self, token):
+        row = self.db.execute('SELECT * FROM seller_dialogues WHERE id=? AND chat=?', (token,ADMIN_ID)).fetchone()
+        if row is None:
+            raise ValueError('Диалог не найден.')
+        return dict(row)
+
+    def start(self, token):
+        ad = self.db.execute('SELECT * FROM dialogue_ads WHERE token=? AND chat=?', (token,ADMIN_ID)).fetchone()
+        if ad is None:
+            raise ValueError('Карточка не найдена. Откройте /dialogs.')
+        existing = self.db.execute('SELECT id FROM seller_dialogues WHERE seller=?', (ad['seller'],)).fetchone()
+        if existing:
+            return existing['id']
+        if not self.transport.configured():
+            raise DialogueUnavailable('Для переписки подключите аккаунт: /account. Вход в браузере ChatGPT не подключает Render автоматически.')
+        with self.db:
+            self.db.execute('INSERT INTO seller_dialogues(id,chat,seller,ad,updated) VALUES (?,?,?,?,?)',
+                (token, ADMIN_ID, ad['seller'], ad['data'], time.time()))
+        return token
+
+    def save(self, token, **values):
+        permitted = {'room','state','stage','cursor','answered','pending_stage','pending_text','pending_after','note'}
+        if not values or not values.keys() <= permitted:
+            raise ValueError('Некорректное состояние диалога.')
+        if 'answered' in values:
+            values['answered'] = json.dumps(sorted(set(values['answered'])))
+        values['updated'] = time.time()
+        with self.db:
+            self.db.execute('UPDATE seller_dialogues SET '+','.join(k+'=?' for k in values)+' WHERE id=? AND chat=?',
+                list(values.values())+[token,ADMIN_ID])
+
+    async def notify(self, row, text):
+        ad = json.loads(row['ad'])
+        markup = ui_keyboard([[('⏸ Остановить диалог','talk:pause:'+row['id']), ('📋 Статус','talk:status:'+row['id'])]])
+        with suppress(TelegramError):
+            await self.service.bot.send_message(chat_id=ADMIN_ID,
+                text=('💬 '+ad.get('seller_name','Продавец')+' · '+ad.get('title','Товар')+'\n\n'+text)[:3900], reply_markup=markup)
+
+    def record(self, token, messages):
+        with self.db:
+            self.db.executemany('INSERT OR IGNORE INTO dialogue_events VALUES (?,?,?,?,?)',
+                [(token,m['id'],m['direction'],m['text'][:3000],time.time()) for m in messages])
+
+    async def update(self, row):
+        token, ad = row['id'], json.loads(row['ad'])
+        if row['state'] == 'queued':
+            room = await self.transport.locate(ad)
+            if room:
+                messages = await self.transport.messages()
+                self.record(token,messages)
+                outgoing = [m for m in messages if m['direction']=='out']
+                if len(outgoing) == 1 and outgoing[0]['text'] == DIALOG_QUESTIONS[0]:
+                    self.save(token, room=room,state='waiting',stage=0,cursor=outgoing[0]['id'])
+                    await self.notify(row, 'Найден уже начатый диалог. Первое сообщение повторно не отправлено.')
+                elif not messages:
+                    self.save(token,room=room,state='sending',pending_stage=0,pending_text=DIALOG_QUESTIONS[0],pending_after=0)
+                    message_id = await self.transport.send(DIALOG_QUESTIONS[0],0)
+                    self.save(token,state='waiting',stage=0,cursor=message_id,pending_text='',pending_stage=None)
+                else:
+                    self.save(token,room=room,state='review',note='В чате есть более ранняя переписка. Нужна ручная проверка.')
+                    await self.notify(row, 'Уже есть переписка. Автоматический сценарий не запущен, чтобы не вмешиваться в разговор.')
+            else:
+                # Фиксируем попытку ДО внешнего действия. После сбоя не повторяем её.
+                self.save(token,state='sending',pending_stage=0,pending_text=DIALOG_QUESTIONS[0],pending_after=0)
+                room, message_id = await self.transport.first(ad)
+                self.save(token,room=room,state='waiting',stage=0,cursor=message_id,pending_text='',pending_stage=None)
+                await self.notify(row,'Отправлено: '+DIALOG_QUESTIONS[0])
+            return
+        if not row['room']:
+            self.save(token,state='review',note='Результат первой отправки неизвестен. Проверьте сайт вручную.')
+            await self.notify(row,'Нужна ручная проверка первой отправки. Автоматического повтора нет.')
+            return
+        await self.transport.room(row['room'],ad)
+        messages = await self.transport.messages()
+        self.record(token,messages)
+        if row['state'] == 'approved':
+            if any(m['id']>row['pending_after'] for m in messages):
+                self.save(token,state='review',cursor=max(m['id'] for m in messages),pending_text='',pending_stage=None,note='После подтверждения пришло новое сообщение. Откройте чат перед ответом.')
+                await self.notify(row,'Подтверждённый вопрос не отправлен: в диалоге появились новые сообщения.')
+                return
+            self.save(token,state='sending')
+            message_id = await self.transport.send(row['pending_text'],row['pending_after'])
+            self.save(token,state='waiting',stage=row['pending_stage'],cursor=message_id,pending_text='',pending_stage=None)
+            await self.notify(row,'Отправлено после вашего подтверждения: '+DIALOG_QUESTIONS[row['pending_stage']])
+            return
+        if row['state'] == 'sending':
+            sent = [m for m in messages if m['direction']=='out' and m['id']>row['pending_after'] and m['text']==row['pending_text']]
+            if sent:
+                self.save(token,state='waiting',stage=row['pending_stage'],cursor=sent[-1]['id'],pending_text='',pending_stage=None)
+                await self.notify(row,'Отправка подтверждена по истории чата. Вопрос не дублировался.')
+            else:
+                self.save(token,state='review',note='Не удалось подтвердить предыдущую отправку. Повтор автоматически не выполняется.')
+                await self.notify(row,'Не удалось подтвердить отправку. Проверьте чат вручную; вопрос повторно не отправлен.')
+            return
+        fresh = [m for m in messages if m['id']>row['cursor']]
+        if not fresh:
+            self.save(token,note='Ожидаем новый ответ продавца.')
+            return
+        if any(m['direction']!='in' for m in fresh):
+            self.save(token,state='review',note='В чате появился ручной ответ или неизвестный тип сообщения.')
+            await self.notify(row,'Автоматическая переписка приостановлена: ручной ответ или неизвестный тип сообщения.')
+            return
+        reply = '\n'.join(m['text'] for m in fresh)
+        if not reply.strip():
+            self.save(token,state='review',note='Ответ содержит вложение без распознанного текста.')
+            await self.notify(row,'Продавец прислал вложение. Нужен ручной просмотр.')
+            return
+        decision, answered, next_stage = dialogue_answer(reply,row['stage'],json.loads(row['answered']))
+        cursor = max(m['id'] for m in fresh)
+        self.save(token,cursor=cursor,answered=answered)
+        await self.notify(row,'Продавец: '+reply[:2200])
+        if decision == 'wait':
+            return
+        if decision in {'stopped','review','complete'}:
+            notes={'stopped':'Продавец сообщил о продаже или попросил остановиться.',
+                   'review':'Неоднозначный ответ. Нужен ответ человека.', 'complete':'Все вопросы заданы. Сделка автоматически не заключается.'}
+            self.save(token,state=decision,note=notes[decision])
+            await self.notify(row,notes[decision])
+            return
+        question = DIALOG_QUESTIONS[next_stage]
+        self.save(token,state='sending',pending_stage=next_stage,pending_text=question,pending_after=cursor,answered=answered)
+        message_id = await self.transport.send(question,cursor)
+        self.save(token,state='waiting',stage=next_stage,cursor=message_id,pending_text='',pending_stage=None)
+        await self.notify(row,'Отправлено: '+question)
+
+    async def poll(self, context):
+        await self.service.account_login.expire()
+        if self.service.account_login.active:
+            return
+        if self.service.closing or self.lock.locked() or not self.transport.configured():
+            return
+        async with self.lock:
+            rows = list(self.db.execute("SELECT * FROM seller_dialogues WHERE chat=? AND state IN ('queued','waiting','sending','approved') ORDER BY updated LIMIT 5",(ADMIN_ID,)))
+            for db_row in rows:
+                row = dict(db_row)
+                self.transport.guard = lambda token=row['id']: token not in self.cancelled and not self.service.closing and not self.service.account_login.active
+                try:
+                    await self.update(row)
+                except Exception as exc:
+                    # Не выводим URL сессии/содержимое storage_state в логи.
+                    log.warning('[seller_dialogue] id=%s type=%s',row['id'],type(exc).__name__)
+                    if row['id'] in self.cancelled:
+                        self.save(row['id'],state='paused',note='Остановлен владельцем.')
+                        continue
+                    self.save(row['id'],state='review',note='Проверка или отправка не завершена. Нужен ручной просмотр.')
+                    await self.notify(row,'Переписка приостановлена: '+(str(exc)[:500] if isinstance(exc,DialogueUnavailable) else 'сайт не ответил или изменился интерфейс. Проверьте диалог вручную.'))
+
+    async def close(self):
+        async with self.lock:
+            await self.transport.close()
+
+
+async def dialogue_panel(update, context, token=''):
+    if update.effective_user.id != ADMIN_ID:
+        raise ValueError('Переписка с личного аккаунта доступна только владельцу.')
+    dialogs = context.application.bot_data['service'].dialogues
+    if token:
+        row = dialogs.row(token)
+        ad = json.loads(row['ad'])
+        statuses={'queued':'в очереди','waiting':'ожидаем ответ','sending':'проверяем отправку','approved':'вопрос подтверждён владельцем','paused':'остановлен владельцем','review':'нужна ручная проверка','stopped':'остановлен','complete':'вопросы завершены'}
+        text = f"💬 <b>{escape(ad['seller_name'])}</b>\n{escape(ad['title'])}\n\nСостояние: {statuses.get(row['state'],row['state'])}\n"
+        if row['stage']>=0:
+            text += '\nПоследний вопрос: '+escape(DIALOG_QUESTIONS[row['stage']])+'\n'
+        text += '\n'+escape(row['note'])
+        rows = [[('⏸ Остановить','talk:pause:'+token)]]
+        if row['state']=='review' and row['stage']==-1 and not row['pending_text']:
+            rows.append([('Повторить подключение без отправки','talk:retry:'+token)])
+        if row['state'] in {'review','paused'} and row['room'] and 0 <= row['stage'] < len(DIALOG_QUESTIONS)-1 and not row['pending_text']:
+            rows.append([('Следующий вопрос с подтверждением', 'talk:next:'+token)])
+        keyboard = ui_keyboard(rows+[[('‹ Диалоги','talk:list')]])
+        if row['room']:
+            keyboard = InlineKeyboardMarkup(list(keyboard.inline_keyboard)+[[InlineKeyboardButton('✍️ Открыть чат',url=row['room'])]])
+    else:
+        rows = list(dialogs.db.execute('SELECT id,ad,state FROM seller_dialogues WHERE chat=? ORDER BY updated DESC LIMIT 20',(ADMIN_ID,)))
+        text = '💬 <b>Диалоги с продавцами</b>\n\nЗапуск — кнопкой у выбранного объявления. Один продавец — один диалог. Неясный ответ передаётся владельцу.\n\n'
+        text += 'Аккаунт на Render: '+('настройки заданы; вход проверяется при запуске диалога.' if dialogs.transport.configured() else 'не подключён. /chatstatus')
+        keyboard = ui_keyboard([[(json.loads(r['ad'])['seller_name']+' · '+r['state'],'talk:status:'+r['id'])] for r in rows]+[[('⏸ Остановить все','talk:pause_all')],[('‹ Главное меню','menu_home')]])
+    await show_panel(update,text,keyboard)
+
+
+async def dialogue_callback(update, context):
+    query, user, chat = update.callback_query, update.effective_user, update.effective_chat
+    if not user or user.id != ADMIN_ID or not chat or chat.type != 'private':
+        await query.answer('Переписка с личного аккаунта доступна только владельцу.',show_alert=True)
+        return
+    await query.answer()
+    dialogs = context.application.bot_data['service'].dialogues
+    parts = (query.data or '').split(':')
+    try:
+        if parts[1] == 'start' and len(parts)==3:
+            async with dialogs.lock:
+                token = dialogs.start(parts[2])
+            await dialogue_panel(update,context,token)
+        elif parts[1]=='next' and len(parts)==3:
+            row = dialogs.row(parts[2])
+            if row['state'] not in {'review','paused'} or row['pending_text'] or not row['room'] or not 0 <= row['stage'] < len(DIALOG_QUESTIONS)-1:
+                raise ValueError('Сначала проверьте историю чата. Неизвестную отправку повторять нельзя.')
+            stage = row['stage']+1
+            await show_panel(update,'Отправить следующий вопрос после вашего просмотра переписки?\n\n'+escape(DIALOG_QUESTIONS[stage]),
+                ui_keyboard([[('Да, отправить',f"talk:approve:{row['id']}:{stage}:{row['cursor']}")],[('Отмена','talk:status:'+row['id'])]]))
+        elif parts[1]=='approve' and len(parts)==5:
+            async with dialogs.lock:
+                row=dialogs.row(parts[2])
+                stage,cursor=int(parts[3]),int(parts[4])
+                if row['state'] not in {'review','paused'} or row['pending_text'] or not row['room'] or stage!=row['stage']+1 or cursor!=row['cursor'] or not 0<=stage<len(DIALOG_QUESTIONS):
+                    raise ValueError('Подтверждение устарело. Откройте статус диалога.')
+                dialogs.cancelled.discard(row['id'])
+                dialogs.save(row['id'],state='approved',pending_stage=stage,pending_text=DIALOG_QUESTIONS[stage],pending_after=cursor)
+            await dialogue_panel(update,context,row['id'])
+        elif parts[1]=='pause' and len(parts)==3:
+
+            async with dialogs.lock:
+                dialogs.row(parts[2])
+                dialogs.save(parts[2],state='paused',note='Остановлен владельцем. Автоответы отключены.')
+            await dialogue_panel(update,context,parts[2])
+        elif parts[1]=='pause_all':
+            dialogs.cancelled.update(r['id'] for r in dialogs.db.execute('SELECT id FROM seller_dialogues WHERE chat=?',(ADMIN_ID,)))
+            async with dialogs.lock:
+                with dialogs.db:
+                    dialogs.db.execute("UPDATE seller_dialogues SET state='paused',note='Остановлен владельцем' WHERE chat=? AND state IN ('queued','waiting','sending','approved')",(ADMIN_ID,))
+            await dialogue_panel(update,context)
+        elif parts[1]=='status' and len(parts)==3:
+            await dialogue_panel(update,context,parts[2])
+        else:
+            await dialogue_panel(update,context)
+    except ValueError as exc:
+        await query.message.reply_text(str(exc)[:1000])
+
+
+async def local_chat_login():
+    """Запускается владельцем на его компьютере, не в Telegram и не в ChatGPT."""
+    from playwright.async_api import async_playwright
+    target = Path(os.getenv('OPENSOOQ_CHAT_STATE_FILE','opensooq-chat.json')).expanduser()
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=False)
+        context = await browser.new_context()
+        page = await context.new_page()
+        await page.goto('https://my.opensooq.com/chats',wait_until='domcontentloaded')
+        print('Войдите в существующий аккаунт вручную в открывшемся браузере и откройте любой существующий диалог. Затем вернитесь сюда и нажмите Enter. Не присылайте файл сессии в чат и не добавляйте его в GitHub.')
+        await asyncio.to_thread(input)
+        if urlsplit(page.url).hostname != 'my.opensooq.com' or not await page.get_by_role('button',name='My Profile',exact=True).is_visible():
+            await browser.close()
+            raise SystemExit('Вход не подтверждён. Файл сессии не сохранён.')
+        selected = dict(parse_qsl(urlsplit(page.url).query)).get('selectedRoom','')
+        match = re.fullmatch(r'\d+-\d+-(\d+)',selected)
+        if not match:
+            await browser.close()
+            raise SystemExit('Откройте любой существующий диалог перед нажатием Enter. Файл не сохранён: ID аккаунта не подтверждён.')
+        target.parent.mkdir(parents=True,exist_ok=True)
+        state = await context.storage_state()
+        state['_opensooq_account_id'] = match[1]
+        fd=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+        os.fchmod(fd,0o600)
+        with os.fdopen(fd,'w',encoding='utf-8') as file:
+            json.dump(state,file)
+        os.chmod(target,0o600)
+        print('Сессия сохранена локально. На Render добавьте её как Secret File, не как файл репозитория.')
+        print('OPENSOOQ_CHAT_ACCOUNT_ID='+match[1])
+        await browser.close()
+
+
+
+ACCOUNT_PAGE = r'''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Подключить OpenSooq</title><style>body{margin:0;background:#10141e;color:#f7f7fb;font:16px system-ui}main{max-width:480px;margin:auto;padding:14px}button,input{font:inherit;border-radius:10px;padding:12px;border:1px solid #506077}button{background:#1264eb;color:white;margin:4px 2px}button:disabled{opacity:.5}input{box-sizing:border-box;width:100%;background:#202a3b;color:white}canvas{display:block;width:100%;max-width:420px;margin:auto;background:white;border-radius:8px}#status{white-space:pre-wrap;font-size:14px}small{display:block;margin:12px 0;color:#c4ccdb}</style><main><h2>Вход в OpenSooq</h2><p>Войдите в свой аккаунт на экране ниже. Затем откройте «Чаты», выберите существующий диалог и нажмите «Сохранить вход».</p><small>Эта личная ссылка даёт управление браузером. Не пересылайте её. Номер и код вводите здесь, не в Telegram.</small><button id="chats">Открыть чаты</button><button id="save">Сохранить вход</button><button id="close">Закрыть без сохранения</button><p id="status">Подключаем браузер…</p><canvas id="screen" width="420" height="820"></canvas><p>Нажмите нужное поле на экране. Введите текст ниже и нажмите «Ввести».</p><input id="entry" type="password" autocomplete="off" placeholder="Номер, пароль или код — для выбранного поля"><button id="type">Ввести</button><button id="enter">Enter / Далее</button><button id="backspace">Удалить символ</button><button id="tab">Следующее поле</button><button id="up">↑</button><button id="down">↓</button><small>Доступ к этой странице действует 15 минут. При ошибке откройте новую ссылку командой /account.</small></main><script>
+'use strict';const token=location.hash.slice(1);history.replaceState(null,'','/account');const status=document.querySelector('#status'),canvas=document.querySelector('#screen'),entry=document.querySelector('#entry');let busy=false,ended=false,shown=false;
+function notice(s){status.textContent=s}
+async function request(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:{Authorization:'Bearer '+token,...(body?{'Content-Type':'application/json'}:{})},body:body?JSON.stringify(body):undefined,cache:'no-store',referrerPolicy:'no-referrer'});if(!r.ok){let m='Ошибка подключения';try{m=(await r.json()).error||m}catch{}if(r.status===401){ended=true}throw Error(m)}return r}
+async function shot(){if(busy||ended)return;busy=true;try{const r=await request('/account-api/screen');const blob=await r.blob();const url=URL.createObjectURL(blob),img=new Image();await new Promise((resolve,reject)=>{img.onload=resolve;img.onerror=reject;img.src=url});canvas.width=img.naturalWidth;canvas.height=img.naturalHeight;canvas.getContext('2d').drawImage(img,0,0);URL.revokeObjectURL(url);if(!shown){notice('Браузер готов. Вход выполняете вы.');shown=true}}catch(e){notice(e.message)}finally{busy=false}}
+async function act(body){if(busy||ended)return;busy=true;document.querySelectorAll('button').forEach(b=>b.disabled=true);try{const data=await(await request('/account-api/action',body)).json();notice(data.message||'Готово');if(data.finished){ended=true;canvas.getContext('2d').clearRect(0,0,canvas.width,canvas.height)}}catch(e){notice(e.message)}finally{busy=false;document.querySelectorAll('button').forEach(b=>b.disabled=ended)}if(!ended)await shot()}
+canvas.addEventListener('click',e=>{const r=canvas.getBoundingClientRect();act({action:'click',x:(e.clientX-r.left)*canvas.width/r.width,y:(e.clientY-r.top)*canvas.height/r.height})});
+document.querySelector('#type').onclick=()=>{if(busy||!entry.value)return;const text=entry.value;entry.value='';act({action:'text',text})};
+for(const [id,key] of [['enter','Enter'],['backspace','Backspace'],['tab','Tab']])document.querySelector('#'+id).onclick=()=>act({action:'key',key});
+document.querySelector('#up').onclick=()=>act({action:'scroll',dy:-500});document.querySelector('#down').onclick=()=>act({action:'scroll',dy:500});
+for(const id of ['chats','save','close'])document.querySelector('#'+id).onclick=()=>act({action:id});
+if(!token){notice('Ссылка без кода доступа. Получите новую через /account.');ended=true}else{shot();setInterval(shot,2500)}
+</script></html>'''
+
+
+class AccountLogin:
+    def __init__(self, service):
+        self.service=service
+        self.token=''
+        self.expires=0
+        self.active=False
+        self.lock=asyncio.Lock()
+        self.pw=self.browser=self.context=self.page=None
+
+    async def issue(self):
+        async with self.lock:
+            await self._close()
+            self.token=secrets.token_urlsafe(32)
+            self.expires=time.monotonic()+900
+            self.active=True
+            dialogs=getattr(self.service,'dialogues',None)
+            if dialogs is not None:
+                async with dialogs.lock:
+                    await dialogs.transport.close()
+            return self.token
+
+    def authorized(self, value):
+        try:
+            return (self.active and time.monotonic()<self.expires and bool(self.token)
+                    and isinstance(value,str) and secrets.compare_digest(value,'Bearer '+self.token))
+        except (TypeError,ValueError):return False
+
+    async def _open(self):
+        if self.page is not None and not self.page.is_closed():return
+        from playwright.async_api import async_playwright
+        self.pw=await async_playwright().start()
+        try:
+            self.browser=await self.pw.chromium.launch(headless=True,args=['--disable-dev-shm-usage'])
+            self.context=await self.browser.new_context(viewport={'width':420,'height':820},locale='en-US')
+            self.page=await self.context.new_page()
+            self.page.set_default_timeout(12000)
+            # Управление только официальным OpenSooq, без произвольного браузерного прокси.
+            async def restrict(route):
+                req=route.request
+                host=urlsplit(req.url).hostname or ''
+                if req.is_navigation_request() and not (host=='opensooq.com' or host.endswith('.opensooq.com')):
+                    await route.abort()
+                else:await route.continue_()
+            await self.context.route('**/*',restrict)
+            await self.page.goto('https://kw.opensooq.com/en',wait_until='domcontentloaded',timeout=30000)
+        except asyncio.CancelledError:
+            await self._close()
+            raise
+        except Exception:
+            await self._close()
+            raise DialogueUnavailable('Не удалось открыть браузер входа. Проверьте установку Chromium и доступную память Render.') from None
+
+    async def screen(self, authorization):
+        async with self.lock:
+            if not self.authorized(authorization):raise PermissionError()
+            await self._open()
+            return await self.page.screenshot(type='png')
+
+    async def action(self, authorization, data):
+        async with self.lock:
+            if not self.authorized(authorization):raise PermissionError()
+            await self._open()
+            action=data.get('action')
+            if action=='click':
+                x,y=data.get('x'),data.get('y')
+                if isinstance(x,bool) or isinstance(y,bool) or not isinstance(x,(int,float)) or not isinstance(y,(int,float)) or not math.isfinite(x) or not math.isfinite(y) or not 0<=x<420 or not 0<=y<820:
+                    raise ValueError('Нажмите внутри экрана браузера.')
+                await self.page.mouse.click(x,y)
+            elif action=='text':
+                value=data.get('text')
+                if not isinstance(value,str) or not 1<=len(value)<=200:
+                    raise ValueError('Введите от 1 до 200 символов.')
+                await self.page.keyboard.insert_text(value)
+            elif action=='key':
+                if data.get('key') not in {'Enter','Backspace','Tab'}:raise ValueError('Клавиша не поддерживается.')
+                await self.page.keyboard.press(data['key'])
+            elif action=='scroll':
+                dy=data.get('dy')
+                if type(dy) is not int or dy not in {-500,500}:raise ValueError('Некорректная прокрутка.')
+                await self.page.mouse.wheel(0,dy)
+            elif action=='chats':
+                await self.page.goto('https://my.opensooq.com/chats',wait_until='domcontentloaded',timeout=30000)
+            elif action=='save':
+                return await self._save()
+            elif action=='close':
+                await self._close()
+                return {'finished':True,'message':'Браузер закрыт. Новый вход не сохранён.'}
+            else:raise ValueError('Действие не поддерживается.')
+            return {'message':'Готово'}
+
+    async def _save(self):
+        url=urlsplit(self.page.url)
+        room=dict(parse_qsl(url.query)).get('selectedRoom','')
+        match=re.fullmatch(r'\d+-\d+-(\d+)',room)
+        if url.scheme!='https' or url.hostname!='my.opensooq.com' or url.path!='/chats' or not match:
+            raise ValueError('Откройте «Чаты» и выберите существующий диалог, затем сохраните вход.')
+        if not await self.page.get_by_role('button',name='My Profile',exact=True).is_visible():
+            raise ValueError('Вход не подтверждён. Завершите вход на сайте.')
+        if not await self.page.get_by_placeholder('Message Text...',exact=True).is_visible():
+            raise ValueError('Дождитесь загрузки выбранного диалога.')
+        state=await self.context.storage_state()
+        state['_opensooq_account_id']=match[1]
+        state['_opensooq_chat_enabled']=True
+        path=DATA_DIR/'opensooq-chat.json'
+        # Сохраняем в каталоге данных, а не в репозитории и не в read-only Secret Files.
+        fd,temp=tempfile.mkstemp(prefix='.opensooq-',suffix='.json',dir=DATA_DIR)
+        try:
+            os.fchmod(fd,0o600)
+            with os.fdopen(fd,'w',encoding='utf-8') as file:
+                json.dump(state,file)
+                file.flush();os.fsync(file.fileno())
+            os.replace(temp,path)
+        finally:
+            with suppress(FileNotFoundError):os.unlink(temp)
+        dialogs=self.service.dialogues
+        async with dialogs.lock:
+            await dialogs.transport.close()
+            dialogs.transport.state_file=path
+            dialogs.transport.account=match[1]
+            dialogs.transport.saved_enabled=True
+            dialogs.transport.disabled=False
+            dialogs.transport.blocked=False
+        await self._close()
+        with suppress(TelegramError):
+            await self.service.bot.send_message(chat_id=ADMIN_ID,text='✅ Аккаунт OpenSooq подключён к этому серверу. Сам вход сообщений не отправляет. Запуск — кнопкой у выбранного объявления. Диалоги: /dialogs. Отключить: /account_off.')
+        return {'finished':True,'message':'Вход сохранён на сервере. Вернитесь в Telegram и откройте /dialogs.'}
+
+    async def _close(self):
+        for obj,method in ((self.context,'close'),(self.browser,'close'),(self.pw,'stop')):
+            if obj is not None:
+                with suppress(Exception):await getattr(obj,method)()
+        self.context=self.browser=self.pw=self.page=None
+        self.active=False;self.token='';self.expires=0
+
+    async def expire(self):
+        if self.active and time.monotonic()>=self.expires:
+            async with self.lock:
+                if self.active and time.monotonic()>=self.expires:
+                    await self._close()
+
+    async def close(self):
+        async with self.lock:await self._close()
+
+
+def account_origin():
+    raw=os.getenv('RENDER_EXTERNAL_URL','').strip()
+    parsed=urlsplit(raw)
+    if parsed.scheme!='https' or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in {'','/'}:
+        raise ValueError('Не найден HTTPS-адрес сервиса. Задайте RENDER_EXTERNAL_URL адресом вашего сервиса Render без пути и параметров.')
+    return raw.rstrip('/')
+
+
+def make_http_handler(service, loop):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self,*args):pass
+        def respond(self,status,body,kind='application/json; charset=utf-8'):
+            if not isinstance(body,bytes):body=json.dumps(body,ensure_ascii=False).encode()
+            self.send_response(status)
+            self.send_header('Content-Type',kind)
+            self.send_header('Content-Length',str(len(body)))
+            self.send_header('Cache-Control','no-store, max-age=0')
+            self.send_header('Referrer-Policy','no-referrer')
+            self.send_header('X-Content-Type-Options','nosniff')
+            self.send_header('X-Frame-Options','DENY')
+            self.send_header('Content-Security-Policy',"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+            self.end_headers()
+            with suppress(BrokenPipeError,ConnectionResetError):self.wfile.write(body)
+        def api(self,post=False):
+            manager=service.account_login
+            authorization=self.headers.get('Authorization','')
+            if not manager.authorized(authorization):
+                self.respond(401,{'error':'Доступ истёк или ссылка неверна. Получите новую через /account.'});return
+            if post:
+                try:
+                    if self.headers.get('Origin')!=account_origin():
+                        self.respond(403,{'error':'Источник запроса не разрешён.'});return
+                    size=int(self.headers.get('Content-Length','0'))
+                    if not 0<size<=8192:raise ValueError()
+                    if self.headers.get('Content-Type','').split(';')[0]!='application/json':raise ValueError()
+                    data=json.loads(self.rfile.read(size))
+                    if not isinstance(data,dict):raise ValueError()
+                except (ValueError,TypeError):
+                    self.respond(400,{'error':'Некорректный запрос.'});return
+                coroutine=manager.action(authorization,data)
+            else:coroutine=manager.screen(authorization)
+            future=asyncio.run_coroutine_threadsafe(coroutine,loop)
+            try:
+                result=future.result(timeout=40)
+                self.respond(200,result,'application/json; charset=utf-8' if post else 'image/png')
+            except PermissionError:self.respond(401,{'error':'Доступ истёк. Получите новую ссылку.'})
+            except (ValueError,DialogueUnavailable) as exc:self.respond(400,{'error':str(exc)[:600]})
+            except Exception:
+                future.cancel()
+                # Никаких содержимых полей, cookie, токенов и исключений браузера в ответе/логе.
+                self.respond(503,{'error':'Браузер не ответил. Откройте новую ссылку через /account.'})
+        def do_GET(self):
+            if self.path in {'/','/healthz'}:self.respond(200,b'ok','text/plain')
+            elif self.path=='/account':self.respond(200,ACCOUNT_PAGE.encode(),'text/html; charset=utf-8')
+            elif self.path=='/account-api/screen':self.api()
+            else:self.respond(404,{'error':'Не найдено.'})
+        def do_POST(self):
+            if self.path=='/account-api/action':self.api(post=True)
+            else:self.respond(404,{'error':'Не найдено.'})
+    return Handler
+
+
+
 def build_app(token, allowed, database):
     async def setup(app):
         if SUBSCRIPTIONS_ENABLED and not os.getenv("ADMIN_ID", "").strip():
@@ -2488,20 +3316,15 @@ def build_app(token, allowed, database):
         app.bot_data["service"] = service
         log.info("[startup] database=%s data_dir=%s browser=%s proxy=%s", Path(database).resolve(), DATA_DIR.resolve(), USE_BROWSER, bool(service.reader.proxy_url))
         if os.getenv("PORT"):
-            class HealthHandler(BaseHTTPRequestHandler):
-                def do_GET(self):
-                    self.send_response(200 if self.path in {"/", "/healthz"} else 404)
-                    self.end_headers()
-                    self.wfile.write(b"ok")
-                def log_message(self, *args):
-                    pass
-            server = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT"])), HealthHandler)
+            server = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT"])), make_http_handler(service,asyncio.get_running_loop()))
+            server.daemon_threads=True
             threading.Thread(target=server.serve_forever, daemon=True).start()
             app.bot_data["health_server"] = server
         if app.job_queue is None:
             raise RuntimeError('Установите python-telegram-bot с дополнением [job-queue].')
         app.job_queue.run_repeating(service.tick, interval=15, first=5)
         app.job_queue.run_repeating(service.billing.poll, interval=30, first=10)
+        app.job_queue.run_repeating(service.dialogues.poll, interval=30, first=15)
         try:
             await app.bot.set_my_commands([
                 BotCommand("start", "Меню"), BotCommand("check", "Проверить объявления"),
@@ -2613,6 +3436,9 @@ def main():
     logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    if "--chat-login" in sys.argv:
+        asyncio.run(local_chat_login())
+        return 0
     if "--check-startup" in sys.argv:
         try:
             check_startup()
@@ -2624,7 +3450,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v11] Создание Telegram Application")
+    log.info("[boot_v13] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
