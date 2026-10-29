@@ -3101,6 +3101,19 @@ if(!token){notice('Ссылка без кода доступа. Получите
 </script></html>'''
 
 
+def login_navigation_allowed(url, top_frame):
+    """Разрешаем штатные окна reCAPTCHA, не произвольные внешние страницы."""
+    parsed=urlsplit(url)
+    host=parsed.hostname or ''
+    if parsed.scheme not in {'http','https'} or parsed.username or parsed.password:
+        return False
+    if host=='opensooq.com' or host.endswith('.opensooq.com'):
+        return True
+    return (not top_frame and parsed.scheme=='https'
+            and host in {'www.google.com','recaptcha.google.com','www.recaptcha.net','recaptcha.net'}
+            and parsed.port in {None,443} and parsed.path.startswith('/recaptcha/'))
+
+
 class AccountLogin:
     def __init__(self, service):
         self.service=service
@@ -3140,10 +3153,15 @@ class AccountLogin:
             # Управление только официальным OpenSooq, без произвольного браузерного прокси.
             async def restrict(route):
                 req=route.request
-                host=urlsplit(req.url).hostname or ''
-                if req.is_navigation_request() and not (host=='opensooq.com' or host.endswith('.opensooq.com')):
-                    await route.abort()
-                else:await route.continue_()
+                if req.is_navigation_request():
+                    try:
+                        allowed=login_navigation_allowed(req.url,req.frame==self.page.main_frame)
+                    except ValueError:
+                        allowed=False
+                    if not allowed:
+                        await route.abort()
+                        return
+                await route.continue_()
             await self.context.route('**/*',restrict)
             await self.page.goto('https://kw.opensooq.com/en',wait_until='domcontentloaded',timeout=30000)
         except asyncio.CancelledError:
@@ -3450,7 +3468,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v13] Создание Telegram Application")
+    log.info("[boot_v14] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
