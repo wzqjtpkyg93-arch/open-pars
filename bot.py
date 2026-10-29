@@ -3094,19 +3094,97 @@ async def local_chat_login():
 
 
 
-ACCOUNT_PAGE = r'''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Подключить OpenSooq</title><style>body{margin:0;background:#10141e;color:#f7f7fb;font:16px system-ui}main{max-width:480px;margin:auto;padding:14px}button,input{font:inherit;border-radius:10px;padding:12px;border:1px solid #506077}button{background:#1264eb;color:white;margin:4px 2px}button:disabled{opacity:.5}input{box-sizing:border-box;width:100%;background:#202a3b;color:white}canvas{display:block;width:100%;max-width:420px;margin:auto;background:white;border-radius:8px}#status{white-space:pre-wrap;font-size:14px}small{display:block;margin:12px 0;color:#c4ccdb}</style><main><h2>Вход в OpenSooq</h2><p>Войдите в свой аккаунт на экране ниже. Затем откройте «Чаты», выберите существующий диалог и нажмите «Сохранить вход».</p><small>Эта личная ссылка даёт управление браузером. Не пересылайте её. Номер и код вводите здесь, не в Telegram.</small><button id="chats">Открыть чаты</button><button id="save">Сохранить вход</button><button id="close">Закрыть без сохранения</button><p id="status">Подключаем браузер…</p><canvas id="screen" width="420" height="820"></canvas><p>Нажмите нужное поле на экране. Введите текст ниже и нажмите «Ввести».</p><input id="entry" type="password" autocomplete="off" placeholder="Номер, пароль или код — для выбранного поля"><button id="type">Ввести</button><button id="enter">Enter / Далее</button><button id="backspace">Удалить символ</button><button id="tab">Следующее поле</button><button id="up">↑</button><button id="down">↓</button><small>Доступ к этой странице действует 15 минут. При ошибке откройте новую ссылку командой /account.</small></main><script>
-'use strict';const token=location.hash.slice(1);history.replaceState(null,'','/account');const status=document.querySelector('#status'),canvas=document.querySelector('#screen'),entry=document.querySelector('#entry');let busy=false,ended=false,shown=false;
+ACCOUNT_PAGE = r'''<!doctype html>
+<html lang="ru"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Подключить OpenSooq</title>
+<style>
+body{margin:0;background:#10141e;color:#f7f7fb;font:16px system-ui}
+main{max-width:480px;margin:auto;padding:14px}button,input{font:inherit;border-radius:10px;padding:12px;border:1px solid #506077}
+button{background:#1264eb;color:white;margin:4px 2px}button:disabled{opacity:.5}
+input{box-sizing:border-box;width:100%;background:#202a3b;color:white}
+canvas{display:block;width:100%;max-width:420px;margin:auto;background:white;border-radius:8px}
+#status{white-space:pre-wrap;font-size:14px}small{display:block;margin:12px 0;color:#c4ccdb}
+</style>
+<main><h2>Вход в OpenSooq</h2>
+<p>Сначала завершите вход на экране ниже. После подтверждения входа откройте «Чаты», выберите существующий диалог и нажмите «Сохранить вход».</p>
+<small>Личная ссылка даёт управление браузером. Не пересылайте её. Пароль и код вводите здесь, не в Telegram. Сообщения об отправке команды не подтверждают вход в аккаунт.</small>
+<button id="chats">Открыть чаты</button><button id="save">Сохранить вход</button>
+<button id="close">Закрыть без сохранения</button>
+<p id="status" role="status" aria-live="polite">Подключаем браузер…</p>
+<canvas id="screen" width="420" height="820"></canvas>
+<p>Нажмите нужное поле на экране. Введите его полное значение ниже и нажмите «Заменить поле». Предыдущее значение выбранного поля будет заменено.</p>
+<input id="entry" type="password" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="Номер, пароль или код — для выбранного поля">
+<button id="type">Заменить поле</button><button id="enter">Enter / Далее</button>
+<button id="backspace">Удалить символ</button><button id="tab">Следующее поле</button>
+<button id="up">↑</button><button id="down">↓</button><button id="refresh">Обновить экран</button>
+<small>Страница действует 15 минут. При просьбе сайта подождать прекратите попытки. Отчёт в боте: /account_diag. Он не содержит значений полей и не повторяет вход.</small></main>
+<script>
+'use strict';
+const token=location.hash.slice(1);
+history.replaceState(null,'','/account');
+const status=document.querySelector('#status'),canvas=document.querySelector('#screen'),entry=document.querySelector('#entry');
+let ended=false,shown=false,refreshing=false,actionPending=false,screenPromise=Promise.resolve();
 function notice(s){status.textContent=s}
-async function request(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:{Authorization:'Bearer '+token,...(body?{'Content-Type':'application/json'}:{})},body:body?JSON.stringify(body):undefined,cache:'no-store',referrerPolicy:'no-referrer'});if(!r.ok){let m='Ошибка подключения';try{m=(await r.json()).error||m}catch{}if(r.status===401){ended=true}throw Error(m)}return r}
-async function shot(){if(busy||ended)return;busy=true;try{const r=await request('/account-api/screen');const blob=await r.blob();const url=URL.createObjectURL(blob),img=new Image();await new Promise((resolve,reject)=>{img.onload=resolve;img.onerror=reject;img.src=url});canvas.width=img.naturalWidth;canvas.height=img.naturalHeight;canvas.getContext('2d').drawImage(img,0,0);URL.revokeObjectURL(url);if(!shown){notice('Браузер готов. Вход выполняете вы.');shown=true}}catch(e){notice(e.message)}finally{busy=false}}
-async function act(body){if(busy||ended)return;busy=true;document.querySelectorAll('button').forEach(b=>b.disabled=true);try{const data=await(await request('/account-api/action',body)).json();notice(data.message||'Готово');if(data.finished){ended=true;canvas.getContext('2d').clearRect(0,0,canvas.width,canvas.height)}}catch(e){notice(e.message)}finally{busy=false;document.querySelectorAll('button').forEach(b=>b.disabled=ended)}if(!ended)await shot()}
+function controls(){
+ document.querySelectorAll('button').forEach(b=>b.disabled=ended||actionPending);
+ entry.disabled=ended||actionPending;
+ canvas.style.pointerEvents=ended||actionPending?'none':'auto';
+ canvas.setAttribute('aria-busy',String(actionPending));
+}
+function finish(){ended=true;entry.value='';canvas.getContext('2d').clearRect(0,0,canvas.width,canvas.height);controls()}
+async function request(path,body){
+ const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),45000);
+ try{
+  const r=await fetch(path,{method:body?'POST':'GET',headers:{Authorization:'Bearer '+token,...(body?{'Content-Type':'application/json'}:{})},body:body?JSON.stringify(body):undefined,cache:'no-store',referrerPolicy:'no-referrer',signal:controller.signal});
+  if(!r.ok){let m='Ошибка подключения';try{m=(await r.json()).error||m}catch{}if(r.status===401)finish();throw Error(m)}
+  return r;
+ }catch(e){
+  if(e.name==='AbortError')throw Error('Сервер не ответил вовремя. Команда могла выполниться — сначала проверьте экран. Автоматического повтора нет.');
+  throw e;
+ }finally{clearTimeout(timer)}
+}
+async function shot(){
+ if(ended||actionPending||refreshing)return;
+ refreshing=true;
+ screenPromise=(async()=>{
+  let url;
+  try{
+   const r=await request('/account-api/screen'),blob=await r.blob();
+   url=URL.createObjectURL(blob);const img=new Image();
+   await new Promise((resolve,reject)=>{img.onload=resolve;img.onerror=reject;img.src=url});
+   if(ended)return;
+   canvas.width=img.naturalWidth;canvas.height=img.naturalHeight;canvas.getContext('2d').drawImage(img,0,0);
+   if(!shown){if(!actionPending)notice('Браузер готов. Вход выполняете вы.');shown=true}
+  }catch(e){notice(e.message)}finally{if(url)URL.revokeObjectURL(url);refreshing=false}
+ })();
+ await screenPromise;
+}
+async function act(body){
+ if(ended||actionPending)return false;
+ // Действие ожидает уже начатый снимок; снимок не отбрасывает нажатие.
+ actionPending=true;controls();notice('Выполняю выбранное действие…');
+ let ok=false;
+ try{
+  await screenPromise;
+  if(ended)return false;
+  const data=await(await request('/account-api/action',body)).json();
+  ok=true;notice(data.message||'Действие выполнено. Проверьте результат на экране.');
+  if(body.action==='text')entry.value='';
+  if(data.finished)finish();
+ }catch(e){notice(e.message)}finally{actionPending=false;controls()}
+ if(!ended)await shot();
+ return ok;
+}
 canvas.addEventListener('click',e=>{const r=canvas.getBoundingClientRect();act({action:'click',x:(e.clientX-r.left)*canvas.width/r.width,y:(e.clientY-r.top)*canvas.height/r.height})});
-document.querySelector('#type').onclick=()=>{if(busy||!entry.value)return;const text=entry.value;entry.value='';act({action:'text',text})};
+document.querySelector('#type').onclick=()=>{if(!ended&&!actionPending&&entry.value)act({action:'text',text:entry.value})};
 for(const [id,key] of [['enter','Enter'],['backspace','Backspace'],['tab','Tab']])document.querySelector('#'+id).onclick=()=>act({action:'key',key});
 document.querySelector('#up').onclick=()=>act({action:'scroll',dy:-500});document.querySelector('#down').onclick=()=>act({action:'scroll',dy:500});
+document.querySelector('#refresh').onclick=()=>shot();
 for(const id of ['chats','save','close'])document.querySelector('#'+id).onclick=()=>act({action:id});
-if(!token){notice('Ссылка без кода доступа. Получите новую через /account.');ended=true}else{shot();setInterval(shot,2500)}
-</script></html>'''
+if(!token){finish();notice('Ссылка без кода доступа. Получите новую через /account.')}else{shot();setInterval(shot,2500)}
+</script></html>
+'''
 
 
 def login_navigation_allowed(url, top_frame):
@@ -3136,56 +3214,144 @@ class AccountLogin:
         self.diag_failures=Counter()
         self.diag_exists=False
         self.last_diag_check=0.0
+        self.diag_routes={}
+        self.diag_salt=secrets.token_hex(16)
+        self.diag_pending={}
+        self.diag_events=[]
+        self.diag_blocked=0
+        self.diag_action=0
+        self.diag_action_label='открытие страницы'
 
     def diagnostic_text(self):
         if not self.diag_exists:
-            return 'Диагностика пуста: эта версия ещё не наблюдала вход. Команда /account_diag сама не открывает сайт и не повторяет вход. Старые попытки из предыдущих версий не записаны.'
-        lines=['Диагностика последнего сеанса /account',
+            return 'Диагностика пуста. /account_diag не открывает сайт и не повторяет вход. Старые попытки этой версией не наблюдались.'
+        lines=['Диагностика входа v16',
                'Страна: '+COUNTRY_LABELS.get(self.country,self.country),
-               'Доступ к странице: '+('активен' if self.active and time.monotonic()<self.expires else 'закрыт или истёк')]
-        flags={'captcha_failed':'Сайт сообщил: reCAPTCHA verification failed.',
-               'unauthorized':'Сайт сообщил: Unauthorized — точная причина не раскрыта.',
+               'Доступ к странице: '+('активен' if self.active and time.monotonic()<self.expires else 'закрыт или истёк'),
+               'Браузер входа: прямое соединение. Прокси парсера здесь не используется.']
+        flags={'captcha_failed':'На странице: reCAPTCHA verification failed.',
+               'unauthorized':'На странице: Unauthorized. Точная причина не раскрыта.',
                'wait':'Сайт просит подождать перед повторным входом.',
-               'browser_error':'Браузер на сервере не удалось открыть.'}
+               'browser_error':'Не удалось открыть браузер входа.'}
         lines.extend(flags[k] for k in sorted(self.diag_flags) if k in flags)
-        for (provider,status),count in sorted(self.diag_http.items()):
-            lines.append(f'{provider}: HTTP {status}, ответов {count}')
-        for provider,count in sorted(self.diag_failures.items()):
-            lines.append(f'{provider}: запросов без ответа {count}')
-        if not self.diag_flags and not any(status>=400 for _,status in self.diag_http):
-            lines.append('Причина отказа не зафиксирована; это не подтверждение успешного входа.')
-        lines.append('Здесь нет паролей, номеров, кодов, cookie, URL и содержимого запросов. Отчёт собирается с момента /account и хранится до нового сеанса или перезапуска.')
-        return '\n'.join(lines)
+        if self.diag_events:
+            lines.append('Последние запросы авторизации и ошибки:')
+            for action, label, route, group, method, resource, result in self.diag_events[-12:]:
+                lines.append(f'Действие {action} ({label}): {method} / {resource} / {group} / маршрут {route} → {result}')
+            lines.append('Группа маршрута определяется по его названию. HTTP 200 сам по себе не подтверждает вход; чужой HTTP 401 не доказывает отказ входа.')
+        else:
+            lines.append('Запросов авторизации или ошибок пока не зафиксировано.')
+        if self.diag_blocked:
+            lines.append(f'Ограничитель нашей страницы запретил переходов: {self.diag_blocked}.')
+        for (provider,status),amount in sorted(self.diag_http.items()):
+            lines.append(f'{provider}: HTTP {status} × {amount}')
+        for (provider,reason),amount in sorted(self.diag_failures.items()):
+            lines.append(f'{provider}: {reason} × {amount}')
+        lines.append('Тела запросов и ответов, заголовки, значения полей, cookie и полные URL не записываются. Маршруты обозначены только номерами. Новый /account или перезапуск очищает отчёт.')
+        return '\n'.join(lines)[:3900]
 
     @staticmethod
     def diagnostic_provider(url):
-        host=urlsplit(url).hostname or ''
+        try:
+            parsed=urlsplit(url)
+            host=parsed.hostname or ''
+        except ValueError:
+            return ''
         if host=='opensooq.com' or host.endswith('.opensooq.com'):
             return 'OpenSooq'
-        if host in {'www.google.com','recaptcha.google.com','www.recaptcha.net','recaptcha.net','www.gstatic.com'} and urlsplit(url).path.startswith('/recaptcha/'):
+        if host in {'www.google.com','recaptcha.google.com','www.recaptcha.net','recaptcha.net','www.gstatic.com'} and parsed.path.startswith('/recaptcha/'):
             return 'reCAPTCHA'
         return ''
 
-    def response_seen(self,response):
-        provider=self.diagnostic_provider(response.url)
-        if provider:
-            self.diag_http[(provider,int(response.status))]+=1
-
-    def request_failed(self,request):
+    def request_metadata(self, request):
         provider=self.diagnostic_provider(request.url)
-        if provider:
-            self.diag_failures[provider]+=1
+        if not provider:
+            return None
+        parsed=urlsplit(request.url)
+        # Соль и хеш нужны только для сопоставления одного маршрута в памяти.
+        # Телефон, query, исходный путь и URL в журнал не попадают.
+        identity=hashlib.sha256((self.diag_salt+'|'+str(parsed.hostname)+'|'+parsed.path).encode()).hexdigest()
+        if identity not in self.diag_routes and len(self.diag_routes)<80:
+            self.diag_routes[identity]=len(self.diag_routes)+1
+        route=self.diag_routes.get(identity,0)
+        group='reCAPTCHA' if provider=='reCAPTCHA' else 'другой'
+        segments=re.split(r'[^a-z]+',parsed.path.casefold())
+        if provider=='OpenSooq' and any(s in {'login','signin','auth','authenticate','authentication','authorization','session','sessions','token','password','otp','verify','verification'} for s in segments):
+            group='авторизация*'
+        method=request.method if request.method in {'GET','POST','PUT','PATCH','DELETE','HEAD','OPTIONS'} else 'OTHER'
+        resource=request.resource_type if request.resource_type in {'document','xhr','fetch','script','image','stylesheet','font','other'} else 'other'
+        return (self.diag_action,self.diag_action_label,route,group,method,resource,provider)
 
-    async def collect_flags(self):
-        if self.page is None or time.monotonic()-self.last_diag_check<3:
+    def request_seen(self, request):
+        metadata=self.request_metadata(request)
+        if metadata is not None and len(self.diag_pending)<500:
+            self.diag_pending[id(request)]=metadata
+
+    def request_finished(self, request):
+        self.diag_pending.pop(id(request),None)
+
+    def add_diagnostic_event(self, metadata, result):
+        self.diag_events.append((*metadata[:6],result))
+        del self.diag_events[:-40]
+
+    def response_seen(self, response):
+        metadata=self.diag_pending.get(id(response.request)) or self.request_metadata(response.request)
+        if metadata is None:
+            return
+        status=int(response.status)
+        if not 100<=status<=599:
+            return
+        self.diag_http[(metadata[6],status)]+=1
+        if status>=400 or (metadata[3]=='авторизация*' and metadata[5] in {'xhr','fetch','document'}):
+            self.add_diagnostic_event(metadata,'HTTP '+str(status))
+
+    def request_failed(self, request):
+        metadata=self.diag_pending.pop(id(request),None) or self.request_metadata(request)
+        if metadata is None:
+            return
+        # ERR_ABORTED бывает обычной отменой при навигации; не называем это блокировкой.
+        reason='отменён' if request.failure=='net::ERR_ABORTED' else 'сетевая ошибка'
+        self.diag_failures[(metadata[6],reason)]+=1
+        if metadata[3]=='авторизация*':
+            self.add_diagnostic_event(metadata,reason)
+
+    async def collect_flags(self, force=False):
+        if self.page is None or (not force and time.monotonic()-self.last_diag_check<3):
             return
         self.last_diag_check=time.monotonic()
-        for key,pattern in [('captcha_failed',r'^recaptcha verification failed$'),
-                            ('unauthorized',r'^unauthorized$'),
-                            ('wait',r'^please wait before trying again(?: or contact us)?$')]:
-            with suppress(Exception):
-                if await self.page.get_by_text(re.compile(pattern,re.I)).first.is_visible():
-                    self.diag_flags.add(key)
+        for frame in self.page.frames[:30]:
+            try:
+                host=urlsplit(frame.url).hostname or ''
+            except ValueError:
+                continue
+            if host!='opensooq.com' and not host.endswith('.opensooq.com'):
+                continue
+            for key,pattern in [('captcha_failed',r'^recaptcha verification failed$'),
+                                ('unauthorized',r'^unauthorized$'),
+                                ('wait',r'^please wait before trying again(?: or contact us)?$')]:
+                with suppress(Exception):
+                    for candidate in (await frame.get_by_text(re.compile(pattern,re.I)).all())[:8]:
+                        if await candidate.is_visible():
+                            self.diag_flags.add(key)
+                            break
+
+    async def replace_focused_field(self, value):
+        # Смотрим только на фокус и редактируемость. Значения полей не читаем.
+        candidates=[]
+        for frame in self.page.frames[:30]:
+            try:
+                host=urlsplit(frame.url).hostname or ''
+            except ValueError:
+                continue
+            if host!='opensooq.com' and not host.endswith('.opensooq.com'):
+                continue
+            for item in (await frame.locator('input:focus, textarea:focus, [contenteditable="true"]:focus').all())[:3]:
+                if (await item.is_visible() and await item.is_editable()
+                        and await item.evaluate('(el) => el.ownerDocument.hasFocus()')):
+                    candidates.append(item)
+        if len(candidates)!=1:
+            raise ValueError('Сначала нажмите нужное поле OpenSooq на экране, затем снова нажмите «Заменить поле». Текст не введён.')
+        await candidates[0].fill(value,timeout=5000)
 
     async def issue(self,country='sa'):
         if country not in COUNTRIES:
@@ -3194,6 +3360,9 @@ class AccountLogin:
             await self._close()
             self.country=country
             self.diag_flags.clear();self.diag_http.clear();self.diag_failures.clear()
+            self.diag_routes.clear();self.diag_pending.clear();self.diag_events.clear()
+            self.diag_salt=secrets.token_hex(16)
+            self.diag_blocked=0;self.diag_action=0;self.diag_action_label='открытие страницы' 
             self.diag_exists=True
             self.last_diag_check=0.0
             self.token=secrets.token_urlsafe(32)
@@ -3220,6 +3389,8 @@ class AccountLogin:
             self.context=await self.browser.new_context(viewport={'width':420,'height':820},locale='en-US')
             self.page=await self.context.new_page()
             self.page.set_default_timeout(12000)
+            self.page.on('request',self.request_seen)
+            self.page.on('requestfinished',self.request_finished)
             self.page.on('response',self.response_seen)
             self.page.on('requestfailed',self.request_failed)
             # Управление только официальным OpenSooq, без произвольного браузерного прокси.
@@ -3231,6 +3402,7 @@ class AccountLogin:
                     except ValueError:
                         allowed=False
                     if not allowed:
+                        self.diag_blocked+=1
                         await route.abort()
                         return
                 await route.continue_()
@@ -3256,6 +3428,12 @@ class AccountLogin:
             if not self.authorized(authorization):raise PermissionError()
             await self._open()
             action=data.get('action')
+            labels={'click':'нажатие','text':'замена поля','key':'клавиша',
+                    'scroll':'прокрутка','chats':'открытие чатов','save':'сохранение','close':'закрытие'}
+            if action not in labels:
+                raise ValueError('Действие не поддерживается.')
+            self.diag_action+=1
+            self.diag_action_label=labels[action]
             if action=='click':
                 x,y=data.get('x'),data.get('y')
                 if isinstance(x,bool) or isinstance(y,bool) or not isinstance(x,(int,float)) or not isinstance(y,(int,float)) or not math.isfinite(x) or not math.isfinite(y) or not 0<=x<420 or not 0<=y<820:
@@ -3265,7 +3443,7 @@ class AccountLogin:
                 value=data.get('text')
                 if not isinstance(value,str) or not 1<=len(value)<=200:
                     raise ValueError('Введите от 1 до 200 символов.')
-                await self.page.keyboard.insert_text(value)
+                await self.replace_focused_field(value)
             elif action=='key':
                 if data.get('key') not in {'Enter','Backspace','Tab'}:raise ValueError('Клавиша не поддерживается.')
                 await self.page.keyboard.press(data['key'])
@@ -3281,8 +3459,10 @@ class AccountLogin:
                 await self._close()
                 return {'finished':True,'message':'Браузер закрыт. Новый вход не сохранён.'}
             else:raise ValueError('Действие не поддерживается.')
-            await self.collect_flags()
-            return {'message':'Готово'}
+            await self.collect_flags(force=True)
+            message=('Значение выбранного поля заменено.' if action=='text' else
+                     'Действие выполнено. Проверьте результат на экране — это не подтверждение входа.')
+            return {'message':message}
 
     async def _save(self):
         url=urlsplit(self.page.url)
@@ -3326,6 +3506,7 @@ class AccountLogin:
             if obj is not None:
                 with suppress(Exception):await getattr(obj,method)()
         self.context=self.browser=self.pw=self.page=None
+        self.diag_pending.clear()
         self.active=False;self.token='';self.expires=0
 
     async def expire(self):
@@ -3543,7 +3724,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v15] Создание Telegram Application")
+    log.info("[boot_v16] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
