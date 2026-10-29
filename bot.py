@@ -1084,6 +1084,7 @@ class Service:
         self.closing = False
         self.subscription_table = "subscriptions_test" if XROCKET_TESTNET else "subscriptions"
         self.billing = Billing(self)
+        self.account_browser = PersistentOpenSooqBrowser()
         self.dialogues = SellerDialogues(self)
         self.account_login = AccountLogin(self)
 
@@ -1434,6 +1435,7 @@ class Service:
         await self.billing.close()
         await self.account_login.close()
         await self.dialogues.close()
+        await self.account_browser.close()
         self.db.close()
 
 
@@ -1827,26 +1829,9 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     raise ValueError('Включите Web Service с PORT на Render для страницы входа.')
                 token=await service.account_login.issue(country)
                 keyboard=InlineKeyboardMarkup([[InlineKeyboardButton('🔐 Войти в OpenSooq',url=origin+'/account#'+token)]])
-                await message.reply_text("Страна входа: "+COUNTRY_LABELS[country]+"\n\n🔐 Личная страница входа на 15 минут. Откройте кнопку на iPhone, войдите в OpenSooq, откройте существующий чат и нажмите «Сохранить вход». Ссылку не пересылайте. Коды в Telegram вводить не нужно. Сам вход не начинает переписку.",reply_markup=keyboard)
+                await message.reply_text("Страна входа: "+COUNTRY_LABELS[country]+"\n\n🔐 Личная страница управления на 15 минут. Браузер использует постоянный профиль. Активные диалоги поставлены на паузу. Войдите в OpenSooq, откройте существующий чат и нажмите «Сохранить вход». Новая ссылка продолжит ту же форму, если она осталась открыта. Ссылку не пересылайте. Коды в Telegram вводить не нужно.",reply_markup=keyboard)
             else:
-                dialogs=service.dialogues
-                dialogs.cancelled.update(r['id'] for r in dialogs.db.execute('SELECT id FROM seller_dialogues WHERE chat=?',(ADMIN_ID,)))
-                await service.account_login.close()
-                async with dialogs.lock:
-                    dialogs.transport.disabled=True
-                    dialogs.transport.saved_enabled=False
-                    await dialogs.transport.close()
-                    path=DATA_DIR/'opensooq-chat.json'
-                    if path.is_file():
-                        state=json.loads(path.read_text(encoding='utf-8'))
-                        state['_opensooq_chat_enabled']=False
-                        fd,temp=tempfile.mkstemp(prefix='.opensooq-',suffix='.json',dir=DATA_DIR)
-                        try:
-                            with os.fdopen(fd,'w',encoding='utf-8') as out:json.dump(state,out)
-                            os.replace(temp,path)
-                        finally:
-                            with suppress(FileNotFoundError):os.unlink(temp)
-                    with dialogs.db:dialogs.db.execute("UPDATE seller_dialogues SET state='paused' WHERE chat=? AND state IN ('queued','waiting','sending','approved')",(ADMIN_ID,))
+                await disconnect_opensooq_account(service)
                 await message.reply_text("⏸ Аккаунт отключён от автоответчика, активные диалоги остановлены. Парсер работает как раньше.")
         except (ValueError,OSError):
             await message.reply_text('Не удалось открыть подключение аккаунта. Проверьте HTTPS-адрес RENDER_EXTERNAL_URL, PORT и доступ на запись в DATA_DIR. Секреты в чат не присылайте.')
@@ -1864,7 +1849,8 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("⏸ Автоответы во всех диалогах остановлены.")
         elif command == "/chatstatus":
             worker=service.dialogues.transport
-            await message.reply_text("Переписка на Render: "+("настройки заданы; вход проверяется при запуске диалога." if worker.configured() else "не подключена.")+"\nПодключить аккаунт с телефона: /account. Отключить: /account_off. Коды и файлы сессии в Telegram не присылайте.")
+            mode='постоянный профиль' if worker.profile_mode else 'прежний файл сессии или ещё не подключён'
+            await message.reply_text("Переписка на Render: "+("настройки заданы; вход проверяется при запуске диалога." if worker.configured() else "не подключена.")+"\nРежим: "+mode+".\nПодключить аккаунт с телефона: /account. Отключить: /account_off. Для сохранения после перезапуска DATA_DIR должен находиться на постоянном диске Render. Коды и профиль в Telegram не присылайте.")
         elif command == "/dialog":
             try:
                 url=safe_url(message.text.split(maxsplit=1)[1])
@@ -2625,12 +2611,163 @@ class DialogueUnavailable(ValueError):
     pass
 
 
+class PersistentOpenSooqBrowser:
+    """Один выделенный профиль и один браузер для ручного входа и переписки."""
+    def __init__(self, directory=None):
+        self.directory=Path(directory) if directory is not None else DATA_DIR/'opensooq-browser-profile'
+        self.lock=asyncio.Lock()
+        self.pw=self.context=self.page=None
+        self._file_lock=None
+        self.on_blocked=None
+
+    def _acquire_profile(self):
+        import fcntl
+        self.directory.mkdir(parents=True,exist_ok=True,mode=0o700)
+        os.chmod(self.directory,0o700)
+        fd=os.open(self.directory/'.bot-profile.lock',os.O_RDWR|os.O_CREAT,0o600)
+        try:
+            os.fchmod(fd,0o600)
+            fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BaseException:
+            os.close(fd)
+            raise
+        self._file_lock=fd
+
+    def _release_profile(self):
+        if self._file_lock is not None:
+            fd,self._file_lock=self._file_lock,None
+            os.close(fd)
+
+    def _context_closed(self,context):
+        if self.context is context:
+            self.context=self.page=None
+
+    async def _restrict_navigation(self,route):
+        request=route.request
+        if request.is_navigation_request():
+            try:
+                allowed=login_navigation_allowed(request.url,request.frame.parent_frame is None)
+            except (ValueError,AttributeError):
+                allowed=False
+            if not allowed:
+                if self.on_blocked is not None:
+                    self.on_blocked()
+                await route.abort()
+                return
+        await route.continue_()
+
+    async def get_page(self):
+        async with self.lock:
+            if self.context is not None:
+                if self.page is None or self.page.is_closed():
+                    self.page=await self.context.new_page()
+                    self.page.set_default_timeout(12000)
+                return self.context,self.page
+            # Завершаем оставшийся транспорт после неожиданного закрытия Chromium.
+            await self._shutdown()
+            try:
+                self._acquire_profile()
+            except BlockingIOError:
+                raise DialogueUnavailable('Постоянный профиль уже используется другим процессом. Второй браузер не запущен; файлы блокировки не удаляются.') from None
+            try:
+                from playwright.async_api import async_playwright
+                self.pw=await async_playwright().start()
+                self.context=await self.pw.chromium.launch_persistent_context(
+                    str(self.directory),headless=True,args=['--disable-dev-shm-usage'],
+                    viewport={'width':420,'height':820},locale='en-US',
+                    accept_downloads=False,timeout=25000)
+                self.context.on('close',self._context_closed)
+                await self.context.route('**/*',self._restrict_navigation)
+                pages=[page for page in self.context.pages if not page.is_closed()]
+                self.page=pages[0] if pages else await self.context.new_page()
+                self.page.set_default_timeout(12000)
+                return self.context,self.page
+            except asyncio.CancelledError:
+                await self._shutdown()
+                raise
+            except Exception:
+                await self._shutdown()
+                raise DialogueUnavailable('Не удалось открыть постоянный браузер. Проверьте Chromium, память, доступ на запись в DATA_DIR и отсутствие второго процесса с тем же профилем.') from None
+
+    async def _shutdown(self):
+        context,pw=self.context,self.pw
+        self.context=self.page=self.pw=None
+        try:
+            if context is not None:
+                with suppress(Exception):
+                    await asyncio.wait_for(context.close(),timeout=10)
+        finally:
+            try:
+                if pw is not None:
+                    with suppress(Exception):
+                        await asyncio.wait_for(pw.stop(),timeout=10)
+            finally:
+                self._release_profile()
+
+    async def close(self):
+        async with self.lock:
+            await self._shutdown()
+
+
+def write_account_metadata(metadata):
+    """Атомарный файл разрешения на автоответы; для постоянного режима без cookie."""
+    DATA_DIR.mkdir(parents=True,exist_ok=True)
+    path=DATA_DIR/'opensooq-chat.json'
+    fd,temporary=tempfile.mkstemp(prefix='.opensooq-',suffix='.json',dir=DATA_DIR)
+    try:
+        os.fchmod(fd,0o600)
+        with os.fdopen(fd,'w',encoding='utf-8') as stream:
+            json.dump(metadata,stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary,path)
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(temporary)
+    return path
+
+
+def pause_account_automation(dialogs):
+    """Вызывать под dialogs.lock: новый ручной вход требует нового Save."""
+    dialogs.transport.disabled=True
+    dialogs.transport.saved_enabled=False
+    with dialogs.db:
+        dialogs.db.execute("UPDATE seller_dialogues SET state='paused',note='Ручное управление аккаунтом; продолжение только после подтверждения владельца' WHERE chat=? AND state IN ('queued','waiting','sending','approved')",(ADMIN_ID,))
+    metadata={}
+    path=DATA_DIR/'opensooq-chat.json'
+    if path.is_file():
+        with suppress(ValueError,OSError,TypeError):
+            value=json.loads(path.read_text(encoding='utf-8'))
+            if isinstance(value,dict):
+                metadata=value
+    metadata['_opensooq_chat_enabled']=False
+    write_account_metadata(metadata)
+
+
+async def disconnect_opensooq_account(service):
+    dialogs=service.dialogues
+    dialogs.cancelled.update(row['id'] for row in dialogs.db.execute(
+        'SELECT id FROM seller_dialogues WHERE chat=?',(ADMIN_ID,)))
+    await service.account_login.close()
+    async with dialogs.lock:
+        try:
+            # Сначала запрещаем автоответы на диске, затем закрываем браузер.
+            pause_account_automation(dialogs)
+        finally:
+            await dialogs.transport.close()
+            await service.account_browser.close()
+
+
+
 class OpenSooqChatBrowser:
     """Обычный интерфейс сайта. Секрет сессии создаёт владелец вне чата Telegram."""
-    def __init__(self):
+    def __init__(self, profile=None):
         self.pw = self.browser = self.context = self.page = None
         self.account = os.getenv('OPENSOOQ_CHAT_ACCOUNT_ID', '').strip()
         self.state_file = Path(os.getenv('OPENSOOQ_CHAT_STATE_FILE', '/etc/secrets/opensooq-chat.json'))
+        self.profile=profile
+        self.profile_mode=False
+        self._using_profile=False
         self.saved_enabled=False
         self.disabled=False
         local=DATA_DIR/'opensooq-chat.json'
@@ -2641,12 +2778,15 @@ class OpenSooqChatBrowser:
                 self.account=str(meta.get('_opensooq_account_id',''))
                 self.saved_enabled=meta.get('_opensooq_chat_enabled') is True
                 self.disabled=meta.get('_opensooq_chat_enabled') is False
+                self.profile_mode=meta.get('_opensooq_profile_mode')=='persistent'
         self.blocked = False
         self.guard = lambda: True
 
     def configured(self):
-        return (not self.disabled and (self.saved_enabled or os.getenv('OPENSOOQ_CHAT_ENABLED','0')=='1')
-                and self.state_file.is_file() and self.account.isdecimal())
+        enabled=self.saved_enabled or os.getenv('OPENSOOQ_CHAT_ENABLED','0')=='1'
+        if self.profile_mode:
+            enabled=self.saved_enabled and self.profile is not None and self.profile.directory.is_dir()
+        return (not self.disabled and enabled and self.state_file.is_file() and self.account.isdecimal())
 
     async def ready(self):
         if self.blocked:
@@ -2654,6 +2794,15 @@ class OpenSooqChatBrowser:
         if not self.configured():
             raise DialogueUnavailable('Аккаунт ещё не подключён. Откройте /account и войдите с телефона через личную страницу.')
         if self.page is not None and not self.page.is_closed():
+            return
+        if self.profile_mode:
+            metadata=json.loads(self.state_file.read_text(encoding='utf-8'))
+            if (metadata.get('_opensooq_account_id')!=self.account
+                    or metadata.get('_opensooq_chat_enabled') is not True
+                    or metadata.get('_opensooq_profile_mode')!='persistent'):
+                raise DialogueUnavailable('Разрешение или привязка профиля изменились. Подтвердите вход через /account.')
+            self.context,self.page=await self.profile.get_page()
+            self._using_profile=True
             return
         from playwright.async_api import async_playwright
         self.pw = await async_playwright().start()
@@ -2786,6 +2935,10 @@ class OpenSooqChatBrowser:
         return room_url, outgoing[-1]['id']
 
     async def close(self):
+        if self._using_profile:
+            self.pw=self.browser=self.context=self.page=None
+            self._using_profile=False
+            return
         if self.context is not None:
             with suppress(Exception):
                 await self.context.close()
@@ -2801,7 +2954,7 @@ class OpenSooqChatBrowser:
 class SellerDialogues:
     def __init__(self, service):
         self.service, self.db = service, service.db
-        self.transport = OpenSooqChatBrowser()
+        self.transport = OpenSooqChatBrowser(getattr(service,'account_browser',None))
         self.lock = asyncio.Lock()
         self.cancelled = set()
         self.db.executescript('''
@@ -3042,7 +3195,8 @@ async def dialogue_callback(update, context):
                 dialogs.save(row['id'],state='approved',pending_stage=stage,pending_text=DIALOG_QUESTIONS[stage],pending_after=cursor)
             await dialogue_panel(update,context,row['id'])
         elif parts[1]=='pause' and len(parts)==3:
-
+            dialogs.row(parts[2])
+            dialogs.cancelled.add(parts[2])
             async with dialogs.lock:
                 dialogs.row(parts[2])
                 dialogs.save(parts[2],state='paused',note='Остановлен владельцем. Автоответы отключены.')
@@ -3108,9 +3262,9 @@ canvas{display:block;width:100%;max-width:420px;margin:auto;background:white;bor
 </style>
 <main><h2>Вход в OpenSooq</h2>
 <p>Сначала завершите вход на экране ниже. После подтверждения входа откройте «Чаты», выберите существующий диалог и нажмите «Сохранить вход».</p>
-<small>Личная ссылка даёт управление браузером. Не пересылайте её. Пароль и код вводите здесь, не в Telegram. Сообщения об отправке команды не подтверждают вход в аккаунт.</small>
+<small>Личная ссылка даёт управление постоянным браузером. Закрытие страницы не удаляет его профиль; отключение бота: /account_off. Не пересылайте её. Пароль и код вводите здесь, не в Telegram. Сообщения об отправке команды не подтверждают вход в аккаунт.</small>
 <button id="chats">Открыть чаты</button><button id="save">Сохранить вход</button>
-<button id="close">Закрыть без сохранения</button>
+<button id="close">Закрыть страницу входа</button>
 <p id="status" role="status" aria-live="polite">Подключаем браузер…</p>
 <canvas id="screen" width="420" height="820"></canvas>
 <p>Нажмите нужное поле на экране. Введите его полное значение ниже и нажмите «Заменить поле». Предыдущее значение выбранного поля будет заменено.</p>
@@ -3221,14 +3375,15 @@ class AccountLogin:
         self.diag_blocked=0
         self.diag_action=0
         self.diag_action_label='открытие страницы'
+        self._observed_page=None
 
     def diagnostic_text(self):
         if not self.diag_exists:
             return 'Диагностика пуста. /account_diag не открывает сайт и не повторяет вход. Старые попытки этой версией не наблюдались.'
-        lines=['Диагностика входа v16',
+        lines=['Диагностика входа v17',
                'Страна: '+COUNTRY_LABELS.get(self.country,self.country),
                'Доступ к странице: '+('активен' if self.active and time.monotonic()<self.expires else 'закрыт или истёк'),
-               'Браузер входа: прямое соединение. Прокси парсера здесь не используется.']
+               'Браузер входа: постоянный профиль, прямое соединение. Прокси парсера здесь не используется.']
         flags={'captcha_failed':'На странице: reCAPTCHA verification failed.',
                'unauthorized':'На странице: Unauthorized. Точная причина не раскрыта.',
                'wait':'Сайт просит подождать перед повторным входом.',
@@ -3247,7 +3402,7 @@ class AccountLogin:
             lines.append(f'{provider}: HTTP {status} × {amount}')
         for (provider,reason),amount in sorted(self.diag_failures.items()):
             lines.append(f'{provider}: {reason} × {amount}')
-        lines.append('Тела запросов и ответов, заголовки, значения полей, cookie и полные URL не записываются. Маршруты обозначены только номерами. Новый /account или перезапуск очищает отчёт.')
+        lines.append('Тела запросов и ответов, заголовки, значения полей, cookie и полные URL не записываются. Маршруты обозначены только номерами. Новый /account или перезапуск очищает отчёт. Профиль сохраняется отдельно в DATA_DIR.')
         return '\n'.join(lines)[:3900]
 
     @staticmethod
@@ -3370,8 +3525,15 @@ class AccountLogin:
             self.active=True
             dialogs=getattr(self.service,'dialogues',None)
             if dialogs is not None:
+                dialogs.cancelled.update(row['id'] for row in dialogs.db.execute(
+                    'SELECT id FROM seller_dialogues WHERE chat=?',(ADMIN_ID,)))
                 async with dialogs.lock:
-                    await dialogs.transport.close()
+                    try:
+                        pause_account_automation(dialogs)
+                        await dialogs.transport.close()
+                    except BaseException:
+                        await self._close()
+                        raise
             return self.token
 
     def authorized(self, value):
@@ -3380,41 +3542,41 @@ class AccountLogin:
                     and isinstance(value,str) and secrets.compare_digest(value,'Bearer '+self.token))
         except (TypeError,ValueError):return False
 
+    def blocked_navigation(self):
+        self.diag_blocked+=1
+
+    def _listeners(self):
+        return (('request',self.request_seen),('requestfinished',self.request_finished),
+                ('response',self.response_seen),('requestfailed',self.request_failed))
+
     async def _open(self):
-        if self.page is not None and not self.page.is_closed():return
-        from playwright.async_api import async_playwright
-        self.pw=await async_playwright().start()
+        if self.page is not None and not self.page.is_closed():
+            return
         try:
-            self.browser=await self.pw.chromium.launch(headless=True,args=['--disable-dev-shm-usage'])
-            self.context=await self.browser.new_context(viewport={'width':420,'height':820},locale='en-US')
-            self.page=await self.context.new_page()
-            self.page.set_default_timeout(12000)
-            self.page.on('request',self.request_seen)
-            self.page.on('requestfinished',self.request_finished)
-            self.page.on('response',self.response_seen)
-            self.page.on('requestfailed',self.request_failed)
-            # Управление только официальным OpenSooq, без произвольного браузерного прокси.
-            async def restrict(route):
-                req=route.request
-                if req.is_navigation_request():
-                    try:
-                        allowed=login_navigation_allowed(req.url,req.frame==self.page.main_frame)
-                    except ValueError:
-                        allowed=False
-                    if not allowed:
-                        self.diag_blocked+=1
-                        await route.abort()
-                        return
-                await route.continue_()
-            await self.context.route('**/*',restrict)
-            await self.page.goto(f'https://{self.country}.opensooq.com/en',wait_until='domcontentloaded',timeout=30000)
+            manager=self.service.account_browser
+            self.context,self.page=await manager.get_page()
+            manager.on_blocked=self.blocked_navigation
+            self._observed_page=self.page
+            for event,callback in self._listeners():
+                self.page.on(event,callback)
+            current=urlsplit(self.page.url)
+            requested_host=self.country+'.opensooq.com'
+            current_host=current.hostname or ''
+            # Новая ссылка сохраняет текущую форму/чат. При явной смене страны
+            # открываем выбранную главную, не меняя профиль или сетевые настройки.
+            if (not login_navigation_allowed(self.page.url,True)
+                    or (current_host in {c+'.opensooq.com' for c in COUNTRIES}
+                        and current_host!=requested_host)):
+                await self.page.goto('https://'+requested_host+'/en',wait_until='domcontentloaded',timeout=30000)
         except asyncio.CancelledError:
             await self._close()
             raise
-        except Exception:
+        except Exception as error:
             self.diag_flags.add('browser_error')
             await self._close()
-            raise DialogueUnavailable('Не удалось открыть браузер входа. Проверьте установку Chromium и доступную память Render.') from None
+            if isinstance(error,DialogueUnavailable):
+                raise
+            raise DialogueUnavailable('Не удалось показать постоянный браузер. Проверьте DATA_DIR, Chromium и память Render.') from None
 
     async def screen(self, authorization):
         async with self.lock:
@@ -3457,7 +3619,7 @@ class AccountLogin:
                 return await self._save()
             elif action=='close':
                 await self._close()
-                return {'finished':True,'message':'Браузер закрыт. Новый вход не сохранён.'}
+                return {'finished':True,'message':'Доступ по ссылке закрыт. Профиль браузера сохранён; остановленные диалоги остаются на паузе.'}
             else:raise ValueError('Действие не поддерживается.')
             await self.collect_flags(force=True)
             message=('Значение выбранного поля заменено.' if action=='text' else
@@ -3474,20 +3636,11 @@ class AccountLogin:
             raise ValueError('Вход не подтверждён. Завершите вход на сайте.')
         if not await self.page.get_by_placeholder('Message Text...',exact=True).is_visible():
             raise ValueError('Дождитесь загрузки выбранного диалога.')
-        state=await self.context.storage_state()
-        state['_opensooq_account_id']=match[1]
-        state['_opensooq_chat_enabled']=True
-        path=DATA_DIR/'opensooq-chat.json'
-        # Сохраняем в каталоге данных, а не в репозитории и не в read-only Secret Files.
-        fd,temp=tempfile.mkstemp(prefix='.opensooq-',suffix='.json',dir=DATA_DIR)
-        try:
-            os.fchmod(fd,0o600)
-            with os.fdopen(fd,'w',encoding='utf-8') as file:
-                json.dump(state,file)
-                file.flush();os.fsync(file.fileno())
-            os.replace(temp,path)
-        finally:
-            with suppress(FileNotFoundError):os.unlink(temp)
+        # Браузерные данные остаются в профиле. Файл ниже хранит только
+        # подтверждённый аккаунт и явное разрешение владельца на автоответы.
+        path=write_account_metadata({'_opensooq_account_id':match[1],
+            '_opensooq_chat_enabled':True,'_opensooq_profile_mode':'persistent',
+            '_opensooq_profile_version':1})
         dialogs=self.service.dialogues
         async with dialogs.lock:
             await dialogs.transport.close()
@@ -3496,15 +3649,23 @@ class AccountLogin:
             dialogs.transport.saved_enabled=True
             dialogs.transport.disabled=False
             dialogs.transport.blocked=False
+            dialogs.transport.profile_mode=True
         await self._close()
         with suppress(TelegramError):
-            await self.service.bot.send_message(chat_id=ADMIN_ID,text='✅ Аккаунт OpenSooq подключён к этому серверу. Сам вход сообщений не отправляет. Запуск — кнопкой у выбранного объявления. Диалоги: /dialogs. Отключить: /account_off.')
-        return {'finished':True,'message':'Вход сохранён на сервере. Вернитесь в Telegram и откройте /dialogs.'}
+            await self.service.bot.send_message(chat_id=ADMIN_ID,text='✅ Вход подтверждён. Переписка использует тот же постоянный профиль браузера. Диалоги, остановленные при открытии /account, остаются на паузе. Запуск — кнопкой у выбранного объявления. /chatstatus — состояние, /account_off — отключение.')
+        return {'finished':True,'message':'Вход подтверждён, профиль сохранён. Браузер остаётся доступен боту; прежние диалоги на паузе.'}
 
     async def _close(self):
-        for obj,method in ((self.context,'close'),(self.browser,'close'),(self.pw,'stop')):
-            if obj is not None:
-                with suppress(Exception):await getattr(obj,method)()
+        # Отзываем только доступ по ссылке. Общий браузер и его профиль остаются.
+        page=self._observed_page
+        if page is not None:
+            for event,callback in self._listeners():
+                with suppress(Exception):
+                    page.remove_listener(event,callback)
+        manager=getattr(self.service,'account_browser',None)
+        if manager is not None and manager.on_blocked==self.blocked_navigation:
+            manager.on_blocked=None
+        self._observed_page=None
         self.context=self.browser=self.pw=self.page=None
         self.diag_pending.clear()
         self.active=False;self.token='';self.expires=0
@@ -3724,7 +3885,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v16] Создание Telegram Application")
+    log.info("[boot_v17] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
