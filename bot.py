@@ -1829,7 +1829,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     raise ValueError('Включите Web Service с PORT на Render для страницы входа.')
                 token=await service.account_login.issue(country)
                 keyboard=InlineKeyboardMarkup([[InlineKeyboardButton('🔐 Войти в OpenSooq',url=origin+'/account#'+token)]])
-                await message.reply_text("Страна входа: "+COUNTRY_LABELS[country]+"\n\n🔐 Личная страница управления на 15 минут. Браузер использует постоянный профиль. Активные диалоги поставлены на паузу. Войдите в OpenSooq, откройте существующий чат и нажмите «Сохранить вход». Новая ссылка продолжит ту же форму, если она осталась открыта. Ссылку не пересылайте. Коды в Telegram вводить не нужно.",reply_markup=keyboard)
+                await message.reply_text("Страна входа: "+COUNTRY_LABELS[country]+"\n\n🔐 Личная страница управления на 15 минут. Браузер использует постоянный профиль. Активные диалоги поставлены на паузу. Сначала войдите через главную OpenSooq: кнопка «Вход / профиль», затем Login or Sign Up. После успешного входа откройте существующий чат и нажмите «Сохранить вход». Браузер входа и переписка используют OPENSOOQ_PROXY_URL, если он задан. Новый /account открывает главную; чаты автоматически не открываются. Ссылку не пересылайте. Коды в Telegram вводить не нужно.",reply_markup=keyboard)
             else:
                 await disconnect_opensooq_account(service)
                 await message.reply_text("⏸ Аккаунт отключён от автоответчика, активные диалоги остановлены. Парсер работает как раньше.")
@@ -2651,7 +2651,7 @@ class PersistentOpenSooqBrowser:
                 allowed=False
             if not allowed:
                 if self.on_blocked is not None:
-                    self.on_blocked()
+                    self.on_blocked(request)
                 await route.abort()
                 return
         await route.continue_()
@@ -2673,7 +2673,7 @@ class PersistentOpenSooqBrowser:
                 from playwright.async_api import async_playwright
                 self.pw=await async_playwright().start()
                 self.context=await self.pw.chromium.launch_persistent_context(
-                    str(self.directory),headless=True,args=['--disable-dev-shm-usage'],
+                    str(self.directory),**opensooq_browser_launch_options(),
                     viewport={'width':420,'height':820},locale='en-US',
                     accept_downloads=False,timeout=25000)
                 self.context.on('close',self._context_closed)
@@ -2807,7 +2807,7 @@ class OpenSooqChatBrowser:
         from playwright.async_api import async_playwright
         self.pw = await async_playwright().start()
         try:
-            self.browser = await self.pw.chromium.launch(headless=True, args=['--disable-dev-shm-usage'])
+            self.browser = await self.pw.chromium.launch(**opensooq_browser_launch_options())
             state = json.loads(self.state_file.read_text(encoding='utf-8'))
             if state.get('_opensooq_account_id') != self.account:
                 raise DialogueUnavailable('Файл сессии не привязан к указанному аккаунту. Создайте его через --chat-login.')
@@ -3261,9 +3261,9 @@ canvas{display:block;width:100%;max-width:420px;margin:auto;background:white;bor
 #status{white-space:pre-wrap;font-size:14px}small{display:block;margin:12px 0;color:#c4ccdb}
 </style>
 <main><h2>Вход в OpenSooq</h2>
-<p>Сначала завершите вход на экране ниже. После подтверждения входа откройте «Чаты», выберите существующий диалог и нажмите «Сохранить вход».</p>
+<p>Начните с кнопки «Вход / профиль»: она открывает главную OpenSooq и штатную форму Login or Sign Up. Завершите вход на экране ниже. После подтверждения входа откройте «Чаты», выберите существующий диалог и нажмите «Сохранить вход».</p>
 <small>Личная ссылка даёт управление постоянным браузером. Закрытие страницы не удаляет его профиль; отключение бота: /account_off. Не пересылайте её. Пароль и код вводите здесь, не в Telegram. Сообщения об отправке команды не подтверждают вход в аккаунт.</small>
-<button id="chats">Открыть чаты</button><button id="save">Сохранить вход</button>
+<button id="login">Вход / профиль</button><button id="chats">После входа: открыть чаты</button><button id="save">Сохранить вход</button>
 <button id="close">Закрыть страницу входа</button>
 <p id="status" role="status" aria-live="polite">Подключаем браузер…</p>
 <canvas id="screen" width="420" height="820"></canvas>
@@ -3272,7 +3272,7 @@ canvas{display:block;width:100%;max-width:420px;margin:auto;background:white;bor
 <button id="type">Заменить поле</button><button id="enter">Enter / Далее</button>
 <button id="backspace">Удалить символ</button><button id="tab">Следующее поле</button>
 <button id="up">↑</button><button id="down">↓</button><button id="refresh">Обновить экран</button>
-<small>Страница действует 15 минут. При просьбе сайта подождать прекратите попытки. Отчёт в боте: /account_diag. Он не содержит значений полей и не повторяет вход.</small></main>
+<small>Страница действует 15 минут. При просьбе сайта подождать прекратите попытки. Расширенный отчёт v18 в боте: /account_diag. Он не содержит значений полей и не повторяет вход.</small></main>
 <script>
 'use strict';
 const token=location.hash.slice(1);
@@ -3335,7 +3335,7 @@ document.querySelector('#type').onclick=()=>{if(!ended&&!actionPending&&entry.va
 for(const [id,key] of [['enter','Enter'],['backspace','Backspace'],['tab','Tab']])document.querySelector('#'+id).onclick=()=>act({action:'key',key});
 document.querySelector('#up').onclick=()=>act({action:'scroll',dy:-500});document.querySelector('#down').onclick=()=>act({action:'scroll',dy:500});
 document.querySelector('#refresh').onclick=()=>shot();
-for(const id of ['chats','save','close'])document.querySelector('#'+id).onclick=()=>act({action:id});
+for(const id of ['login','chats','save','close'])document.querySelector('#'+id).onclick=()=>act({action:id});
 if(!token){finish();notice('Ссылка без кода доступа. Получите новую через /account.')}else{shot();setInterval(shot,2500)}
 </script></html>
 '''
@@ -3352,6 +3352,125 @@ def login_navigation_allowed(url, top_frame):
     return (not top_frame and parsed.scheme=='https'
             and host in {'www.google.com','recaptcha.google.com','www.recaptcha.net','recaptcha.net'}
             and parsed.port in {None,443} and parsed.path.startswith('/recaptcha/'))
+
+
+def opensooq_browser_launch_options():
+    """Use the same configured static proxy for OpenSooq login and chat.
+
+    A proxy failure propagates to the caller; there is no direct retry/fallback.
+    Telegram and billing clients keep their existing network configuration.
+    """
+    _, browser_proxy = proxy_settings(os.getenv('OPENSOOQ_PROXY_URL', ''))
+    options = {'headless': True, 'args': ['--disable-dev-shm-usage']}
+    if browser_proxy is not None:
+        options['proxy'] = browser_proxy
+    return options
+
+
+def login_error_labels(document):
+    """Return fixed labels only; never retain or render server-provided strings."""
+    known = {
+        'unauthorized': 'auth_unspecified',
+        'unauthenticated': 'auth_unspecified',
+        'authentication failed': 'auth_unspecified',
+        'invalid credentials': 'credentials_rejected',
+        'invalid login credentials': 'credentials_rejected',
+        'incorrect credentials': 'credentials_rejected',
+        'invalid password': 'password_rejected',
+        'incorrect password': 'password_rejected',
+        'wrong password': 'password_rejected',
+        'captcha verification failed': 'captcha_rejected',
+        'recaptcha verification failed': 'captcha_rejected',
+        'invalid captcha': 'captcha_rejected',
+        'invalid recaptcha': 'captcha_rejected',
+        'captcha failed': 'captcha_rejected',
+        'captcha validation failed': 'captcha_rejected',
+        'recaptcha validation failed': 'captcha_rejected',
+        'too many requests': 'wait',
+        'too many attempts': 'wait',
+        'too many login attempts': 'wait',
+        'rate limit exceeded': 'wait',
+        'please wait before trying again': 'wait',
+        'please wait before trying again or contact us': 'wait',
+        'session expired': 'session_rejected',
+        'invalid session': 'session_rejected',
+        'csrf token mismatch': 'session_rejected',
+        'invalid csrf token': 'session_rejected',
+        'csrf verification failed': 'session_rejected',
+        'invalid otp': 'otp_rejected',
+        'incorrect otp': 'otp_rejected',
+        'otp expired': 'otp_rejected',
+        'invalid verification code': 'otp_rejected',
+        'bad request': 'request_rejected',
+        'validation error': 'request_rejected',
+        'validation failed': 'request_rejected',
+        'access denied': 'access_rejected',
+        'access restricted': 'access_rejected',
+        'account blocked': 'account_rejected',
+        'account suspended': 'account_rejected',
+        'account disabled': 'account_rejected',
+    }
+    # Some API error codes join words with underscores/hyphens or camelCase.
+    # Match an entire known code. Do not infer reasons from arbitrary substrings.
+    compact = {re.sub(r'[^a-z]', '', key): value for key, value in known.items()}
+    permitted = {'error', 'errors', 'message', 'messages', 'detail', 'details',
+                 'description', 'code', 'errorcode', 'errormessage', 'reason', 'data'}
+    stack = [(document, 0)]
+    result = set()
+    visited = 0
+    while stack and visited < 80:
+        value, depth = stack.pop()
+        visited += 1
+        if isinstance(value, str):
+            if not 0 < len(value) <= 180:
+                continue
+            text = value.casefold().strip().rstrip('.!')
+            normalized = re.sub(r'[_\-\s]+', ' ', text)
+            label = known.get(normalized)
+            if label is None and re.fullmatch(r'[a-zA-Z_\-]+', value):
+                label = compact.get(re.sub(r'[^a-z]', '', text))
+            if label:
+                result.add(label)
+        elif depth < 5 and isinstance(value, dict):
+            for key, child in list(value.items())[:30]:
+                if isinstance(key, str) and re.sub(r'[_\-]', '', key.casefold()) in permitted:
+                    stack.append((child, depth + 1))
+        elif depth < 5 and isinstance(value, list):
+            stack.extend((child, depth + 1) for child in value[:20])
+    return result
+
+
+def login_blocked_destination(url):
+    """Classify a destination without persisting its hostname, path or query."""
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname or ''
+    except ValueError:
+        return 'некорректный адрес'
+    if host in {'www.google.com', 'recaptcha.google.com', 'www.recaptcha.net', 'recaptcha.net'}:
+        return 'Google / reCAPTCHA'
+    if host == 'gstatic.com' or host.endswith('.gstatic.com'):
+        return 'Google static'
+    if any(host == base or host.endswith('.' + base) for base in
+           ('doubleclick.net', 'googlesyndication.com', 'googleadservices.com')):
+        return 'рекламный домен'
+    if host == 'opensooq.com' or host.endswith('.opensooq.com'):
+        return 'OpenSooq'
+    return 'другой внешний адрес'
+
+
+LOGIN_ERROR_LABELS = {
+    'auth_unspecified': 'отказ авторизации без уточнения причины',
+    'credentials_rejected': 'сервис сообщил: данные входа отклонены',
+    'password_rejected': 'сервис сообщил: пароль отклонён',
+    'captcha_rejected': 'сервис сообщил: проверка CAPTCHA отклонена',
+    'wait': 'сервис просит подождать',
+    'session_rejected': 'сервис сообщил: ошибка сессии или CSRF',
+    'otp_rejected': 'сервис сообщил: код подтверждения отклонён или истёк',
+    'request_rejected': 'запрос отклонён без конкретной причины',
+    'access_rejected': 'сервис ограничил доступ; основание не указано',
+    'account_rejected': 'сервис сообщил об ограничении аккаунта',
+}
 
 
 class AccountLogin:
@@ -3376,14 +3495,20 @@ class AccountLogin:
         self.diag_action=0
         self.diag_action_label='открытие страницы'
         self._observed_page=None
+        self.diag_error_details=[]
+        self.diag_inspect_tasks=set()
+        self.diag_inspected=0
+        self.diag_generation=0
+        self.diag_blocked_kinds=Counter()
+        self._account_entry_pending=False
 
     def diagnostic_text(self):
         if not self.diag_exists:
             return 'Диагностика пуста. /account_diag не открывает сайт и не повторяет вход. Старые попытки этой версией не наблюдались.'
-        lines=['Диагностика входа v17',
+        lines=['Диагностика входа v18',
                'Страна: '+COUNTRY_LABELS.get(self.country,self.country),
                'Доступ к странице: '+('активен' if self.active and time.monotonic()<self.expires else 'закрыт или истёк'),
-               'Браузер входа: постоянный профиль, прямое соединение. Прокси парсера здесь не используется.']
+               'Браузер входа: постоянный профиль. '+('Настроен общий прокси OPENSOOQ_PROXY_URL; прямого повтора при его ошибке нет.' if self.service.reader.browser_proxy is not None else 'Прямое соединение: OPENSOOQ_PROXY_URL не задан.')]
         flags={'captcha_failed':'На странице: reCAPTCHA verification failed.',
                'unauthorized':'На странице: Unauthorized. Точная причина не раскрыта.',
                'wait':'Сайт просит подождать перед повторным входом.',
@@ -3391,18 +3516,25 @@ class AccountLogin:
         lines.extend(flags[k] for k in sorted(self.diag_flags) if k in flags)
         if self.diag_events:
             lines.append('Последние запросы авторизации и ошибки:')
-            for action, label, route, group, method, resource, result in self.diag_events[-12:]:
+            for action, label, route, group, method, resource, result in self.diag_events[-4:]:
                 lines.append(f'Действие {action} ({label}): {method} / {resource} / {group} / маршрут {route} → {result}')
             lines.append('Группа маршрута определяется по его названию. HTTP 200 сам по себе не подтверждает вход; чужой HTTP 401 не доказывает отказ входа.')
         else:
             lines.append('Запросов авторизации или ошибок пока не зафиксировано.')
+        if self.diag_error_details:
+            lines.append('Разбор уже полученных ошибок (без новых запросов):')
+            for action, route, status, description in self.diag_error_details:
+                lines.append(f'Действие {action}, маршрут {route}, HTTP {status}: {description}.')
+            lines.append('Это сообщение сервиса, а не независимая проверка пароля или CAPTCHA. Если причина не раскрыта, она остаётся неизвестной.')
         if self.diag_blocked:
             lines.append(f'Ограничитель нашей страницы запретил переходов: {self.diag_blocked}.')
+        for (frame_kind,destination),amount in sorted(self.diag_blocked_kinds.items()):
+            lines.append(f'Запрещено: {frame_kind} / {destination} × {amount}')
         for (provider,status),amount in sorted(self.diag_http.items()):
             lines.append(f'{provider}: HTTP {status} × {amount}')
         for (provider,reason),amount in sorted(self.diag_failures.items()):
             lines.append(f'{provider}: {reason} × {amount}')
-        lines.append('Тела запросов и ответов, заголовки, значения полей, cookie и полные URL не записываются. Маршруты обозначены только номерами. Новый /account или перезапуск очищает отчёт. Профиль сохраняется отдельно в DATA_DIR.')
+        lines.append('JSON-ошибки входа распознаются в памяти по списку известных сообщений. В отчёте только готовые категории; исходный текст ответа, значения полей, заголовки, cookie и URL не сохраняются. Действие у запроса означает время его начала, не доказанную причину. Новый /account очищает отчёт.')
         return '\n'.join(lines)[:3900]
 
     @staticmethod
@@ -3459,6 +3591,62 @@ class AccountLogin:
         self.diag_http[(metadata[6],status)]+=1
         if status>=400 or (metadata[3]=='авторизация*' and metadata[5] in {'xhr','fetch','document'}):
             self.add_diagnostic_event(metadata,'HTTP '+str(status))
+        self.inspect_login_error(response, metadata, status)
+
+    def inspect_login_error(self, response, metadata, status):
+        # Process only failed OpenSooq login-like fetches, at most 20 per viewer.
+        # No extra HTTP request is sent: response.body() reads the existing reply.
+        if (metadata[6] != 'OpenSooq' or metadata[3] != 'авторизация*'
+                or metadata[5] not in {'fetch', 'xhr'} or not 400 <= status < 500
+                or self.diag_inspected >= 20 or len(self.diag_inspect_tasks) >= 4):
+            return
+        self.diag_inspected += 1
+        generation = self.diag_generation
+        task = asyncio.create_task(self.read_login_error(response, metadata, status, generation))
+        self.diag_inspect_tasks.add(task)
+        task.add_done_callback(self.diag_inspect_tasks.discard)
+
+    async def read_login_error(self, response, metadata, status, generation):
+        labels = set()
+        detail = 'JSON с уточнением не получен'
+        try:
+            headers = response.headers
+            kind = headers.get('content-type', '').partition(';')[0].strip().lower()
+            if kind == 'application/json' or (kind.startswith('application/') and kind.endswith('+json')):
+                declared = headers.get('content-length')
+                if declared is not None and (not declared.isdecimal() or int(declared) > 32768):
+                    detail = 'разбор пропущен: размер ответа'
+                else:
+                    raw = await asyncio.wait_for(response.body(), timeout=2)
+                    if len(raw) <= 32768:
+                        # JSON is parsed in memory only. Never stringify or log it.
+                        document = json.loads(raw)
+                        labels = login_error_labels(document)
+                        detail = 'известного сообщения об ошибке нет'
+                    else:
+                        detail = 'разбор пропущен: размер ответа'
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Exception text may contain credentials or browser request details.
+            detail = 'ответ не удалось безопасно разобрать'
+        if generation != self.diag_generation:
+            return
+        descriptions = [LOGIN_ERROR_LABELS[key] for key in sorted(labels)]
+        self.diag_error_details.append((metadata[0], metadata[2], status,
+                                        '; '.join(descriptions[:2]) if descriptions else detail))
+        del self.diag_error_details[:-4]
+        if 'wait' in labels:
+            self.diag_flags.add('wait')
+
+    async def cancel_diagnostic_reads(self):
+        self.diag_generation += 1
+        tasks = tuple(self.diag_inspect_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.diag_inspect_tasks.clear()
 
     def request_failed(self, request):
         metadata=self.diag_pending.pop(id(request),None) or self.request_metadata(request)
@@ -3516,6 +3704,9 @@ class AccountLogin:
             self.country=country
             self.diag_flags.clear();self.diag_http.clear();self.diag_failures.clear()
             self.diag_routes.clear();self.diag_pending.clear();self.diag_events.clear()
+            self.diag_error_details.clear();self.diag_blocked_kinds.clear()
+            self.diag_inspected=0
+            self._account_entry_pending=True
             self.diag_salt=secrets.token_hex(16)
             self.diag_blocked=0;self.diag_action=0;self.diag_action_label='открытие страницы' 
             self.diag_exists=True
@@ -3542,8 +3733,14 @@ class AccountLogin:
                     and isinstance(value,str) and secrets.compare_digest(value,'Bearer '+self.token))
         except (TypeError,ValueError):return False
 
-    def blocked_navigation(self):
+    def blocked_navigation(self, request):
         self.diag_blocked+=1
+        try:
+            frame_kind='основное окно' if request.frame.parent_frame is None else 'встроенное окно'
+        except Exception:
+            frame_kind='окно не определено'
+        destination=login_blocked_destination(request.url)
+        self.diag_blocked_kinds[(frame_kind,destination)]+=1
 
     def _listeners(self):
         return (('request',self.request_seen),('requestfinished',self.request_finished),
@@ -3562,12 +3759,13 @@ class AccountLogin:
             current=urlsplit(self.page.url)
             requested_host=self.country+'.opensooq.com'
             current_host=current.hostname or ''
-            # Новая ссылка сохраняет текущую форму/чат. При явной смене страны
-            # открываем выбранную главную, не меняя профиль или сетевые настройки.
-            if (not login_navigation_allowed(self.page.url,True)
+            # Новый /account начинает с главной выбранной страны.
+            # Профиль и заданный прокси сохраняются; чаты сами не открываются.
+            if (self._account_entry_pending or not login_navigation_allowed(self.page.url,True)
                     or (current_host in {c+'.opensooq.com' for c in COUNTRIES}
                         and current_host!=requested_host)):
                 await self.page.goto('https://'+requested_host+'/en',wait_until='domcontentloaded',timeout=30000)
+            self._account_entry_pending=False
         except asyncio.CancelledError:
             await self._close()
             raise
@@ -3591,11 +3789,13 @@ class AccountLogin:
             await self._open()
             action=data.get('action')
             labels={'click':'нажатие','text':'замена поля','key':'клавиша',
-                    'scroll':'прокрутка','chats':'открытие чатов','save':'сохранение','close':'закрытие'}
+                    'scroll':'прокрутка','login':'вход через главную','chats':'открытие чатов','save':'сохранение','close':'закрытие'}
             if action not in labels:
                 raise ValueError('Действие не поддерживается.')
             self.diag_action+=1
             self.diag_action_label=labels[action]
+            if action=='key' and data.get('key') in {'Enter','Backspace','Tab'}:
+                self.diag_action_label+=' '+data['key']
             if action=='click':
                 x,y=data.get('x'),data.get('y')
                 if isinstance(x,bool) or isinstance(y,bool) or not isinstance(x,(int,float)) or not isinstance(y,(int,float)) or not math.isfinite(x) or not math.isfinite(y) or not 0<=x<420 or not 0<=y<820:
@@ -3613,6 +3813,12 @@ class AccountLogin:
                 dy=data.get('dy')
                 if type(dy) is not int or dy not in {-500,500}:raise ValueError('Некорректная прокрутка.')
                 await self.page.mouse.wheel(0,dy)
+            elif action=='login':
+                await self.page.goto('https://'+self.country+'.opensooq.com/en',wait_until='domcontentloaded',timeout=30000)
+                # Open the site's own login form; never submit credentials here.
+                login=self.page.get_by_role('button',name='Login or Sign Up',exact=True)
+                if await login.count()==1 and await login.is_visible():
+                    await login.click()
             elif action=='chats':
                 await self.page.goto('https://my.opensooq.com/chats',wait_until='domcontentloaded',timeout=30000)
             elif action=='save':
@@ -3667,6 +3873,7 @@ class AccountLogin:
             manager.on_blocked=None
         self._observed_page=None
         self.context=self.browser=self.pw=self.page=None
+        await self.cancel_diagnostic_reads()
         self.diag_pending.clear()
         self.active=False;self.token='';self.expires=0
 
@@ -3885,7 +4092,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v17] Создание Telegram Application")
+    log.info("[boot_v18] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
