@@ -27,4 +27,6 @@ RUN mkdir -p /opt/novnc \
 
 COPY bot.py .
 
+RUN python -u /app/bot.py --check-desktop
+
 CMD ["python", "-u", "bot.py"]
