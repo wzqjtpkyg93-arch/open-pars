@@ -1829,7 +1829,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     raise ValueError('Включите Web Service с PORT на Render для страницы входа.')
                 token=await service.account_login.issue(country)
                 keyboard=InlineKeyboardMarkup([[InlineKeyboardButton('🔐 Войти в OpenSooq',url=origin+'/account#'+token)]])
-                await message.reply_text("Страна входа: "+COUNTRY_LABELS[country]+"\n\n🔐 Личная страница управления на 15 минут. Браузер использует постоянный профиль. Активные диалоги поставлены на паузу. Сначала войдите через главную OpenSooq: кнопка «Вход / профиль», затем Login or Sign Up. После успешного входа откройте существующий чат и нажмите «Сохранить вход». Браузер входа и переписка используют OPENSOOQ_PROXY_URL, если он задан. Новый /account открывает главную; чаты автоматически не открываются. Ссылку не пересылайте. Коды в Telegram вводить не нужно.",reply_markup=keyboard)
+                await message.reply_text("Страна входа: "+COUNTRY_LABELS[country]+"\n\n🔐 Личная страница управления на 15 минут. Браузер использует мобильный режим и постоянный профиль. Активные диалоги поставлены на паузу. Сначала войдите через главную OpenSooq: кнопка «Вход / профиль», затем Login or Sign Up. После успешного входа откройте существующий чат и нажмите «Сохранить вход». Браузер входа и переписка используют OPENSOOQ_PROXY_URL, если он задан. Новый /account открывает главную; чаты автоматически не открываются. Ссылку не пересылайте. Коды в Telegram вводить не нужно.",reply_markup=keyboard)
             else:
                 await disconnect_opensooq_account(service)
                 await message.reply_text("⏸ Аккаунт отключён от автоответчика, активные диалоги остановлены. Парсер работает как раньше.")
@@ -2675,6 +2675,9 @@ class PersistentOpenSooqBrowser:
                 self.context=await self.pw.chromium.launch_persistent_context(
                     str(self.directory),**opensooq_browser_launch_options(),
                     viewport={'width':420,'height':820},locale='en-US',
+                    screen={'width':420,'height':820},device_scale_factor=1,
+                    is_mobile=True,has_touch=True,
+                    user_agent=self.pw.devices['Pixel 7']['user_agent'],
                     accept_downloads=False,timeout=25000)
                 self.context.on('close',self._context_closed)
                 await self.context.route('**/*',self._restrict_navigation)
@@ -3260,7 +3263,7 @@ input{box-sizing:border-box;width:100%;background:#202a3b;color:white}
 canvas{display:block;width:100%;max-width:420px;margin:auto;background:white;border-radius:8px}
 #status{white-space:pre-wrap;font-size:14px}small{display:block;margin:12px 0;color:#c4ccdb}
 </style>
-<main><h2>Вход в OpenSooq</h2>
+<main><h2>Вход в OpenSooq · мобильный режим</h2>
 <p>Начните с кнопки «Вход / профиль»: она открывает главную OpenSooq и штатную форму Login or Sign Up. Завершите вход на экране ниже. После подтверждения входа откройте «Чаты», выберите существующий диалог и нажмите «Сохранить вход».</p>
 <small>Личная ссылка даёт управление постоянным браузером. Закрытие страницы не удаляет его профиль; отключение бота: /account_off. Не пересылайте её. Пароль и код вводите здесь, не в Telegram. Сообщения об отправке команды не подтверждают вход в аккаунт.</small>
 <button id="login">Вход / профиль</button><button id="chats">После входа: открыть чаты</button><button id="save">Сохранить вход</button>
@@ -3272,7 +3275,7 @@ canvas{display:block;width:100%;max-width:420px;margin:auto;background:white;bor
 <button id="type">Заменить поле</button><button id="enter">Enter / Далее</button>
 <button id="backspace">Удалить символ</button><button id="tab">Следующее поле</button>
 <button id="up">↑</button><button id="down">↓</button><button id="refresh">Обновить экран</button>
-<small>Страница действует 15 минут. При просьбе сайта подождать прекратите попытки. Расширенный отчёт v18 в боте: /account_diag. Он не содержит значений полей и не повторяет вход.</small></main>
+<small>Страница действует 15 минут. При просьбе сайта подождать прекратите попытки. Отчёт мобильного режима v20 в боте: /account_diag. Он не содержит значений полей и не повторяет вход.</small></main>
 <script>
 'use strict';
 const token=location.hash.slice(1);
@@ -3505,10 +3508,10 @@ class AccountLogin:
     def diagnostic_text(self):
         if not self.diag_exists:
             return 'Диагностика пуста. /account_diag не открывает сайт и не повторяет вход. Старые попытки этой версией не наблюдались.'
-        lines=['Диагностика входа v18',
+        lines=['Диагностика входа v20 mobile',
                'Страна: '+COUNTRY_LABELS.get(self.country,self.country),
                'Доступ к странице: '+('активен' if self.active and time.monotonic()<self.expires else 'закрыт или истёк'),
-               'Браузер входа: постоянный профиль. '+('Настроен общий прокси OPENSOOQ_PROXY_URL; прямого повтора при его ошибке нет.' if self.service.reader.browser_proxy is not None else 'Прямое соединение: OPENSOOQ_PROXY_URL не задан.')]
+               'Браузер входа: мобильная эмуляция Chromium (Android), постоянный профиль. '+('Настроен общий прокси OPENSOOQ_PROXY_URL; прямого повтора при его ошибке нет.' if self.service.reader.browser_proxy is not None else 'Прямое соединение: OPENSOOQ_PROXY_URL не задан.')]
         flags={'captcha_failed':'На странице: reCAPTCHA verification failed.',
                'unauthorized':'На странице: Unauthorized. Точная причина не раскрыта.',
                'wait':'Сайт просит подождать перед повторным входом.',
@@ -3800,7 +3803,7 @@ class AccountLogin:
                 x,y=data.get('x'),data.get('y')
                 if isinstance(x,bool) or isinstance(y,bool) or not isinstance(x,(int,float)) or not isinstance(y,(int,float)) or not math.isfinite(x) or not math.isfinite(y) or not 0<=x<420 or not 0<=y<820:
                     raise ValueError('Нажмите внутри экрана браузера.')
-                await self.page.mouse.click(x,y)
+                await self.page.touchscreen.tap(x,y)
             elif action=='text':
                 value=data.get('text')
                 if not isinstance(value,str) or not 1<=len(value)<=200:
@@ -4092,7 +4095,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v18] Создание Telegram Application")
+    log.info("[boot_v20_mobile] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
