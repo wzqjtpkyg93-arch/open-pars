@@ -1829,7 +1829,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     raise ValueError('Включите Web Service с PORT на Render для страницы входа.')
                 token=await service.account_login.issue(country)
                 keyboard=InlineKeyboardMarkup([[InlineKeyboardButton('🔐 Войти в OpenSooq',url=origin+'/account#'+token)]])
-                await message.reply_text("Страна входа: "+COUNTRY_LABELS[country]+"\n\n🔐 Личная страница управления на 15 минут. Браузер использует мобильный режим и постоянный профиль. Активные диалоги поставлены на паузу. Сначала войдите через главную OpenSooq: кнопка «Вход / профиль», затем Login or Sign Up. После успешного входа откройте существующий чат и нажмите «Сохранить вход». Браузер входа и переписка используют OPENSOOQ_PROXY_URL, если он задан. Новый /account открывает главную; чаты автоматически не открываются. Ссылку не пересылайте. Коды в Telegram вводить не нужно.",reply_markup=keyboard)
+                await message.reply_text("Страна входа: "+COUNTRY_LABELS[country]+"\n\n🔐 Личная страница управления на 15 минут. Браузер использует мобильный WebKit и отдельный постоянный профиль. Это движок Safari для Linux, а не приложение Safari на iPhone. Активные диалоги поставлены на паузу. Сначала войдите через главную OpenSooq: кнопка «Вход / профиль», затем Login or Sign Up. После успешного входа откройте существующий чат и нажмите «Сохранить вход». Браузер входа и переписка используют OPENSOOQ_PROXY_URL, если он задан. Новый /account открывает главную; чаты автоматически не открываются. Ссылку не пересылайте. Коды в Telegram вводить не нужно.",reply_markup=keyboard)
             else:
                 await disconnect_opensooq_account(service)
                 await message.reply_text("⏸ Аккаунт отключён от автоответчика, активные диалоги остановлены. Парсер работает как раньше.")
@@ -2614,7 +2614,7 @@ class DialogueUnavailable(ValueError):
 class PersistentOpenSooqBrowser:
     """Один выделенный профиль и один браузер для ручного входа и переписки."""
     def __init__(self, directory=None):
-        self.directory=Path(directory) if directory is not None else DATA_DIR/'opensooq-browser-profile-clean'
+        self.directory=Path(directory) if directory is not None else DATA_DIR/'opensooq-webkit-profile'
         self.lock=asyncio.Lock()
         self.pw=self.context=self.page=None
         self._file_lock=None
@@ -2672,12 +2672,15 @@ class PersistentOpenSooqBrowser:
             try:
                 from playwright.async_api import async_playwright
                 self.pw=await async_playwright().start()
-                self.context=await self.pw.chromium.launch_persistent_context(
-                    str(self.directory),**opensooq_browser_launch_options(),
+                launch_options=opensooq_browser_launch_options()
+                # Chromium-only command-line flags must not reach WebKit.
+                launch_options.pop('args',None)
+                self.context=await self.pw.webkit.launch_persistent_context(
+                    str(self.directory),**launch_options,
                     viewport={'width':420,'height':820},locale='en-US',
                     screen={'width':420,'height':820},device_scale_factor=1,
                     is_mobile=True,has_touch=True,
-                    user_agent=self.pw.devices['Pixel 7']['user_agent'],
+                    user_agent=self.pw.devices['iPhone 13']['user_agent'],
                     accept_downloads=False,timeout=25000)
                 self.context.on('close',self._context_closed)
                 await self.context.route('**/*',self._restrict_navigation)
@@ -2690,7 +2693,7 @@ class PersistentOpenSooqBrowser:
                 raise
             except Exception:
                 await self._shutdown()
-                raise DialogueUnavailable('Не удалось открыть постоянный браузер. Проверьте Chromium, память, доступ на запись в DATA_DIR и отсутствие второго процесса с тем же профилем.') from None
+                raise DialogueUnavailable('Не удалось открыть WebKit. Замените dockerfile версией с установкой webkit и дождитесь сборки. Также проверьте память, DATA_DIR и отсутствие второго процесса с тем же профилем.') from None
 
     async def _shutdown(self):
         context,pw=self.context,self.pw
@@ -2770,6 +2773,7 @@ class OpenSooqChatBrowser:
         self.state_file = Path(os.getenv('OPENSOOQ_CHAT_STATE_FILE', '/etc/secrets/opensooq-chat.json'))
         self.profile=profile
         self.profile_mode=False
+        self.profile_engine=''
         self._using_profile=False
         self.saved_enabled=False
         self.disabled=False
@@ -2782,13 +2786,15 @@ class OpenSooqChatBrowser:
                 self.saved_enabled=meta.get('_opensooq_chat_enabled') is True
                 self.disabled=meta.get('_opensooq_chat_enabled') is False
                 self.profile_mode=meta.get('_opensooq_profile_mode')=='persistent'
+                self.profile_engine=str(meta.get('_opensooq_profile_engine') or '')
         self.blocked = False
         self.guard = lambda: True
 
     def configured(self):
         enabled=self.saved_enabled or os.getenv('OPENSOOQ_CHAT_ENABLED','0')=='1'
         if self.profile_mode:
-            enabled=self.saved_enabled and self.profile is not None and self.profile.directory.is_dir()
+            enabled=(self.saved_enabled and self.profile_engine=='webkit'
+                     and self.profile is not None and self.profile.directory.is_dir())
         return (not self.disabled and enabled and self.state_file.is_file() and self.account.isdecimal())
 
     async def ready(self):
@@ -2802,7 +2808,8 @@ class OpenSooqChatBrowser:
             metadata=json.loads(self.state_file.read_text(encoding='utf-8'))
             if (metadata.get('_opensooq_account_id')!=self.account
                     or metadata.get('_opensooq_chat_enabled') is not True
-                    or metadata.get('_opensooq_profile_mode')!='persistent'):
+                    or metadata.get('_opensooq_profile_mode')!='persistent'
+                    or metadata.get('_opensooq_profile_engine')!='webkit'):
                 raise DialogueUnavailable('Разрешение или привязка профиля изменились. Подтвердите вход через /account.')
             self.context,self.page=await self.profile.get_page()
             self._using_profile=True
@@ -3263,7 +3270,7 @@ input{box-sizing:border-box;width:100%;background:#202a3b;color:white}
 canvas{display:block;width:100%;max-width:420px;margin:auto;background:white;border-radius:8px}
 #status{white-space:pre-wrap;font-size:14px}small{display:block;margin:12px 0;color:#c4ccdb}
 </style>
-<main><h2>Вход в OpenSooq · мобильный режим</h2>
+<main><h2>Вход в OpenSooq · WebKit</h2>
 <p>Начните с кнопки «Вход / профиль»: она открывает главную OpenSooq и штатную форму Login or Sign Up. Завершите вход на экране ниже. После подтверждения входа откройте «Чаты», выберите существующий диалог и нажмите «Сохранить вход».</p>
 <small>Личная ссылка даёт управление постоянным браузером. Закрытие страницы не удаляет его профиль; отключение бота: /account_off. Не пересылайте её. Пароль и код вводите здесь, не в Telegram. Сообщения об отправке команды не подтверждают вход в аккаунт.</small>
 <button id="login">Вход / профиль</button><button id="chats">После входа: открыть чаты</button><button id="save">Сохранить вход</button>
@@ -3275,7 +3282,7 @@ canvas{display:block;width:100%;max-width:420px;margin:auto;background:white;bor
 <button id="type">Заменить поле</button><button id="enter">Enter / Далее</button>
 <button id="backspace">Удалить символ</button><button id="tab">Следующее поле</button>
 <button id="up">↑</button><button id="down">↓</button><button id="refresh">Обновить экран</button>
-<small>Страница действует 15 минут. При просьбе сайта подождать прекратите попытки. Отчёт мобильного режима v20 в боте: /account_diag. Он не содержит значений полей и не повторяет вход.</small></main>
+<small>Страница действует 15 минут. При просьбе сайта подождать прекратите попытки. Отчёт WebKit v21 в боте: /account_diag. Он не содержит значений полей и не повторяет вход.</small></main>
 <script>
 'use strict';
 const token=location.hash.slice(1);
@@ -3508,10 +3515,10 @@ class AccountLogin:
     def diagnostic_text(self):
         if not self.diag_exists:
             return 'Диагностика пуста. /account_diag не открывает сайт и не повторяет вход. Старые попытки этой версией не наблюдались.'
-        lines=['Диагностика входа v20 mobile',
+        lines=['Диагностика входа v21 WebKit',
                'Страна: '+COUNTRY_LABELS.get(self.country,self.country),
                'Доступ к странице: '+('активен' if self.active and time.monotonic()<self.expires else 'закрыт или истёк'),
-               'Браузер входа: мобильная эмуляция Chromium (Android), постоянный профиль. '+('Настроен общий прокси OPENSOOQ_PROXY_URL; прямого повтора при его ошибке нет.' if self.service.reader.browser_proxy is not None else 'Прямое соединение: OPENSOOQ_PROXY_URL не задан.')]
+               'Браузер входа: мобильный WebKit для Linux (движок Safari), постоянный профиль. '+('Настроен общий прокси OPENSOOQ_PROXY_URL; прямого повтора при его ошибке нет.' if self.service.reader.browser_proxy is not None else 'Прямое соединение: OPENSOOQ_PROXY_URL не задан.')]
         flags={'captcha_failed':'На странице: reCAPTCHA verification failed.',
                'unauthorized':'На странице: Unauthorized. Точная причина не раскрыта.',
                'wait':'Сайт просит подождать перед повторным входом.',
@@ -3791,6 +3798,9 @@ class AccountLogin:
             if not self.authorized(authorization):raise PermissionError()
             await self._open()
             action=data.get('action')
+            await self.collect_flags(force=True)
+            if 'wait' in self.diag_flags and action in {'click','key','text','login','chats'}:
+                raise ValueError('OpenSooq просит подождать. Дальнейшие действия в этом сеансе входа остановлены. Срок ожидания сайт не указал. Не повторяйте вход до окончания ограничения. Отчёт: /account_diag.')
             labels={'click':'нажатие','text':'замена поля','key':'клавиша',
                     'scroll':'прокрутка','login':'вход через главную','chats':'открытие чатов','save':'сохранение','close':'закрытие'}
             if action not in labels:
@@ -3849,7 +3859,7 @@ class AccountLogin:
         # подтверждённый аккаунт и явное разрешение владельца на автоответы.
         path=write_account_metadata({'_opensooq_account_id':match[1],
             '_opensooq_chat_enabled':True,'_opensooq_profile_mode':'persistent',
-            '_opensooq_profile_version':1})
+            '_opensooq_profile_version':1,'_opensooq_profile_engine':'webkit'})
         dialogs=self.service.dialogues
         async with dialogs.lock:
             await dialogs.transport.close()
@@ -3859,6 +3869,7 @@ class AccountLogin:
             dialogs.transport.disabled=False
             dialogs.transport.blocked=False
             dialogs.transport.profile_mode=True
+            dialogs.transport.profile_engine='webkit'
         await self._close()
         with suppress(TelegramError):
             await self.service.bot.send_message(chat_id=ADMIN_ID,text='✅ Вход подтверждён. Переписка использует тот же постоянный профиль браузера. Диалоги, остановленные при открытии /account, остаются на паузе. Запуск — кнопкой у выбранного объявления. /chatstatus — состояние, /account_off — отключение.')
@@ -4095,7 +4106,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v20_mobile] Создание Telegram Application")
+    log.info("[boot_v21_webkit] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
