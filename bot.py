@@ -6,6 +6,7 @@ import math
 import os
 import re
 import secrets
+import signal
 import shlex
 import shutil
 import socket
@@ -2612,84 +2613,151 @@ class DialogueUnavailable(ValueError):
 
 
 class RemoteChromeDesktop:
-    """A private X display; VNC listens only inside this container."""
+    """xvfb-run owns X11/authentication; only local VNC reaches the relay."""
     width, height = 1000, 900
+    HOLD_DISPLAY = (
+        "import json,os,sys; "
+        "print(json.dumps({'display':os.environ['DISPLAY'],'authority':os.environ['XAUTHORITY']}),flush=True); "
+        "sys.stdin.buffer.read(1)"
+    )
+    ERROR_PATTERNS = {
+        'X_SERVER_FAILED': r'xvfb failed to start',
+        'X_AUTH_REJECTED': r'authorization required|authorization failed|invalid mit-magic-cookie|no protocol specified',
+        'X_DISPLAY_UNAVAILABLE': r'xopendisplay failed|unable to open display|cannot open display',
+        'X_LISTEN_FAILED': r'cannot establish any listening sockets|failed to open listener',
+        'X_KEYBOARD_FAILED': r'failed to activate virtual core keyboard|failed to compile keymap',
+        'TEMP_WRITE_FAILED': r'permission denied|read-only file system|no space left on device',
+        'VNC_BIND_FAILED': r'address already in use|unable to bind|failed to bind',
+        'OPTION_REJECTED': r'unrecognized option|unknown option|invalid option',
+    }
 
     def __init__(self):
         self.lock = asyncio.Lock()
         self.processes = []
-        self.temporary = None
         self.display = ''
         self.port = None
         self.environment = {}
+        self.issue = ''
+        self.flags = set()
+        self._monitors = []
+        self._temporary = None
+        self._startup_log = None
 
     @property
     def running(self):
-        return (len(self.processes) == 2
-                and all(process.returncode is None for process in self.processes))
+        return len(self.processes) == 2 and all(p.returncode is None for p in self.processes)
+
+    async def _observe_errors(self, stream):
+        tail = ''
+        while chunk := await stream.read(2048):
+            tail = (tail + chunk.decode('utf-8', errors='replace'))[-4096:]
+            for code, pattern in self.ERROR_PATTERNS.items():
+                if re.search(pattern, tail, re.I):
+                    self.flags.add(code)
+
+    def _consume_startup_log(self):
+        if self._startup_log is not None:
+            try:
+                with self._startup_log.open('rb') as stream:
+                    stream.seek(0, 2)
+                    stream.seek(max(0, stream.tell()-8192))
+                    text = stream.read(8192).decode('utf-8', errors='replace')
+                for code, pattern in self.ERROR_PATTERNS.items():
+                    if re.search(pattern, text, re.I):
+                        self.flags.add(code)
+            except OSError:
+                pass
+            with suppress(OSError):
+                self._startup_log.unlink()
+            self._startup_log = None
+
+    async def _exit_code(self, process):
+        try:
+            value = await asyncio.wait_for(process.wait(), 1)
+        except asyncio.TimeoutError:
+            return 'UNKNOWN'
+        return str(value)
 
     async def start(self):
         async with self.lock:
             if self.running:
                 return
             await self._stop()
-            if any(shutil.which(name) is None for name in ('Xvfb', 'xauth', 'x11vnc')):
-                raise DialogueUnavailable('Для удалённого экрана нужны Xvfb, xauth и x11vnc. Замените dockerfile на v22 и дождитесь успешной сборки.')
+            self.issue = 'DEPENDENCIES'
+            self.flags.clear()
+            if any(shutil.which(name) is None for name in ('xvfb-run', 'Xvfb', 'xauth', 'x11vnc')):
+                raise DialogueUnavailable('Не найдены программы удалённого экрана (DEPENDENCIES). Нужна сборка с dockerfile v22.1.')
             try:
-                self.temporary = tempfile.TemporaryDirectory(prefix='opensooq-display-')
-                authority = Path(self.temporary.name) / 'Xauthority'
-                authority.touch(mode=0o600)
-                for _ in range(30):
-                    display_number = secrets.randbelow(900) + 100
-                    if not Path(f'/tmp/.X11-unix/X{display_number}').exists() and not Path(f'/tmp/.X{display_number}-lock').exists():
-                        break
-                else:
-                    raise RuntimeError('No free display')
-                self.display = f':{display_number}'
-                auth = await asyncio.create_subprocess_exec(
-                    'xauth', '-f', str(authority), 'add', self.display, '.', secrets.token_hex(16),
-                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-                try:
-                    if await asyncio.wait_for(auth.wait(), 5) != 0:
-                        raise RuntimeError('X authority setup failed')
-                finally:
-                    if auth.returncode is None:
-                        auth.kill()
-                        await auth.wait()
-                self.environment = {'DISPLAY': self.display, 'XAUTHORITY': str(authority)}
+                self.issue = 'XVFB_START'
+                self._temporary = tempfile.TemporaryDirectory(prefix='opensooq-xvfb-')
+                self._startup_log = Path(self._temporary.name)/'startup.log'
+                self._startup_log.touch(mode=0o600)
                 process = await asyncio.create_subprocess_exec(
-                    'Xvfb', self.display, '-screen', '0', f'{self.width}x{self.height}x24',
-                    '-nolisten', 'tcp', '-noreset', '-auth', str(authority), '-displayfd', '1',
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                    'xvfb-run', '--auto-servernum', '--error-file='+str(self._startup_log),
+                    '--server-args=-screen 0 1000x900x24 -nolisten tcp -noreset',
+                    sys.executable, '-u', '-c', self.HOLD_DISPLAY,
+                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE, start_new_session=True)
                 self.processes.append(process)
-                ready = await asyncio.wait_for(process.stdout.readline(), 8)
-                if ready.strip() != str(display_number).encode():
-                    raise RuntimeError('X display did not start')
+                self._monitors.append(asyncio.create_task(self._observe_errors(process.stderr)))
+                try:
+                    ready = await asyncio.wait_for(process.stdout.readline(), 12)
+                except asyncio.TimeoutError:
+                    self.issue = 'XVFB_TIMEOUT'
+                    raise
+                if not ready:
+                    self.issue = 'XVFB_EXIT_' + await self._exit_code(process)
+                    raise RuntimeError('X display wrapper exited')
+                self.issue = 'XVFB_REPLY'
+                if len(ready) > 8192:
+                    raise ValueError('Invalid display reply')
+                reply = json.loads(ready)
+                if not isinstance(reply, dict):
+                    raise ValueError('Invalid display reply')
+                display, authority = reply.get('display'), reply.get('authority')
+                if (not isinstance(display, str) or not re.fullmatch(r':\d+(?:\.\d+)?', display)
+                        or not isinstance(authority, str) or not Path(authority).is_file()):
+                    raise ValueError('Invalid display reply')
+                self.display = display
+                self.environment = {'DISPLAY': display, 'XAUTHORITY': authority}
+                # Remove the temporary error file before Chrome starts.
+                self._consume_startup_log()
+                self.issue = 'VNC_START'
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
                     listener.bind(('127.0.0.1', 0))
                     self.port = listener.getsockname()[1]
                 process = await asyncio.create_subprocess_exec(
-                    'x11vnc', '-display', self.display, '-auth', str(authority),
+                    'x11vnc', '-norc', '-display', display, '-auth', authority,
                     '-listen', '127.0.0.1', '-localhost', '-rfbport', str(self.port),
-                    '-rfbportv6', '-1', '-norc',
-                    '-nopw', '-forever', '-shared', '-noxdamage', '-noxrecord', '-nosel', '-noshm', '-no6',
-                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                    '-rfbportv6', '-1', '-no6', '-nopw', '-forever', '-shared',
+                    '-noxdamage', '-noxrecord', '-nosel', '-noshm',
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
                 self.processes.append(process)
+                self._monitors.append(asyncio.create_task(self._observe_errors(process.stderr)))
                 deadline = time.monotonic() + 6
                 while True:
-                    if not self.running or time.monotonic() >= deadline:
-                        raise RuntimeError('VNC did not start')
+                    if process.returncode is not None:
+                        self.issue = 'VNC_EXIT_' + str(process.returncode)
+                        raise RuntimeError('VNC exited')
+                    if self.processes[0].returncode is not None:
+                        self.issue = 'XVFB_EXIT_' + str(self.processes[0].returncode)
+                        raise RuntimeError('X display exited')
+                    if time.monotonic() >= deadline:
+                        self.issue = 'VNC_READY_TIMEOUT'
+                        raise RuntimeError('VNC did not become ready')
                     try:
-                        reader, writer = await asyncio.wait_for(
-                            asyncio.open_connection('127.0.0.1', self.port), 0.5)
+                        reader, writer = await asyncio.wait_for(asyncio.open_connection('127.0.0.1', self.port), 0.5)
                         try:
                             greeting = await asyncio.wait_for(reader.readexactly(12), 0.5)
-                            if not greeting.startswith(b'RFB '):
-                                raise RuntimeError('Unexpected VNC server')
+                            if not re.fullmatch(rb'RFB \d{3}\.\d{3}\n', greeting):
+                                self.issue = 'VNC_PROTOCOL'
+                                raise RuntimeError('Invalid VNC greeting')
                         finally:
                             writer.close()
-                            await writer.wait_closed()
-                        break
+                            with suppress(Exception):
+                                await writer.wait_closed()
+                        self.issue = ''
+                        return
                     except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError):
                         await asyncio.sleep(0.1)
             except BaseException:
@@ -2697,25 +2765,64 @@ class RemoteChromeDesktop:
                 raise
 
     async def _stop(self):
-        for process in reversed(self.processes):
+        for index in range(len(self.processes)-1, -1, -1):
+            process = self.processes[index]
             if process.returncode is None:
-                with suppress(ProcessLookupError):
-                    process.terminate()
-                try:
-                    await asyncio.wait_for(process.wait(), 3)
-                except asyncio.TimeoutError:
+                if index == 0 and process.stdin is not None:
+                    process.stdin.close()
+                else:
                     with suppress(ProcessLookupError):
-                        process.kill()
-                    await process.wait()
+                        process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), 4)
+                except asyncio.TimeoutError:
+                    if index == 0:
+                        with suppress(ProcessLookupError):
+                            os.killpg(process.pid, signal.SIGTERM)
+                    else:
+                        with suppress(ProcessLookupError):
+                            process.terminate()
+                    try:
+                        await asyncio.wait_for(process.wait(), 2)
+                    except asyncio.TimeoutError:
+                        if index == 0:
+                            with suppress(ProcessLookupError):
+                                os.killpg(process.pid, signal.SIGKILL)
+                        else:
+                            with suppress(ProcessLookupError):
+                                process.kill()
+                        await process.wait()
         self.processes.clear()
+        for task in self._monitors:
+            try:
+                await asyncio.wait_for(task, 0.5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+        self._monitors.clear()
+        self._consume_startup_log()
+        if self._temporary is not None:
+            self._temporary.cleanup()
+            self._temporary = None
         self.display, self.port, self.environment = '', None, {}
-        if self.temporary is not None:
-            self.temporary.cleanup()
-            self.temporary = None
 
     async def close(self):
         async with self.lock:
             await self._stop()
+
+
+async def check_desktop():
+    """Xvfb/VNC only: no Chrome, account, database or external requests."""
+    desktop = RemoteChromeDesktop()
+    try:
+        await desktop.start()
+        print('[desktop_check] XVFB_VNC_OK', flush=True)
+        return 0
+    except Exception:
+        print('[desktop_check_failed] '+(desktop.issue or 'UNKNOWN')+
+              (' '+','.join(sorted(desktop.flags)) if desktop.flags else ''), flush=True)
+        return 44
+    finally:
+        await desktop.close()
 
 
 class PersistentOpenSooqBrowser:
@@ -2807,10 +2914,12 @@ class PersistentOpenSooqBrowser:
                 await self._shutdown()
                 raise
             except Exception as error:
-                self.startup_issue=self.startup_stage+':'+type(error).__name__
-                log.warning('[account_browser_start] stage=%s error_type=%s',self.startup_stage,type(error).__name__)
+                code=(getattr(self.desktop,'issue','') or type(error).__name__) if self.startup_stage=='display' else type(error).__name__
+                self.startup_issue=self.startup_stage+':'+code
+                log.warning('[account_browser_start] stage=%s code=%s',self.startup_stage,code)
                 await self._shutdown()
-                raise DialogueUnavailable('Не удалось открыть Chrome с удалённым экраном. Замените dockerfile на v22, дождитесь сборки и проверьте память Render. Профиль не удаляется; прямого повтора без прокси нет.') from None
+                label='экран' if self.startup_stage=='display' else 'Chrome'
+                raise DialogueUnavailable('Не удалось запустить '+label+' ('+code+'). Подробности: /account_diag. Ссылка сохраняет свой срок; автоматического повтора запуска нет.') from None
 
     async def _shutdown(self):
         context,pw=self.context,self.pw
@@ -3398,13 +3507,13 @@ ACCOUNT_PAGE = r'''<!doctype html>
 'use strict';
 const token=location.hash.slice(1);history.replaceState(null,'','/account');
 const status=document.querySelector('#status'),entry=document.querySelector('#entry'),screen=document.querySelector('#desktop'),reconnect=document.querySelector('#reconnect');
-let rfb=null,connected=false,ended=false,paused=false,actionPending=false,large=false,connecting=false;
+let rfb=null,connected=false,ended=false,paused=false,actionPending=false,large=false,connecting=false,lastStartError='';
 function notice(text){status.textContent=text}
 function controls(){document.querySelectorAll('[data-control]').forEach(button=>button.disabled=ended||paused||actionPending||!connected);document.querySelector('#close').disabled=ended||actionPending;entry.disabled=ended||paused}
 function blank(){if(rfb){rfb.viewOnly=true;rfb.disconnect();rfb=null}connected=false;entry.value='';screen.replaceChildren();controls()}
-function finish(text){ended=true;blank();reconnect.style.display='none';notice(text)}
+function finish(text){ended=true;blank();reconnect.style.display='none';notice(text+(lastStartError?'\n\nОшибка запуска: '+lastStartError:''))}
 async function request(path,body,initial=false){
- const headers={};if(body)headers['Content-Type']='application/json';if(initial)headers.Authorization='Bearer '+token;
+ const headers={};if(body)headers['Content-Type']='application/json';if(token)headers.Authorization='Bearer '+token;
  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),45000);
  try{const response=await fetch(path,{method:body?'POST':'GET',headers,body:body?JSON.stringify(body):undefined,cache:'no-store',credentials:'same-origin',referrerPolicy:'no-referrer',signal:controller.signal});
  let data={};try{data=await response.json()}catch{}
@@ -3414,15 +3523,15 @@ async function request(path,body,initial=false){
 async function connect(initial=false){
  if(connecting||ended||paused)return;connecting=true;reconnect.style.display='none';
  try{
-  if(initial)await request('/account-api/connect',{action:'connect'},true);else{const state=await request('/account-api/state');if(state.paused){paused=true;blank();notice(state.message);return}}
+  await request('/account-api/connect',{action:'connect'},true);
   const {default:RFB}=await import('/account-assets/core/rfb.js');
   const address=new URL('/account-api/desktop',location.href);address.protocol=location.protocol==='https:'?'wss:':'ws:';
   rfb=new RFB(screen,address.href,{shared:true});rfb.scaleViewport=true;rfb.resizeSession=false;rfb.qualityLevel=6;rfb.compressionLevel=2;
   const current=rfb;
-  rfb.addEventListener('connect',()=>{if(rfb!==current)return;connected=true;controls();notice('Chrome подключён. Войдите в OpenSooq на его экране.')});
+  rfb.addEventListener('connect',()=>{if(rfb!==current)return;connected=true;lastStartError='';controls();notice('Chrome подключён. Войдите в OpenSooq на его экране.')});
   rfb.addEventListener('disconnect',()=>{if(rfb!==current)return;rfb=null;connected=false;entry.value='';screen.replaceChildren();controls();if(!ended&&!paused){notice('Экран отключился. Ввод автоматически не повторяется. Можно подключить экран снова.');reconnect.style.display='inline-block'}});
   rfb.addEventListener('securityfailure',()=>{if(rfb!==current)return;connected=false;controls();notice('Не удалось подключить удалённый экран. Отправьте /account_diag.')});
- }catch(error){if(!ended){notice(error.name==='AbortError'?'Сервер не успел ответить. Повторного входа или ввода не было. Отправьте /account_diag.':error.message);reconnect.style.display='inline-block'}}finally{connecting=false;controls()}
+ }catch(error){if(!ended){lastStartError=error.name==='AbortError'?'Сервер не успел ответить. Повторного входа или ввода не было. Отправьте /account_diag.':error.message;notice(lastStartError);reconnect.style.display='inline-block'}}finally{connecting=false;controls()}
 }
 async function action(name){
  if(ended||actionPending||(paused&&name!=='close'))return;actionPending=true;controls();
@@ -3615,7 +3724,7 @@ class AccountLogin:
     def diagnostic_text(self):
         if not self.diag_exists:
             return 'Диагностика пуста. /account_diag не открывает сайт и не повторяет вход. Старые попытки этой версией не наблюдались.'
-        lines=['Диагностика входа v22 Chrome Desktop',
+        lines=['Диагностика входа v22.1 Chrome Desktop',
                'Страна: '+COUNTRY_LABELS.get(self.country,self.country),
                'Доступ к странице: '+('активен' if self.active and time.monotonic()<self.expires else 'закрыт или истёк'),
                'Браузер входа: Google Chrome с видимым окном, удалённый экран noVNC, постоянный профиль. '+('Настроен общий прокси OPENSOOQ_PROXY_URL; прямого повтора при его ошибке нет.' if self.service.reader.browser_proxy is not None else 'Прямое соединение: OPENSOOQ_PROXY_URL не задан.')]
@@ -3623,6 +3732,9 @@ class AccountLogin:
         issue=getattr(browser,'startup_issue','')
         if issue:
             lines.append('Последний сбой запуска: '+issue+' (display — экран, chrome — браузер).')
+        flags=sorted(getattr(getattr(browser,'desktop',None),'flags',()))
+        if flags:
+            lines.append('Ошибки графического экрана: '+', '.join(flags))
         lines.append('Мышь и клавиатура удалённого экрана не нумеруются; метки действий относятся к кнопкам страницы управления.')
         flags={'captcha_failed':'На странице: reCAPTCHA verification failed.',
                'unauthorized':'На странице: Unauthorized. Точная причина не раскрыта.',
@@ -3883,11 +3995,11 @@ class AccountLogin:
             self._account_entry_pending=False
             await self.page.bring_to_front()
         except asyncio.CancelledError:
-            await self._close()
+            await self._detach_page()
             raise
         except Exception as error:
             self.diag_flags.add('browser_error')
-            await self._close()
+            await self._detach_page()
             if isinstance(error,DialogueUnavailable):
                 raise
             raise DialogueUnavailable('Не удалось показать Chrome. Проверьте сборку dockerfile v22, DATA_DIR и память Render.') from None
@@ -3959,11 +4071,11 @@ class AccountLogin:
             await self.service.bot.send_message(chat_id=ADMIN_ID,text='✅ Вход подтверждён. Переписка использует тот же постоянный профиль браузера. Диалоги, остановленные при открытии /account, остаются на паузе. Запуск — кнопкой у выбранного объявления. /chatstatus — состояние, /account_off — отключение.')
         return {'finished':True,'message':'Вход подтверждён, профиль сохранён. Браузер остаётся доступен боту; прежние диалоги на паузе.'}
 
-    async def _close(self):
+    async def _detach_page(self):
         remote=getattr(self.service,'account_web',None)
         if remote is not None:
             await remote.disconnect_viewers()
-        # Отзываем только доступ по ссылке. Общий браузер и его профиль остаются.
+        # Отсоединяем страницу; авторизация личной ссылки здесь не меняется.
         page=self._observed_page
         if page is not None:
             for event,callback in self._listeners():
@@ -3976,6 +4088,9 @@ class AccountLogin:
         self.context=self.browser=self.pw=self.page=None
         await self.cancel_diagnostic_reads()
         self.diag_pending.clear()
+
+    async def _close(self):
+        await self._detach_page()
         self.active=False;self.token='';self.expires=0
 
     async def expire(self):
@@ -4090,7 +4205,7 @@ class AccountWebServer:
 
     async def connect(self, request):
         from aiohttp import web
-        credential = self.check(request, origin=True, header_only=True)
+        credential = self.check(request, origin=True)
         await self.request_json(request)
         if not self.assets.joinpath('core/rfb.js').is_file():
             raise DialogueUnavailable('Файлы удалённого экрана отсутствуют. Замените dockerfile на v22 и дождитесь сборки.')
@@ -4105,7 +4220,7 @@ class AccountWebServer:
             await manager.page.bring_to_front()
             token = manager.token
             remaining = max(1, int(manager.expires - time.monotonic()))
-        response = web.json_response({'message': 'Chrome готов. Войдите в OpenSooq на удалённом экране.', 'version': 22})
+        response = web.json_response({'message': 'Chrome готов. Войдите в OpenSooq на удалённом экране.', 'version': '22.1'})
         response.set_cookie(self.COOKIE, token, max_age=remaining, path='/', secure=True, httponly=True, samesite='Strict')
         return response
 
@@ -4361,6 +4476,8 @@ def main():
     logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    if "--check-desktop" in sys.argv:
+        return asyncio.run(check_desktop())
     if "--chat-login" in sys.argv:
         asyncio.run(local_chat_login())
         return 0
@@ -4375,7 +4492,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v22_chrome_desktop] Создание Telegram Application")
+    log.info("[boot_v22_1_chrome_desktop] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
