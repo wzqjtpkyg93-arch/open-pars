@@ -7,10 +7,11 @@ import os
 import re
 import secrets
 import shlex
+import shutil
+import socket
 import sqlite3
 import string
 import sys
-import threading
 import tempfile
 import time
 import unicodedata
@@ -20,7 +21,6 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from html import escape
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
@@ -1829,7 +1829,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     raise ValueError('Включите Web Service с PORT на Render для страницы входа.')
                 token=await service.account_login.issue(country)
                 keyboard=InlineKeyboardMarkup([[InlineKeyboardButton('🔐 Войти в OpenSooq',url=origin+'/account#'+token)]])
-                await message.reply_text("Страна входа: "+COUNTRY_LABELS[country]+"\n\n🔐 Личная страница управления на 15 минут. Браузер использует мобильный WebKit и отдельный постоянный профиль. Это движок Safari для Linux, а не приложение Safari на iPhone. Активные диалоги поставлены на паузу. Сначала войдите через главную OpenSooq: кнопка «Вход / профиль», затем Login or Sign Up. После успешного входа откройте существующий чат и нажмите «Сохранить вход». Браузер входа и переписка используют OPENSOOQ_PROXY_URL, если он задан. Новый /account открывает главную; чаты автоматически не открываются. Ссылку не пересылайте. Коды в Telegram вводить не нужно.",reply_markup=keyboard)
+                await message.reply_text("Страна входа: "+COUNTRY_LABELS[country]+"\n\n🔐 Личный удалённый экран Chrome на 15 минут. Откройте ссылку в Safari. Внутри будет настоящее окно Chrome с адресной строкой. Сначала войдите через главную OpenSooq, затем откройте существующий чат и нажмите «Сохранить вход». На iPhone текст можно вводить полем под экраном. Бот продолжит использовать этот же браузер и профиль. Активные диалоги на паузе. Используется OPENSOOQ_PROXY_URL, если задан; прямого повтора при его ошибке нет. Если сайт просит подождать, ввод останавливается. Ссылку не пересылайте; коды в Telegram вводить не нужно.",reply_markup=keyboard)
             else:
                 await disconnect_opensooq_account(service)
                 await message.reply_text("⏸ Аккаунт отключён от автоответчика, активные диалоги остановлены. Парсер работает как раньше.")
@@ -2611,13 +2611,123 @@ class DialogueUnavailable(ValueError):
     pass
 
 
+class RemoteChromeDesktop:
+    """A private X display; VNC listens only inside this container."""
+    width, height = 1000, 900
+
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self.processes = []
+        self.temporary = None
+        self.display = ''
+        self.port = None
+        self.environment = {}
+
+    @property
+    def running(self):
+        return (len(self.processes) == 2
+                and all(process.returncode is None for process in self.processes))
+
+    async def start(self):
+        async with self.lock:
+            if self.running:
+                return
+            await self._stop()
+            if any(shutil.which(name) is None for name in ('Xvfb', 'xauth', 'x11vnc')):
+                raise DialogueUnavailable('Для удалённого экрана нужны Xvfb, xauth и x11vnc. Замените dockerfile на v22 и дождитесь успешной сборки.')
+            try:
+                self.temporary = tempfile.TemporaryDirectory(prefix='opensooq-display-')
+                authority = Path(self.temporary.name) / 'Xauthority'
+                authority.touch(mode=0o600)
+                for _ in range(30):
+                    display_number = secrets.randbelow(900) + 100
+                    if not Path(f'/tmp/.X11-unix/X{display_number}').exists() and not Path(f'/tmp/.X{display_number}-lock').exists():
+                        break
+                else:
+                    raise RuntimeError('No free display')
+                self.display = f':{display_number}'
+                auth = await asyncio.create_subprocess_exec(
+                    'xauth', '-f', str(authority), 'add', self.display, '.', secrets.token_hex(16),
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                try:
+                    if await asyncio.wait_for(auth.wait(), 5) != 0:
+                        raise RuntimeError('X authority setup failed')
+                finally:
+                    if auth.returncode is None:
+                        auth.kill()
+                        await auth.wait()
+                self.environment = {'DISPLAY': self.display, 'XAUTHORITY': str(authority)}
+                process = await asyncio.create_subprocess_exec(
+                    'Xvfb', self.display, '-screen', '0', f'{self.width}x{self.height}x24',
+                    '-nolisten', 'tcp', '-noreset', '-auth', str(authority), '-displayfd', '1',
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                self.processes.append(process)
+                ready = await asyncio.wait_for(process.stdout.readline(), 8)
+                if ready.strip() != str(display_number).encode():
+                    raise RuntimeError('X display did not start')
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+                    listener.bind(('127.0.0.1', 0))
+                    self.port = listener.getsockname()[1]
+                process = await asyncio.create_subprocess_exec(
+                    'x11vnc', '-display', self.display, '-auth', str(authority),
+                    '-listen', '127.0.0.1', '-localhost', '-rfbport', str(self.port),
+                    '-rfbportv6', '-1', '-norc',
+                    '-nopw', '-forever', '-shared', '-noxdamage', '-noxrecord', '-nosel', '-noshm', '-no6',
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                self.processes.append(process)
+                deadline = time.monotonic() + 6
+                while True:
+                    if not self.running or time.monotonic() >= deadline:
+                        raise RuntimeError('VNC did not start')
+                    try:
+                        reader, writer = await asyncio.wait_for(
+                            asyncio.open_connection('127.0.0.1', self.port), 0.5)
+                        try:
+                            greeting = await asyncio.wait_for(reader.readexactly(12), 0.5)
+                            if not greeting.startswith(b'RFB '):
+                                raise RuntimeError('Unexpected VNC server')
+                        finally:
+                            writer.close()
+                            await writer.wait_closed()
+                        break
+                    except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+                        await asyncio.sleep(0.1)
+            except BaseException:
+                await self._stop()
+                raise
+
+    async def _stop(self):
+        for process in reversed(self.processes):
+            if process.returncode is None:
+                with suppress(ProcessLookupError):
+                    process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), 3)
+                except asyncio.TimeoutError:
+                    with suppress(ProcessLookupError):
+                        process.kill()
+                    await process.wait()
+        self.processes.clear()
+        self.display, self.port, self.environment = '', None, {}
+        if self.temporary is not None:
+            self.temporary.cleanup()
+            self.temporary = None
+
+    async def close(self):
+        async with self.lock:
+            await self._stop()
+
+
 class PersistentOpenSooqBrowser:
     """Один выделенный профиль и один браузер для ручного входа и переписки."""
     def __init__(self, directory=None):
-        self.directory=Path(directory) if directory is not None else DATA_DIR/'opensooq-webkit-profile'
+        self.directory=Path(directory) if directory is not None else DATA_DIR/'opensooq-chrome-profile'
         self.lock=asyncio.Lock()
         self.pw=self.context=self.page=None
         self._file_lock=None
+        self.desktop=RemoteChromeDesktop()
+        self.startup_stage='idle'
+        self.startup_issue=''
         self.on_blocked=None
 
     def _acquire_profile(self):
@@ -2658,10 +2768,12 @@ class PersistentOpenSooqBrowser:
 
     async def get_page(self):
         async with self.lock:
-            if self.context is not None:
+            if self.context is not None and self.desktop.running:
                 if self.page is None or self.page.is_closed():
                     self.page=await self.context.new_page()
                     self.page.set_default_timeout(12000)
+                self.startup_stage='ready'
+                self.startup_issue=''
                 return self.context,self.page
             # Завершаем оставшийся транспорт после неожиданного закрытия Chromium.
             await self._shutdown()
@@ -2670,30 +2782,35 @@ class PersistentOpenSooqBrowser:
             except BlockingIOError:
                 raise DialogueUnavailable('Постоянный профиль уже используется другим процессом. Второй браузер не запущен; файлы блокировки не удаляются.') from None
             try:
+                self.startup_stage='display'
+                await self.desktop.start()
+                self.startup_stage='chrome'
                 from playwright.async_api import async_playwright
                 self.pw=await async_playwright().start()
                 launch_options=opensooq_browser_launch_options()
-                # Chromium-only command-line flags must not reach WebKit.
-                launch_options.pop('args',None)
-                self.context=await self.pw.webkit.launch_persistent_context(
-                    str(self.directory),**launch_options,
-                    viewport={'width':420,'height':820},locale='en-US',
-                    screen={'width':420,'height':820},device_scale_factor=1,
-                    is_mobile=True,has_touch=True,
-                    user_agent=self.pw.devices['iPhone 13']['user_agent'],
-                    accept_downloads=False,timeout=25000)
+                launch_options.update(headless=False,channel='chrome',
+                    env={**os.environ,**self.desktop.environment},no_viewport=True,
+                    args=['--disable-dev-shm-usage','--window-position=0,0',
+                          '--window-size=1000,900'])
+                self.context=await self.pw.chromium.launch_persistent_context(
+                    str(self.directory),**launch_options,locale='en-US',
+                    accept_downloads=False,timeout=30000)
                 self.context.on('close',self._context_closed)
                 await self.context.route('**/*',self._restrict_navigation)
                 pages=[page for page in self.context.pages if not page.is_closed()]
                 self.page=pages[0] if pages else await self.context.new_page()
                 self.page.set_default_timeout(12000)
+                self.startup_stage='ready'
+                self.startup_issue=''
                 return self.context,self.page
             except asyncio.CancelledError:
                 await self._shutdown()
                 raise
-            except Exception:
+            except Exception as error:
+                self.startup_issue=self.startup_stage+':'+type(error).__name__
+                log.warning('[account_browser_start] stage=%s error_type=%s',self.startup_stage,type(error).__name__)
                 await self._shutdown()
-                raise DialogueUnavailable('Не удалось открыть WebKit. Замените dockerfile версией с установкой webkit и дождитесь сборки. Также проверьте память, DATA_DIR и отсутствие второго процесса с тем же профилем.') from None
+                raise DialogueUnavailable('Не удалось открыть Chrome с удалённым экраном. Замените dockerfile на v22, дождитесь сборки и проверьте память Render. Профиль не удаляется; прямого повтора без прокси нет.') from None
 
     async def _shutdown(self):
         context,pw=self.context,self.pw
@@ -2708,7 +2825,10 @@ class PersistentOpenSooqBrowser:
                     with suppress(Exception):
                         await asyncio.wait_for(pw.stop(),timeout=10)
             finally:
-                self._release_profile()
+                try:
+                    await self.desktop.close()
+                finally:
+                    self._release_profile()
 
     async def close(self):
         async with self.lock:
@@ -2793,7 +2913,7 @@ class OpenSooqChatBrowser:
     def configured(self):
         enabled=self.saved_enabled or os.getenv('OPENSOOQ_CHAT_ENABLED','0')=='1'
         if self.profile_mode:
-            enabled=(self.saved_enabled and self.profile_engine=='webkit'
+            enabled=(self.saved_enabled and self.profile_engine=='chrome-headed-v22'
                      and self.profile is not None and self.profile.directory.is_dir())
         return (not self.disabled and enabled and self.state_file.is_file() and self.account.isdecimal())
 
@@ -2809,7 +2929,7 @@ class OpenSooqChatBrowser:
             if (metadata.get('_opensooq_account_id')!=self.account
                     or metadata.get('_opensooq_chat_enabled') is not True
                     or metadata.get('_opensooq_profile_mode')!='persistent'
-                    or metadata.get('_opensooq_profile_engine')!='webkit'):
+                    or metadata.get('_opensooq_profile_engine')!='chrome-headed-v22'):
                 raise DialogueUnavailable('Разрешение или привязка профиля изменились. Подтвердите вход через /account.')
             self.context,self.page=await self.profile.get_page()
             self._using_profile=True
@@ -3259,95 +3379,75 @@ async def local_chat_login():
 
 
 ACCOUNT_PAGE = r'''<!doctype html>
-<html lang="ru"><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Подключить OpenSooq</title>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="referrer" content="no-referrer"><title>Chrome · OpenSooq</title>
 <style>
-body{margin:0;background:#10141e;color:#f7f7fb;font:16px system-ui}
-main{max-width:480px;margin:auto;padding:14px}button,input{font:inherit;border-radius:10px;padding:12px;border:1px solid #506077}
-button{background:#1264eb;color:white;margin:4px 2px}button:disabled{opacity:.5}
-input{box-sizing:border-box;width:100%;background:#202a3b;color:white}
-canvas{display:block;width:100%;max-width:420px;margin:auto;background:white;border-radius:8px}
-#status{white-space:pre-wrap;font-size:14px}small{display:block;margin:12px 0;color:#c4ccdb}
-</style>
-<main><h2>Вход в OpenSooq · WebKit</h2>
-<p>Начните с кнопки «Вход / профиль»: она открывает главную OpenSooq и штатную форму Login or Sign Up. Завершите вход на экране ниже. После подтверждения входа откройте «Чаты», выберите существующий диалог и нажмите «Сохранить вход».</p>
-<small>Личная ссылка даёт управление постоянным браузером. Закрытие страницы не удаляет его профиль; отключение бота: /account_off. Не пересылайте её. Пароль и код вводите здесь, не в Telegram. Сообщения об отправке команды не подтверждают вход в аккаунт.</small>
-<button id="login">Вход / профиль</button><button id="chats">После входа: открыть чаты</button><button id="save">Сохранить вход</button>
-<button id="close">Закрыть страницу входа</button>
-<p id="status" role="status" aria-live="polite">Подключаем браузер…</p>
-<canvas id="screen" width="420" height="820"></canvas>
-<p>Нажмите нужное поле на экране. Введите его полное значение ниже и нажмите «Заменить поле». Предыдущее значение выбранного поля будет заменено.</p>
-<input id="entry" type="password" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="Номер, пароль или код — для выбранного поля">
-<button id="type">Заменить поле</button><button id="enter">Enter / Далее</button>
-<button id="backspace">Удалить символ</button><button id="tab">Следующее поле</button>
-<button id="up">↑</button><button id="down">↓</button><button id="refresh">Обновить экран</button>
-<small>Страница действует 15 минут. При просьбе сайта подождать прекратите попытки. Отчёт WebKit v21 в боте: /account_diag. Он не содержит значений полей и не повторяет вход.</small></main>
-<script>
+*{box-sizing:border-box}body{margin:0;background:#111724;color:#eef2fa;font:16px system-ui}main{max-width:1100px;margin:auto;padding:12px}h1{font-size:22px;margin:8px 0}p{line-height:1.4}button,input{font:inherit;border:1px solid #627089;border-radius:9px;padding:11px}button{background:#2367d9;color:white;margin:4px 2px;min-height:44px}button:disabled{opacity:.45}button.secondary{background:#26344d}input{width:100%;background:#1a263d;color:white}#status{white-space:pre-wrap;padding:10px;border-radius:8px;background:#1c2940;min-height:44px}#desktop{width:100%;height:min(72vh,900px);min-height:300px;background:#080b11;overflow:hidden;border:1px solid #506077;border-radius:8px}small{display:block;color:#becadd;line-height:1.4;margin:8px 0}.row{display:flex;flex-wrap:wrap;gap:3px}.row button{flex:1}#reconnect{display:none}#keyboard-box{margin-top:12px}a{color:#9ec0ff}
+</style></head><body><main>
+<h1>Chrome на сервере</h1>
+<p>Войдите в OpenSooq на экране Chrome. После входа откройте «Чаты», выберите существующий диалог и нажмите «Сохранить вход».</p>
+<div class="row"><button id="login" data-control>Вход / профиль</button><button id="chats" data-control>После входа: чаты</button><button id="save" data-control>Сохранить вход</button></div>
+<div class="row"><button id="scale" class="secondary" data-control>Крупнее</button><button id="focus" class="secondary" data-control>Показать вкладку OpenSooq</button><button id="close" class="secondary">Закрыть доступ</button></div>
+<p id="status" role="status" aria-live="polite">Запускаем Chrome и удалённый экран…</p>
+<button id="reconnect" class="secondary">Подключить экран снова</button>
+<div id="desktop" aria-label="Удалённый экран Chrome"></div>
+<div id="keyboard-box"><small>Для ввода с iPhone сначала нажмите поле внутри Chrome, затем введите его полное значение здесь. «Заменить текст» выделит прежний текст в выбранном поле и введёт новый. Enter отправляйте отдельно.</small>
+<input id="entry" type="password" maxlength="200" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="Номер, пароль или код для выбранного поля" aria-label="Текст для выбранного поля Chrome">
+<div class="row"><button id="type" data-control>Заменить текст</button><button id="enter" data-control>Enter / Далее</button><button id="backspace" class="secondary" data-control>Backspace</button><button id="tab" class="secondary" data-control>Tab</button></div></div>
+<small>Ссылка действует 15 минут. Пароли и коды вводятся на этой странице. Не пересылайте ссылку. Если OpenSooq просит подождать, ввод останавливается. Само подключение браузера сообщений не отправляет.</small>
+</main><script type="module">
 'use strict';
-const token=location.hash.slice(1);
-history.replaceState(null,'','/account');
-const status=document.querySelector('#status'),canvas=document.querySelector('#screen'),entry=document.querySelector('#entry');
-let ended=false,shown=false,refreshing=false,actionPending=false,screenPromise=Promise.resolve();
-function notice(s){status.textContent=s}
-function controls(){
- document.querySelectorAll('button').forEach(b=>b.disabled=ended||actionPending);
- entry.disabled=ended||actionPending;
- canvas.style.pointerEvents=ended||actionPending?'none':'auto';
- canvas.setAttribute('aria-busy',String(actionPending));
-}
-function finish(){ended=true;entry.value='';canvas.getContext('2d').clearRect(0,0,canvas.width,canvas.height);controls()}
-async function request(path,body){
+const token=location.hash.slice(1);history.replaceState(null,'','/account');
+const status=document.querySelector('#status'),entry=document.querySelector('#entry'),screen=document.querySelector('#desktop'),reconnect=document.querySelector('#reconnect');
+let rfb=null,connected=false,ended=false,paused=false,actionPending=false,large=false,connecting=false;
+function notice(text){status.textContent=text}
+function controls(){document.querySelectorAll('[data-control]').forEach(button=>button.disabled=ended||paused||actionPending||!connected);document.querySelector('#close').disabled=ended||actionPending;entry.disabled=ended||paused}
+function blank(){if(rfb){rfb.viewOnly=true;rfb.disconnect();rfb=null}connected=false;entry.value='';screen.replaceChildren();controls()}
+function finish(text){ended=true;blank();reconnect.style.display='none';notice(text)}
+async function request(path,body,initial=false){
+ const headers={};if(body)headers['Content-Type']='application/json';if(initial)headers.Authorization='Bearer '+token;
  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),45000);
- try{
-  const r=await fetch(path,{method:body?'POST':'GET',headers:{Authorization:'Bearer '+token,...(body?{'Content-Type':'application/json'}:{})},body:body?JSON.stringify(body):undefined,cache:'no-store',referrerPolicy:'no-referrer',signal:controller.signal});
-  if(!r.ok){let m='Ошибка подключения';try{m=(await r.json()).error||m}catch{}if(r.status===401)finish();throw Error(m)}
-  return r;
- }catch(e){
-  if(e.name==='AbortError')throw Error('Сервер не ответил вовремя. Команда могла выполниться — сначала проверьте экран. Автоматического повтора нет.');
-  throw e;
+ try{const response=await fetch(path,{method:body?'POST':'GET',headers,body:body?JSON.stringify(body):undefined,cache:'no-store',credentials:'same-origin',referrerPolicy:'no-referrer',signal:controller.signal});
+ let data={};try{data=await response.json()}catch{}
+ if(!response.ok){if(response.status===401)finish(data.error||'Доступ истёк. Получите новую ссылку через /account.');throw Error(data.error||'Подключение не завершено. Отчёт: /account_diag.')}return data
  }finally{clearTimeout(timer)}
 }
-async function shot(){
- if(ended||actionPending||refreshing)return;
- refreshing=true;
- screenPromise=(async()=>{
-  let url;
-  try{
-   const r=await request('/account-api/screen'),blob=await r.blob();
-   url=URL.createObjectURL(blob);const img=new Image();
-   await new Promise((resolve,reject)=>{img.onload=resolve;img.onerror=reject;img.src=url});
-   if(ended)return;
-   canvas.width=img.naturalWidth;canvas.height=img.naturalHeight;canvas.getContext('2d').drawImage(img,0,0);
-   if(!shown){if(!actionPending)notice('Браузер готов. Вход выполняете вы.');shown=true}
-  }catch(e){notice(e.message)}finally{if(url)URL.revokeObjectURL(url);refreshing=false}
- })();
- await screenPromise;
-}
-async function act(body){
- if(ended||actionPending)return false;
- // Действие ожидает уже начатый снимок; снимок не отбрасывает нажатие.
- actionPending=true;controls();notice('Выполняю выбранное действие…');
- let ok=false;
+async function connect(initial=false){
+ if(connecting||ended||paused)return;connecting=true;reconnect.style.display='none';
  try{
-  await screenPromise;
-  if(ended)return false;
-  const data=await(await request('/account-api/action',body)).json();
-  ok=true;notice(data.message||'Действие выполнено. Проверьте результат на экране.');
-  if(body.action==='text')entry.value='';
-  if(data.finished)finish();
- }catch(e){notice(e.message)}finally{actionPending=false;controls()}
- if(!ended)await shot();
- return ok;
+  if(initial)await request('/account-api/connect',{action:'connect'},true);else{const state=await request('/account-api/state');if(state.paused){paused=true;blank();notice(state.message);return}}
+  const {default:RFB}=await import('/account-assets/core/rfb.js');
+  const address=new URL('/account-api/desktop',location.href);address.protocol=location.protocol==='https:'?'wss:':'ws:';
+  rfb=new RFB(screen,address.href,{shared:true});rfb.scaleViewport=true;rfb.resizeSession=false;rfb.qualityLevel=6;rfb.compressionLevel=2;
+  const current=rfb;
+  rfb.addEventListener('connect',()=>{if(rfb!==current)return;connected=true;controls();notice('Chrome подключён. Войдите в OpenSooq на его экране.')});
+  rfb.addEventListener('disconnect',()=>{if(rfb!==current)return;rfb=null;connected=false;entry.value='';screen.replaceChildren();controls();if(!ended&&!paused){notice('Экран отключился. Ввод автоматически не повторяется. Можно подключить экран снова.');reconnect.style.display='inline-block'}});
+  rfb.addEventListener('securityfailure',()=>{if(rfb!==current)return;connected=false;controls();notice('Не удалось подключить удалённый экран. Отправьте /account_diag.')});
+ }catch(error){if(!ended){notice(error.name==='AbortError'?'Сервер не успел ответить. Повторного входа или ввода не было. Отправьте /account_diag.':error.message);reconnect.style.display='inline-block'}}finally{connecting=false;controls()}
 }
-canvas.addEventListener('click',e=>{const r=canvas.getBoundingClientRect();act({action:'click',x:(e.clientX-r.left)*canvas.width/r.width,y:(e.clientY-r.top)*canvas.height/r.height})});
-document.querySelector('#type').onclick=()=>{if(!ended&&!actionPending&&entry.value)act({action:'text',text:entry.value})};
-for(const [id,key] of [['enter','Enter'],['backspace','Backspace'],['tab','Tab']])document.querySelector('#'+id).onclick=()=>act({action:'key',key});
-document.querySelector('#up').onclick=()=>act({action:'scroll',dy:-500});document.querySelector('#down').onclick=()=>act({action:'scroll',dy:500});
-document.querySelector('#refresh').onclick=()=>shot();
-for(const id of ['login','chats','save','close'])document.querySelector('#'+id).onclick=()=>act({action:id});
-if(!token){finish();notice('Ссылка без кода доступа. Получите новую через /account.')}else{shot();setInterval(shot,2500)}
-</script></html>
+async function action(name){
+ if(ended||actionPending||(paused&&name!=='close'))return;actionPending=true;controls();
+ const previous=rfb;if(previous)previous.viewOnly=true;
+ try{const result=await request('/account-api/action',{action:name});if(result.finished){finish(result.message);return}notice(result.message||'Проверьте экран Chrome.')}
+ catch(error){if(!ended)notice(error.name==='AbortError'?'Результат действия неизвестен. Проверьте экран; автоматического повтора нет.':error.message)}
+ finally{actionPending=false;if(rfb&&connected&&!paused&&!ended)rfb.viewOnly=false;controls()}
+}
+function key(symbol,code){if(connected&&!ended&&!paused&&!actionPending&&rfb)rfb.sendKey(symbol,code)}
+function selectAll(){rfb.sendKey(0xffe3,'ControlLeft',true);try{rfb.sendKey(0x61,'KeyA')}finally{rfb.sendKey(0xffe3,'ControlLeft',false)}}
+document.querySelector('#type').onclick=()=>{
+ if(!connected||ended||paused||actionPending||!entry.value)return;
+ const value=entry.value;entry.value='';actionPending=true;controls();
+ try{selectAll();for(const character of value){const point=character.codePointAt(0);if(point<32||point===127)continue;rfb.sendKey(point<=255?point:0x01000000|point)}notice('Текст передан клавиатурой. Проверьте выбранное поле в Chrome; Enter не отправлялся.')}
+ catch{notice('Ввод мог завершиться частично. Проверьте поле перед следующим действием; автоматического повтора нет.')}finally{actionPending=false;controls()}
+};
+document.querySelector('#enter').onclick=()=>key(0xff0d,'Enter');document.querySelector('#backspace').onclick=()=>key(0xff08,'Backspace');document.querySelector('#tab').onclick=()=>key(0xff09,'Tab');
+for(const name of ['login','chats','save','close','focus'])document.querySelector('#'+name).onclick=()=>action(name);
+document.querySelector('#scale').onclick=()=>{if(!rfb)return;large=!large;rfb.scaleViewport=!large;rfb.clipViewport=large;rfb.dragViewport=large;document.querySelector('#scale').textContent=large?'Уместить экран':'Крупнее';notice(large?'Экран увеличен. Перетаскивайте его, чтобы увидеть нужное место.':'Весь экран помещается в окне.')};
+entry.addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();document.querySelector('#type').click()}});
+reconnect.onclick=()=>{if(rfb){rfb.disconnect();rfb=null}screen.replaceChildren();connect(false)};
+window.addEventListener('pagehide',()=>{entry.value='';if(rfb)rfb.disconnect()});
+setInterval(async()=>{if(ended||connecting)return;try{const state=await request('/account-api/state');if(state.paused&&!paused){paused=true;blank();notice(state.message);reconnect.style.display='none'}}catch{}},2500);
+controls();connect(Boolean(token));
+</script></body></html>
 '''
 
 
@@ -3515,10 +3615,15 @@ class AccountLogin:
     def diagnostic_text(self):
         if not self.diag_exists:
             return 'Диагностика пуста. /account_diag не открывает сайт и не повторяет вход. Старые попытки этой версией не наблюдались.'
-        lines=['Диагностика входа v21 WebKit',
+        lines=['Диагностика входа v22 Chrome Desktop',
                'Страна: '+COUNTRY_LABELS.get(self.country,self.country),
                'Доступ к странице: '+('активен' if self.active and time.monotonic()<self.expires else 'закрыт или истёк'),
-               'Браузер входа: мобильный WebKit для Linux (движок Safari), постоянный профиль. '+('Настроен общий прокси OPENSOOQ_PROXY_URL; прямого повтора при его ошибке нет.' if self.service.reader.browser_proxy is not None else 'Прямое соединение: OPENSOOQ_PROXY_URL не задан.')]
+               'Браузер входа: Google Chrome с видимым окном, удалённый экран noVNC, постоянный профиль. '+('Настроен общий прокси OPENSOOQ_PROXY_URL; прямого повтора при его ошибке нет.' if self.service.reader.browser_proxy is not None else 'Прямое соединение: OPENSOOQ_PROXY_URL не задан.')]
+        browser=getattr(self.service,'account_browser',None)
+        issue=getattr(browser,'startup_issue','')
+        if issue:
+            lines.append('Последний сбой запуска: '+issue+' (display — экран, chrome — браузер).')
+        lines.append('Мышь и клавиатура удалённого экрана не нумеруются; метки действий относятся к кнопкам страницы управления.')
         flags={'captcha_failed':'На странице: reCAPTCHA verification failed.',
                'unauthorized':'На странице: Unauthorized. Точная причина не раскрыта.',
                'wait':'Сайт просит подождать перед повторным входом.',
@@ -3776,6 +3881,7 @@ class AccountLogin:
                         and current_host!=requested_host)):
                 await self.page.goto('https://'+requested_host+'/en',wait_until='domcontentloaded',timeout=30000)
             self._account_entry_pending=False
+            await self.page.bring_to_front()
         except asyncio.CancelledError:
             await self._close()
             raise
@@ -3784,7 +3890,7 @@ class AccountLogin:
             await self._close()
             if isinstance(error,DialogueUnavailable):
                 raise
-            raise DialogueUnavailable('Не удалось показать постоянный браузер. Проверьте DATA_DIR, Chromium и память Render.') from None
+            raise DialogueUnavailable('Не удалось показать Chrome. Проверьте сборку dockerfile v22, DATA_DIR и память Render.') from None
 
     async def screen(self, authorization):
         async with self.lock:
@@ -3795,40 +3901,23 @@ class AccountLogin:
 
     async def action(self, authorization, data):
         async with self.lock:
-            if not self.authorized(authorization):raise PermissionError()
-            await self._open()
+            if not self.authorized(authorization):
+                raise PermissionError()
             action=data.get('action')
-            await self.collect_flags(force=True)
-            if 'wait' in self.diag_flags and action in {'click','key','text','login','chats'}:
-                raise ValueError('OpenSooq просит подождать. Дальнейшие действия в этом сеансе входа остановлены. Срок ожидания сайт не указал. Не повторяйте вход до окончания ограничения. Отчёт: /account_diag.')
-            labels={'click':'нажатие','text':'замена поля','key':'клавиша',
-                    'scroll':'прокрутка','login':'вход через главную','chats':'открытие чатов','save':'сохранение','close':'закрытие'}
-            if action not in labels:
+            if action not in {'login','chats','save','close','focus'}:
                 raise ValueError('Действие не поддерживается.')
+            if action=='close':
+                await self._close()
+                return {'finished':True,'message':'Доступ по ссылке закрыт. Chrome и профиль остаются на сервере; прежние диалоги на паузе.'}
+            await self._open()
+            await self.collect_flags(force=True)
+            if 'wait' in self.diag_flags and action in {'login','chats','focus'}:
+                raise ValueError('OpenSooq просит подождать. Ввод остановлен; срок ожидания сайт не указал. Отчёт: /account_diag.')
             self.diag_action+=1
-            self.diag_action_label=labels[action]
-            if action=='key' and data.get('key') in {'Enter','Backspace','Tab'}:
-                self.diag_action_label+=' '+data['key']
-            if action=='click':
-                x,y=data.get('x'),data.get('y')
-                if isinstance(x,bool) or isinstance(y,bool) or not isinstance(x,(int,float)) or not isinstance(y,(int,float)) or not math.isfinite(x) or not math.isfinite(y) or not 0<=x<420 or not 0<=y<820:
-                    raise ValueError('Нажмите внутри экрана браузера.')
-                await self.page.touchscreen.tap(x,y)
-            elif action=='text':
-                value=data.get('text')
-                if not isinstance(value,str) or not 1<=len(value)<=200:
-                    raise ValueError('Введите от 1 до 200 символов.')
-                await self.replace_focused_field(value)
-            elif action=='key':
-                if data.get('key') not in {'Enter','Backspace','Tab'}:raise ValueError('Клавиша не поддерживается.')
-                await self.page.keyboard.press(data['key'])
-            elif action=='scroll':
-                dy=data.get('dy')
-                if type(dy) is not int or dy not in {-500,500}:raise ValueError('Некорректная прокрутка.')
-                await self.page.mouse.wheel(0,dy)
-            elif action=='login':
+            self.diag_action_label={'login':'открытие главной','chats':'открытие чатов',
+                                    'save':'сохранение','focus':'показ вкладки'}[action]
+            if action=='login':
                 await self.page.goto('https://'+self.country+'.opensooq.com/en',wait_until='domcontentloaded',timeout=30000)
-                # Open the site's own login form; never submit credentials here.
                 login=self.page.get_by_role('button',name='Login or Sign Up',exact=True)
                 if await login.count()==1 and await login.is_visible():
                     await login.click()
@@ -3836,14 +3925,9 @@ class AccountLogin:
                 await self.page.goto('https://my.opensooq.com/chats',wait_until='domcontentloaded',timeout=30000)
             elif action=='save':
                 return await self._save()
-            elif action=='close':
-                await self._close()
-                return {'finished':True,'message':'Доступ по ссылке закрыт. Профиль браузера сохранён; остановленные диалоги остаются на паузе.'}
-            else:raise ValueError('Действие не поддерживается.')
+            await self.page.bring_to_front()
             await self.collect_flags(force=True)
-            message=('Значение выбранного поля заменено.' if action=='text' else
-                     'Действие выполнено. Проверьте результат на экране — это не подтверждение входа.')
-            return {'message':message}
+            return {'message':'Проверьте результат в окне Chrome. Вход подтверждается отдельно кнопкой «Сохранить вход».'}
 
     async def _save(self):
         url=urlsplit(self.page.url)
@@ -3859,7 +3943,7 @@ class AccountLogin:
         # подтверждённый аккаунт и явное разрешение владельца на автоответы.
         path=write_account_metadata({'_opensooq_account_id':match[1],
             '_opensooq_chat_enabled':True,'_opensooq_profile_mode':'persistent',
-            '_opensooq_profile_version':1,'_opensooq_profile_engine':'webkit'})
+            '_opensooq_profile_version':1,'_opensooq_profile_engine':'chrome-headed-v22'})
         dialogs=self.service.dialogues
         async with dialogs.lock:
             await dialogs.transport.close()
@@ -3869,13 +3953,16 @@ class AccountLogin:
             dialogs.transport.disabled=False
             dialogs.transport.blocked=False
             dialogs.transport.profile_mode=True
-            dialogs.transport.profile_engine='webkit'
+            dialogs.transport.profile_engine='chrome-headed-v22'
         await self._close()
         with suppress(TelegramError):
             await self.service.bot.send_message(chat_id=ADMIN_ID,text='✅ Вход подтверждён. Переписка использует тот же постоянный профиль браузера. Диалоги, остановленные при открытии /account, остаются на паузе. Запуск — кнопкой у выбранного объявления. /chatstatus — состояние, /account_off — отключение.')
         return {'finished':True,'message':'Вход подтверждён, профиль сохранён. Браузер остаётся доступен боту; прежние диалоги на паузе.'}
 
     async def _close(self):
+        remote=getattr(self.service,'account_web',None)
+        if remote is not None:
+            await remote.disconnect_viewers()
         # Отзываем только доступ по ссылке. Общий браузер и его профиль остаются.
         page=self._observed_page
         if page is not None:
@@ -3909,58 +3996,242 @@ def account_origin():
     return raw.rstrip('/')
 
 
-def make_http_handler(service, loop):
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self,*args):pass
-        def respond(self,status,body,kind='application/json; charset=utf-8'):
-            if not isinstance(body,bytes):body=json.dumps(body,ensure_ascii=False).encode()
-            self.send_response(status)
-            self.send_header('Content-Type',kind)
-            self.send_header('Content-Length',str(len(body)))
-            self.send_header('Cache-Control','no-store, max-age=0')
-            self.send_header('Referrer-Policy','no-referrer')
-            self.send_header('X-Content-Type-Options','nosniff')
-            self.send_header('X-Frame-Options','DENY')
-            self.send_header('Content-Security-Policy',"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
-            self.end_headers()
-            with suppress(BrokenPipeError,ConnectionResetError):self.wfile.write(body)
-        def api(self,post=False):
-            manager=service.account_login
-            authorization=self.headers.get('Authorization','')
-            if not manager.authorized(authorization):
-                self.respond(401,{'error':'Доступ истёк или ссылка неверна. Получите новую через /account.'});return
-            if post:
-                try:
-                    if self.headers.get('Origin')!=account_origin():
-                        self.respond(403,{'error':'Источник запроса не разрешён.'});return
-                    size=int(self.headers.get('Content-Length','0'))
-                    if not 0<size<=8192:raise ValueError()
-                    if self.headers.get('Content-Type','').split(';')[0]!='application/json':raise ValueError()
-                    data=json.loads(self.rfile.read(size))
-                    if not isinstance(data,dict):raise ValueError()
-                except (ValueError,TypeError):
-                    self.respond(400,{'error':'Некорректный запрос.'});return
-                coroutine=manager.action(authorization,data)
-            else:coroutine=manager.screen(authorization)
-            future=asyncio.run_coroutine_threadsafe(coroutine,loop)
+class AccountWebServer:
+    """One Render HTTP port, with authenticated WebSocket-to-local-VNC relay."""
+    COOKIE = '__Host-opensooq-desktop'
+
+    def __init__(self, service, assets=None):
+        self.service = service
+        self.assets = Path(assets or '/opt/novnc').resolve()
+        self.runner = None
+        self.site = None
+        self.connections = set()
+        service.account_web = self
+
+    @staticmethod
+    def security_headers():
+        return {
+            'Cache-Control': 'no-store, max-age=0', 'Referrer-Policy': 'no-referrer',
+            'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY',
+            'Content-Security-Policy': "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data: blob:; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+        }
+
+    def credential(self, request):
+        header = request.headers.get('Authorization')
+        return header if header is not None else 'Bearer ' + request.cookies.get(self.COOKIE, '')
+
+    def check(self, request, origin=False, header_only=False):
+        from aiohttp import web
+        credential = request.headers.get('Authorization', '') if header_only else self.credential(request)
+        if not self.service.account_login.authorized(credential):
+            raise web.HTTPUnauthorized(text='Доступ истёк. Получите ссылку командой /account.')
+        if origin and request.headers.get('Origin') != account_origin():
+            raise web.HTTPForbidden(text='Источник запроса не разрешён.')
+        return credential
+
+    async def request_json(self, request):
+        from aiohttp import web
+        if request.content_type != 'application/json':
+            raise web.HTTPBadRequest(text='Нужен JSON-запрос.')
+        try:
+            raw = await request.read()
+            if not 0 < len(raw) <= 8192:
+                raise ValueError()
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError()
+            return data
+        except (ValueError, TypeError):
+            raise web.HTTPBadRequest(text='Некорректный запрос.') from None
+
+    def create_app(self):
+        from aiohttp import web
+
+        @web.middleware
+        async def errors(request, handler):
             try:
-                result=future.result(timeout=40)
-                self.respond(200,result,'application/json; charset=utf-8' if post else 'image/png')
-            except PermissionError:self.respond(401,{'error':'Доступ истёк. Получите новую ссылку.'})
-            except (ValueError,DialogueUnavailable) as exc:self.respond(400,{'error':str(exc)[:600]})
+                response = await handler(request)
+            except web.HTTPException as error:
+                response = web.json_response({'error': error.text[:500]}, status=error.status)
+            except PermissionError:
+                response = web.json_response({'error': 'Доступ истёк. Получите ссылку командой /account.'}, status=401)
+            except DialogueUnavailable as error:
+                response = web.json_response({'error': str(error)[:600]}, status=503)
+            except ValueError as error:
+                response = web.json_response({'error': str(error)[:600]}, status=400)
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                future.cancel()
-                # Никаких содержимых полей, cookie, токенов и исключений браузера в ответе/логе.
-                self.respond(503,{'error':'Браузер не ответил. Откройте новую ссылку через /account.'})
-        def do_GET(self):
-            if self.path in {'/','/healthz'}:self.respond(200,b'ok','text/plain')
-            elif self.path=='/account':self.respond(200,ACCOUNT_PAGE.encode(),'text/html; charset=utf-8')
-            elif self.path=='/account-api/screen':self.api()
-            else:self.respond(404,{'error':'Не найдено.'})
-        def do_POST(self):
-            if self.path=='/account-api/action':self.api(post=True)
-            else:self.respond(404,{'error':'Не найдено.'})
-    return Handler
+                # No exception details, account input, cookies or URLs in server logs.
+                log.warning('[account_web] operation_failed')
+                response = web.json_response({'error': 'Удалённый экран не ответил. Отправьте /account_diag; повторного ввода не было.'}, status=503)
+            if not response.prepared:
+                response.headers.update(self.security_headers())
+            return response
+
+        app = web.Application(middlewares=[errors], client_max_size=8192)
+        app.router.add_get('/', self.health)
+        app.router.add_get('/healthz', self.health)
+        app.router.add_get('/account', self.page)
+        app.router.add_post('/account-api/connect', self.connect)
+        app.router.add_get('/account-api/state', self.state)
+        app.router.add_post('/account-api/action', self.action)
+        app.router.add_get('/account-api/desktop', self.desktop)
+        app.router.add_get('/account-assets/{name:.*}', self.asset)
+        return app
+
+    async def health(self, request):
+        from aiohttp import web
+        return web.Response(text='ok')
+
+    async def page(self, request):
+        from aiohttp import web
+        return web.Response(text=ACCOUNT_PAGE, content_type='text/html')
+
+    async def connect(self, request):
+        from aiohttp import web
+        credential = self.check(request, origin=True, header_only=True)
+        await self.request_json(request)
+        if not self.assets.joinpath('core/rfb.js').is_file():
+            raise DialogueUnavailable('Файлы удалённого экрана отсутствуют. Замените dockerfile на v22 и дождитесь сборки.')
+        manager = self.service.account_login
+        async with manager.lock:
+            if not manager.authorized(credential):
+                raise PermissionError()
+            await manager._open()
+            await manager.collect_flags(force=True)
+            if 'wait' in manager.diag_flags:
+                raise ValueError('OpenSooq просит подождать. Ввод остановлен; срок ожидания сайт не указал.')
+            await manager.page.bring_to_front()
+            token = manager.token
+            remaining = max(1, int(manager.expires - time.monotonic()))
+        response = web.json_response({'message': 'Chrome готов. Войдите в OpenSooq на удалённом экране.', 'version': 22})
+        response.set_cookie(self.COOKIE, token, max_age=remaining, path='/', secure=True, httponly=True, samesite='Strict')
+        return response
+
+    async def state(self, request):
+        from aiohttp import web
+        self.check(request)
+        manager = self.service.account_login
+        paused = 'wait' in manager.diag_flags
+        return web.json_response({'active': True, 'paused': paused,
+                                  'message': 'OpenSooq просит подождать. Ввод остановлен; срок сайт не указал.' if paused else ''})
+
+    async def action(self, request):
+        from aiohttp import web
+        credential = self.check(request, origin=True)
+        data = await self.request_json(request)
+        if data.get('action') not in {'login', 'chats', 'save', 'close', 'focus'}:
+            raise ValueError('Действие не поддерживается.')
+        result = await asyncio.wait_for(self.service.account_login.action(credential, data), 40)
+        response = web.json_response(result)
+        if result.get('finished'):
+            response.del_cookie(self.COOKIE, path='/', secure=True, httponly=True, samesite='Strict')
+        return response
+
+    async def asset(self, request):
+        from aiohttp import web
+        self.check(request)
+        name = request.match_info['name']
+        path = (self.assets / name).resolve()
+        if (not path.is_relative_to(self.assets) or name.split('/', 1)[0] not in {'core', 'vendor'}
+                or path.suffix not in {'.js', '.css', '.json', '.png', '.svg'} or not path.is_file()):
+            raise web.HTTPNotFound(text='Не найдено.')
+        response = web.FileResponse(path)
+        if path.suffix == '.js':
+            response.content_type = 'text/javascript'
+        return response
+
+    async def desktop(self, request):
+        from aiohttp import web, WSMsgType
+        credential = self.check(request, origin=True)
+        manager = self.service.account_login
+        if 'wait' in manager.diag_flags:
+            raise web.HTTPConflict(text='OpenSooq просит подождать. Ввод остановлен.')
+        if len(self.connections) >= 2:
+            raise web.HTTPConflict(text='Закройте другие вкладки удалённого экрана.')
+        display = self.service.account_browser.desktop
+        if not display.running or display.port is None:
+            raise DialogueUnavailable('Удалённый экран закрыт. Отправьте /account_diag.')
+        reader, writer = await asyncio.wait_for(asyncio.open_connection('127.0.0.1', display.port), 3)
+        ws = web.WebSocketResponse(protocols=('binary',), heartbeat=20, max_msg_size=1024*1024, compress=False)
+        tasks = []
+        try:
+            if not manager.authorized(credential) or 'wait' in manager.diag_flags:
+                raise PermissionError()
+            ws.headers.update(self.security_headers())
+            await ws.prepare(request)
+            self.connections.add(ws)
+
+            async def browser_to_phone():
+                while True:
+                    data = await reader.read(65536)
+                    if not data:
+                        break
+                    if not manager.authorized(credential):
+                        break
+                    await ws.send_bytes(data)
+
+            async def phone_to_browser():
+                async for message in ws:
+                    if not manager.authorized(credential) or 'wait' in manager.diag_flags:
+                        break
+                    if message.type == WSMsgType.BINARY:
+                        writer.write(message.data)
+                        await writer.drain()
+                    elif message.type in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR}:
+                        break
+                    elif message.type == WSMsgType.TEXT:
+                        break
+
+            async def lifetime():
+                while manager.authorized(credential):
+                    if 'wait' in manager.diag_flags:
+                        break
+                    await asyncio.sleep(0.5)
+                    # Observation only: no login requests, clicks or submissions.
+                    async with manager.lock:
+                        if manager.authorized(credential):
+                            await manager.collect_flags()
+
+            tasks = [asyncio.create_task(coroutine()) for coroutine in
+                     (browser_to_phone, phone_to_browser, lifetime)]
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self.connections.discard(ws)
+            writer.close()
+            with suppress(Exception):
+                await writer.wait_closed()
+            if ws.prepared:
+                await ws.close()
+        return ws
+
+    async def disconnect_viewers(self):
+        # Called on Save, Close, expiry, a new link and account_off.
+        for ws in tuple(self.connections):
+            with suppress(Exception):
+                await asyncio.wait_for(ws.close(), 2)
+
+    async def start(self, port):
+        from aiohttp import web
+        self.runner = web.AppRunner(self.create_app(), access_log=None, shutdown_timeout=3)
+        await self.runner.setup()
+        self.site = web.TCPSite(self.runner, '0.0.0.0', port)
+        try:
+            await self.site.start()
+        except BaseException:
+            await self.runner.cleanup()
+            self.runner = self.site = None
+            raise
+
+    async def close(self):
+        await self.disconnect_viewers()
+        if self.runner is not None:
+            await self.runner.cleanup()
+            self.runner = self.site = None
 
 
 
@@ -3972,9 +4243,8 @@ def build_app(token, allowed, database):
         app.bot_data["service"] = service
         log.info("[startup] database=%s data_dir=%s browser=%s proxy=%s", Path(database).resolve(), DATA_DIR.resolve(), USE_BROWSER, bool(service.reader.proxy_url))
         if os.getenv("PORT"):
-            server = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT"])), make_http_handler(service,asyncio.get_running_loop()))
-            server.daemon_threads=True
-            threading.Thread(target=server.serve_forever, daemon=True).start()
+            server = AccountWebServer(service)
+            await server.start(int(os.environ["PORT"]))
             app.bot_data["health_server"] = server
         if app.job_queue is None:
             raise RuntimeError('Установите python-telegram-bot с дополнением [job-queue].')
@@ -3997,8 +4267,7 @@ def build_app(token, allowed, database):
     async def cleanup(app):
         server = app.bot_data.pop("health_server", None)
         if server:
-            await asyncio.to_thread(server.shutdown)
-            server.server_close()
+            await server.close()
         service = app.bot_data.pop("service", None)
         if service:
             await service.close()
@@ -4106,7 +4375,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v21_webkit] Создание Telegram Application")
+    log.info("[boot_v22_chrome_desktop] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
