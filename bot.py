@@ -2614,7 +2614,7 @@ class DialogueUnavailable(ValueError):
 class PersistentOpenSooqBrowser:
     """Один выделенный профиль и один браузер для ручного входа и переписки."""
     def __init__(self, directory=None):
-        self.directory=Path(directory) if directory is not None else DATA_DIR/'opensooq-browser-profile'
+        self.directory=Path(directory) if directory is not None else DATA_DIR/'opensooq-browser-profile-clean'
         self.lock=asyncio.Lock()
         self.pw=self.context=self.page=None
         self._file_lock=None
