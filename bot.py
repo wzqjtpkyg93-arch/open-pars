@@ -1068,9 +1068,6 @@ class Service:
                 link TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', applied INTEGER NOT NULL DEFAULT 0,
                 created REAL NOT NULL, checked REAL NOT NULL DEFAULT 0, network TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS account_alerts(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,message TEXT NOT NULL,
-                created REAL NOT NULL,sent INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS saved_searches(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat INTEGER NOT NULL,
@@ -1088,19 +1085,9 @@ class Service:
         self.closing = False
         self.subscription_table = "subscriptions_test" if XROCKET_TESTNET else "subscriptions"
         self.billing = Billing(self)
-        self._account_block_task = None
         self.account_browser = PersistentOpenSooqBrowser()
         self.dialogues = SellerDialogues(self)
         self.account_login = AccountLogin(self)
-        self.account_browser.on_account_blocked=self.account_blocked
-
-    def account_blocked(self):
-        if self.closing or self._account_block_task is not None:
-            return
-        self.dialogues.transport.disabled=True
-        self.dialogues.transport.saved_enabled=False
-        self.dialogues.cancelled.update(r['id'] for r in self.db.execute('SELECT id FROM seller_dialogues WHERE chat=?',(ADMIN_ID,)))
-        self._account_block_task=asyncio.create_task(reset_blocked_account(self))
 
     def permitted(self, chat):
         if chat == ADMIN_ID:
@@ -1181,7 +1168,6 @@ class Service:
         return True
 
     async def tick(self, context):
-        await deliver_account_alerts(self)
         if SUBSCRIPTIONS_ENABLED:
             active = set(self.tasks) | {r["chat"] for r in self.db.execute("SELECT chat FROM users WHERE enabled=1")}
             for chat in active:
@@ -1451,8 +1437,6 @@ class Service:
         await self.account_login.close()
         await self.dialogues.close()
         await self.account_browser.close()
-        if self._account_block_task is not None:
-            await asyncio.gather(self._account_block_task,return_exceptions=True)
         self.db.close()
 
 
@@ -1846,7 +1830,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     raise ValueError('Включите Web Service с PORT на Render для страницы входа.')
                 token=await service.account_login.issue(country)
                 keyboard=InlineKeyboardMarkup([[InlineKeyboardButton('🔐 Войти в OpenSooq',url=origin+'/account#'+token)]])
-                await message.reply_text("🔐 "+COUNTRY_LABELS[country]+"\n\nОткрой ссылку, войди в аккаунт, выбери существующий чат и нажми «Сохранить вход». Ссылка действует 15 минут.",reply_markup=keyboard)
+                await message.reply_text("Страна входа: "+COUNTRY_LABELS[country]+"\n\n🔐 Личный удалённый экран Chrome на 15 минут. Откройте ссылку в Safari. Внутри будет настоящее окно Chrome с адресной строкой. Сначала войдите через главную OpenSooq, затем откройте существующий чат и нажмите «Сохранить вход». На iPhone текст можно вводить полем под экраном. Бот продолжит использовать этот же браузер и профиль. Активные диалоги на паузе. Используется OPENSOOQ_PROXY_URL, если задан; прямого повтора при его ошибке нет. Если сайт просит подождать, ввод останавливается. Ссылку не пересылайте; коды в Telegram вводить не нужно.",reply_markup=keyboard)
             else:
                 await disconnect_opensooq_account(service)
                 await message.reply_text("⏸ Аккаунт отключён от автоответчика, активные диалоги остановлены. Парсер работает как раньше.")
@@ -1863,11 +1847,11 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with dialogs.lock:
                 with dialogs.db:
                     dialogs.db.execute("UPDATE seller_dialogues SET state='paused',note='Остановлен владельцем' WHERE chat=? AND state IN ('queued','waiting','sending','approved')",(ADMIN_ID,))
-            await message.reply_text("⏸ Пауза во всех диалогах остановлены.")
+            await message.reply_text("⏸ Отправка во всех диалогах приостановлена.")
         elif command == "/chatstatus":
             worker=service.dialogues.transport
             mode='постоянный профиль' if worker.profile_mode else 'прежний файл сессии или ещё не подключён'
-            await message.reply_text("💬 Аккаунт: "+("подключён" if worker.configured() else "не подключён")+"\n/account — подключить\n/dialogs — диалоги\n/phrases — фразы\n/account_off — отключить")
+            await message.reply_text("Переписка на Render: "+("настройки заданы; вход проверяется при запуске диалога." if worker.configured() else "не подключена.")+"\nРежим: "+mode+".\nПодключить аккаунт с телефона: /account. Отключить: /account_off. Для сохранения после перезапуска DATA_DIR должен находиться на постоянном диске Render. Коды и профиль в Telegram не присылайте.")
         elif command == "/dialog":
             try:
                 url=safe_url(message.text.split(maxsplit=1)[1])
@@ -2897,7 +2881,6 @@ class PersistentOpenSooqBrowser:
         self.startup_stage='idle'
         self.startup_issue=''
         self.on_blocked=None
-        self.on_account_blocked=None
 
     def _acquire_profile(self):
         import fcntl
@@ -2935,29 +2918,6 @@ class PersistentOpenSooqBrowser:
                 return
         await route.continue_()
 
-    async def _watch_account_response(self, response):
-        if self.on_account_blocked is not None and await explicit_account_block_response(response):
-            self.on_account_blocked()
-
-    async def clear_login_data(self):
-        async with self.lock:
-            await self._shutdown()
-            expected=DATA_DIR/'opensooq-chrome-profile'
-            if self.directory.is_symlink() or self.directory.resolve()!=expected.resolve():
-                raise ValueError('Unexpected browser profile path')
-            self._acquire_profile()
-            try:
-                # Retain the lock inode; never touch the bot database or DATA_DIR itself.
-                for item in self.directory.iterdir():
-                    if item.name=='.bot-profile.lock':
-                        continue
-                    if item.is_symlink() or not item.is_dir():
-                        item.unlink()
-                    else:
-                        shutil.rmtree(item)
-            finally:
-                self._release_profile()
-
     async def get_page(self):
         async with self.lock:
             if self.context is not None and self.desktop.running:
@@ -2988,7 +2948,6 @@ class PersistentOpenSooqBrowser:
                     str(self.directory),**launch_options,locale='en-US',
                     accept_downloads=False,timeout=30000)
                 self.context.on('close',self._context_closed)
-                self.context.on('response',self._watch_account_response)
                 await self.context.route('**/*',self._restrict_navigation)
                 pages=[page for page in self.context.pages if not page.is_closed()]
                 self.page=pages[0] if pages else await self.context.new_page()
@@ -3080,97 +3039,6 @@ async def disconnect_opensooq_account(service):
 
 
 
-ACCOUNT_BLOCK_PATTERN = re.compile(
-    r'^(?:your\s+)?account\s+(?:(?:has\s+been|is)\s+)?(?:blocked|suspended|disabled)[.!]?$'
-    r'|^تم\s+(?:حظر|تعليق|إيقاف)\s+حسابك[.!]?$'
-    r'|^حسابك\s+(?:محظور|موقوف)[.!]?$', re.I)
-
-
-async def account_blocked_screen(page):
-    """Only official system dialogs/alerts; never classify seller message text."""
-    try:
-        parsed=urlsplit(page.url)
-        host=parsed.hostname or ''
-        if parsed.scheme!='https' or (host!='opensooq.com' and not host.endswith('.opensooq.com')):
-            return False
-        nodes=await page.locator('[role="alert"], [role="dialog"]').get_by_text(ACCOUNT_BLOCK_PATTERN,exact=True).all()
-        for item in nodes[:8]:
-            if (await item.is_visible() and not await item.evaluate('(el) => Boolean(el.closest(\'[id^="msg-"]\'))')):
-                return True
-    except Exception:
-        pass
-    return False
-
-
-async def explicit_account_block_response(response):
-    try:
-        parsed=urlsplit(response.url)
-        host=parsed.hostname or ''
-        if (parsed.scheme!='https' or (host!='opensooq.com' and not host.endswith('.opensooq.com'))
-                or not 400<=int(response.status)<500):
-            return False
-        segments=set(re.split(r'[^a-z]+',parsed.path.casefold()))
-        if not segments & {'login','signin','auth','authenticate','authentication','authorization','session','sessions','password','token'}:
-            return False
-        headers=response.headers
-        kind=headers.get('content-type','').partition(';')[0].strip().lower()
-        if kind!='application/json' and not (kind.startswith('application/') and kind.endswith('+json')):
-            return False
-        length=headers.get('content-length')
-        if length is not None and (not length.isdecimal() or int(length)>32768):
-            return False
-        raw=await asyncio.wait_for(response.body(),2)
-        if len(raw)>32768:
-            return False
-        return 'account_rejected' in login_error_labels(json.loads(raw))
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        return False
-
-
-async def deliver_account_alerts(service):
-    if service.closing:
-        return
-    rows=list(service.db.execute('SELECT * FROM account_alerts WHERE sent=0 ORDER BY id LIMIT 5'))
-    for row in rows:
-        try:
-            await telegram_call(service.bot.send_message,chat_id=ADMIN_ID,text=row['message'])
-        except TelegramError:
-            log.warning('[account_alert] delivery_pending')
-            return
-        with service.db:
-            service.db.execute('UPDATE account_alerts SET sent=1 WHERE id=?',(row['id'],))
-
-
-async def reset_blocked_account(service):
-    cleaned=False
-    try:
-        await service.account_login.close()
-        dialogs=service.dialogues
-        async with dialogs.lock:
-            dialogs.cancelled.update(r['id'] for r in dialogs.db.execute('SELECT id FROM seller_dialogues WHERE chat=?',(ADMIN_ID,)))
-            dialogs.transport.disabled=True
-            dialogs.transport.saved_enabled=False
-            dialogs.transport.account=''
-            dialogs.transport.blocked=True
-            write_account_metadata({'_opensooq_chat_enabled':False,'_opensooq_account_status':'blocked'})
-            with dialogs.db:
-                dialogs.db.execute("UPDATE seller_dialogues SET state='paused',note='OpenSooq сообщил о блокировке аккаунта' WHERE chat=? AND state IN ('queued','waiting','approved','sending','review')",(ADMIN_ID,))
-                dialogs.db.execute('DELETE FROM dialogue_approvals')
-            await dialogs.transport.close()
-            await service.account_browser.clear_login_data()
-            cleaned=True
-    except Exception:
-        log.warning('[blocked_account] cleanup_incomplete')
-    message='⛔ OpenSooq сообщил о блокировке аккаунта. Отправка остановлена. '
-    message+=('Данные входа удалены из браузера.' if cleaned else 'Очистить данные браузера полностью не удалось. Проверь сервер.')
-    with service.db:
-        service.db.execute('INSERT INTO account_alerts(message,created) VALUES (?,?)',(message,time.time()))
-    await deliver_account_alerts(service)
-
-
-
 class OpenSooqChatBrowser:
     """Обычный интерфейс сайта. Секрет сессии создаёт владелец вне чата Telegram."""
     def __init__(self, profile=None):
@@ -3242,11 +3110,6 @@ class OpenSooqChatBrowser:
         if parsed.scheme != 'https' or parsed.hostname not in HOSTS | {'my.opensooq.com'}:
             raise DialogueUnavailable('Некорректный адрес диалога.')
         await self.page.goto(url, wait_until='domcontentloaded', timeout=30000)
-        if await account_blocked_screen(self.page):
-            self.blocked=True
-            if self.profile is not None and self.profile.on_account_blocked is not None:
-                self.profile.on_account_blocked()
-            raise DialogueUnavailable('OpenSooq сообщил о блокировке аккаунта.')
         title = await self.page.title()
         if re.search(r'just a moment|access denied|access restricted|verify.*human', title, re.I):
             self.blocked = True
@@ -3813,10 +3676,10 @@ ACCOUNT_PAGE = r'''<!doctype html>
 <p id="status" role="status" aria-live="polite">Запускаем Chrome и удалённый экран…</p>
 <button id="reconnect" class="secondary">Подключить экран снова</button>
 <div id="desktop" aria-label="Удалённый экран Chrome"></div>
-<div id="keyboard-box"><small>Для ввода с iPhone сначала нажмите поле внутри Chrome, затем введите его полное значение здесь. «Заменить текст» заполнит выбранное поле целиком. Enter отправляйте отдельно.</small>
+<div id="keyboard-box"><small>Для ввода с iPhone сначала нажмите поле внутри Chrome, затем введите его полное значение здесь. «Заменить текст» выделит прежний текст в выбранном поле и введёт новый. Enter отправляйте отдельно.</small>
 <input id="entry" type="password" maxlength="200" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="Номер, пароль или код для выбранного поля" aria-label="Текст для выбранного поля Chrome">
 <div class="row"><button id="type" data-control>Заменить текст</button><button id="enter" data-control>Enter / Далее</button><button id="backspace" class="secondary" data-control>Backspace</button><button id="tab" class="secondary" data-control>Tab</button></div></div>
-<small>Личная ссылка действует 15 минут. Не пересылай её. Если сайт просит подождать, сделай паузу.</small>
+<small>Ссылка действует 15 минут. Пароли и коды вводятся на этой странице. Не пересылайте ссылку. Если OpenSooq просит подождать, ввод останавливается. Само подключение браузера сообщений не отправляет.</small>
 </main><script type="module">
 'use strict';
 const token=location.hash.slice(1);history.replaceState(null,'','/account');
@@ -4036,7 +3899,7 @@ class AccountLogin:
     def diagnostic_text(self):
         if not self.diag_exists:
             return 'Диагностика пуста. /account_diag не открывает сайт и не повторяет вход. Старые попытки этой версией не наблюдались.'
-        lines=['Диагностика входа v25 Chrome Desktop',
+        lines=['Диагностика входа v26 Chrome Desktop',
                'Страна: '+COUNTRY_LABELS.get(self.country,self.country),
                'Доступ к странице: '+('активен' if self.active and time.monotonic()<self.expires else 'закрыт или истёк'),
                'Браузер входа: Google Chrome с видимым окном, удалённый экран noVNC, постоянный профиль. '+('Настроен общий прокси OPENSOOQ_PROXY_URL; прямого повтора при его ошибке нет.' if self.service.reader.browser_proxy is not None else 'Прямое соединение: OPENSOOQ_PROXY_URL не задан.')]
@@ -4054,8 +3917,7 @@ class AccountLogin:
         flags={'captcha_failed':'На странице: reCAPTCHA verification failed.',
                'unauthorized':'На странице: Unauthorized. Точная причина не раскрыта.',
                'wait':'Сайт просит подождать перед повторным входом.',
-               'browser_error':'Не удалось открыть браузер входа.',
-               'account_blocked':'OpenSooq сообщил о блокировке аккаунта.'}
+               'browser_error':'Не удалось открыть браузер входа.'}
         lines.extend(flags[k] for k in sorted(self.diag_flags) if k in flags)
         if self.diag_events:
             lines.append('Последние запросы авторизации и ошибки:')
@@ -4205,9 +4067,6 @@ class AccountLogin:
         if self.page is None or (not force and time.monotonic()-self.last_diag_check<3):
             return
         self.last_diag_check=time.monotonic()
-        if await account_blocked_screen(self.page):
-            self.diag_flags.add('account_blocked')
-            self.service.account_blocked()
         for frame in self.page.frames[:30]:
             try:
                 host=urlsplit(frame.url).hostname or ''
@@ -4243,10 +4102,6 @@ class AccountLogin:
         await candidates[0].fill(value,timeout=5000)
 
     async def issue(self,country='sa'):
-        cleanup=getattr(self.service,'_account_block_task',None)
-        if cleanup is not None:
-            await asyncio.shield(cleanup)
-            self.service._account_block_task=None
         if country not in COUNTRIES:
             raise ValueError('Неизвестная страна аккаунта.')
         async with self.lock:
@@ -4372,8 +4227,6 @@ class AccountLogin:
             return {'message':'Проверьте результат в окне Chrome. Вход подтверждается отдельно кнопкой «Сохранить вход».'}
 
     async def _save(self):
-        if 'account_blocked' in self.diag_flags or getattr(self.service,'_account_block_task',None) is not None:
-            raise ValueError('OpenSooq сообщил о блокировке аккаунта. Сохранение отключено.')
         url=urlsplit(self.page.url)
         room=dict(parse_qsl(url.query)).get('selectedRoom','')
         match=re.fullmatch(r'\d+-\d+-(\d+)',room)
@@ -4400,8 +4253,8 @@ class AccountLogin:
             dialogs.transport.profile_engine='chrome-headed-v22'
         await self._close()
         with suppress(TelegramError):
-            await self.service.bot.send_message(chat_id=ADMIN_ID,text='✅ Аккаунт подключён.\n/dialogs — диалоги\n/phrases — фразы автоответчика')
-        return {'finished':True,'message':'✅ Аккаунт подключён. Вернись в Telegram.'}
+            await self.service.bot.send_message(chat_id=ADMIN_ID,text='✅ Вход подтверждён. Переписка использует тот же постоянный профиль браузера. Диалоги, остановленные при открытии /account, остаются на паузе. Запуск — кнопкой у выбранного объявления. /chatstatus — состояние, /account_off — отключение.')
+        return {'finished':True,'message':'Вход подтверждён, профиль сохранён. Браузер остаётся доступен боту; прежние диалоги на паузе.'}
 
     async def _detach_page(self):
         remote=getattr(self.service,'account_web',None)
@@ -4552,7 +4405,7 @@ class AccountWebServer:
             await manager.page.bring_to_front()
             token = manager.token
             remaining = max(1, int(manager.expires - time.monotonic()))
-        response = web.json_response({'message': 'Chrome готов. Войдите в OpenSooq на удалённом экране.', 'version': '25'})
+        response = web.json_response({'message': 'Chrome готов. Войдите в OpenSooq на удалённом экране.', 'version': '26'})
         response.set_cookie(self.COOKIE, token, max_age=remaining, path='/', secure=True, httponly=True, samesite='Strict')
         return response
 
@@ -4825,7 +4678,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v25_dialogue_suggestions] Создание Telegram Application")
+    log.info("[boot_v26_dialogues] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
