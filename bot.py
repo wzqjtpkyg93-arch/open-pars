@@ -1847,7 +1847,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with dialogs.lock:
                 with dialogs.db:
                     dialogs.db.execute("UPDATE seller_dialogues SET state='paused',note='Остановлен владельцем' WHERE chat=? AND state IN ('queued','waiting','sending','approved')",(ADMIN_ID,))
-            await message.reply_text("⏸ Отправка во всех диалогах приостановлена.")
+            await message.reply_text("⏸ Автоответы во всех диалогах остановлены.")
         elif command == "/chatstatus":
             worker=service.dialogues.transport
             mode='постоянный профиль' if worker.profile_mode else 'прежний файл сессии или ещё не подключён'
@@ -1870,8 +1870,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await message.reply_text(str(exc)[:800] if not isinstance(exc,IndexError) else "Используйте /dialog ССЫЛКА_НА_ОБЪЯВЛЕНИЕ")
         else:
             await dialogue_panel(update,context)
-        return
-    if await dialogue_settings_message(update, context):
         return
     if await billing_message(update, context):
         return
@@ -2559,64 +2557,55 @@ async def billing_callback(update, context):
 
 
 # Переписка с продавцами: один выбранный товар, один вопрос после нового ответа.
-DIALOG_QUESTIONS = ('Hii I’m interested in this item. Is it still available?', 'Is everything in good condition?', 'How long have u been using it?', 'Why are u selling?', 'Do u still have the receipt?', 'Is that your final price?', 'Okay I’m ready to buy. Can I place an order with delivery through the OpenSooq app?')
-LEGACY_DIALOG_QUESTIONS = ("Hi! I'm interested in this item. Is it still available?", 'Is everything in good condition?', 'How long have you been using it?', 'Why are you selling it?', 'Do you still have the receipt?', 'Is that your final price?')
+DIALOG_QUESTIONS = (
+    "Hi! I'm interested in this item. Is it still available?",
+    "Is everything in good condition?",
+    "How long have you been using it?",
+    "Why are you selling it?",
+    "Do you still have the receipt?",
+    "Is that your final price?",
+)
 
 
 def dialogue_answer(text, stage, answered):
-    """Choose the next prepared question; uncertain replies require the owner."""
+    """Консервативный сценарий. Неясный ответ отдаём владельцу, не угадываем."""
     text = unicodedata.normalize('NFKC', text).casefold().strip()
-    text = re.sub(r'[\u064b-\u065f\u0670ـ]', '', text)
     text = re.sub(r'\s+', ' ', text.replace('’', "'"))
     answered = set(answered)
-    if stage not in range(len(DIALOG_QUESTIONS)):
-        return 'review', answered, None
-    if re.search(r"\b(stop messaging|stop contacting|do not contact|don't contact|leave me alone|not interested)\b|لا تراسل", text):
+    if re.search(r"\b(sold|not available|no longer available|already gone|stop messaging|do not contact|don't contact|leave me alone)\b|مباع|لا تراسل", text):
         return 'stopped', answered, None
-    if not text or re.fullmatch(r'(?:hi|hello|hey|good morning|good evening|مرحبا|السلام عليكم)[.!\s👋🙂😊]*', text):
+    if not text or re.fullmatch(r'(hi|hello|hey|good morning|good evening|مرحبا|السلام عليكم)[.! ]*', text):
         return 'wait', answered, None
-    if re.search(r"https?://|www\.|[?؟]|\b(pay|payment|deposit|transfer|whatsapp|telegram|ignore previous|send money|delivery fee|you want|do you|are you|can you|will you|call me|contact me|not sure|unsure|don.t know|do not know|maybe|perhaps|i think|but|however)\b", text):
+    # Вопрос продавца или предложение перевода/внешнего перехода требует человека.
+    if re.search(r'https?://|\?|\b(pay|deposit|transfer|whatsapp|telegram|ignore previous|send money|delivery fee|you want|do you|are you|can you|will you)\b', text):
         return 'review', answered, None
-    availability = text.replace('not sold', 'unsold')
-    if re.search(r'\b(sold|not available|unavailable|no longer available|already gone)\b|مباع|غير متوفر', availability):
+    yes = bool(re.search(r'\b(yes|yeah|yep|sure|ok|okay|available|of course)\b|نعم|متوفر', text))
+    no = bool(re.search(r"\b(no|nope|not|isn't|doesn't|don't|broken|damaged|faulty)\b|ليس|لا يوجد", text))
+    if stage == 0 and re.fullmatch(r'(no|nope|sorry no)[.! ]*', text):
         return 'stopped', answered, None
-    if stage == 0 and re.fullmatch(r'(?:no|nope|sorry[,]? no)[.!\s]*', text):
-        return 'stopped', answered, None
-    normalized = re.sub(r'\bno (?:issues?|problems?|defects?|damage|faults?)\b', 'issuefree', availability)
-    negative = bool(re.search(r"\b(no|nope|not|isn't|doesn't|don't|isnt|doesnt|broken|damaged|faulty|problem|issue|defect)\b|ليس|لا يوجد|غير", normalized))
-    yes = bool(re.search(r'\b(yes|yeah|yep|yup|sure|ok|okay|available|of course|certainly)\b|نعم|متوفر|ايوه', normalized))
-    good = bool(re.search(r'\b(fine|good|excellent|perfect|mint|working|works well|works perfectly|brand new|like new|issuefree)\b|ممتاز|جيد|تمام', normalized)) and not negative
-    duration = bool(re.search(r'\b(?:\d+(?:[.,]\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|a|an|few|couple of)\s*(?:days?|weeks?|months?|years?|hrs?|hours?)\b|\b(?:since\s+(?:20\d{2}|last year|last month)|never used|unused|brand new)\b', text))
-    reason = bool(re.search(r'\b(because|moving|relocat\w*|upgrad\w*|bought another|no longer need|need money|not using|dont use|do not use|leaving the country)\b', text))
-    if good:
+    if re.search(r'\b(good|excellent|perfect|mint|working|brand new|like new)\b', text) and not no:
         answered.add(1)
-    if duration:
+    if re.search(r'\b\d+\s*(days?|weeks?|months?|years?|hrs?|hours?)\b|\b(never used|unused|brand new)\b', text):
         answered.add(2)
-    if reason:
+    if re.search(r'\b(because|moving|upgrad\w*|bought another|no longer need|need money)\b', text):
         answered.add(3)
-    if re.search(r'\b(receipt|invoice|proof of purchase)\b', text) and (yes or negative or re.search(r'\b(have|lost|included|missing)\b', text)):
-        answered.add(4)
+    if re.search(r'\b(receipt|invoice|proof of purchase)\b', text):
+        if yes or no or re.search(r'\b(have|lost|included|missing)\b', text):
+            answered.add(4)
     if re.search(r'\b(price is firm|price is final|final price|no negotiation)\b', text):
         answered.add(5)
-    if stage == 0 and yes and not negative:
+    if stage == 0 and yes and not no:
         answered.add(0)
-    elif stage == 1 and (good or (yes and not negative)):
+    elif stage == 1 and yes and not no:
         answered.add(1)
-    elif stage == 4 and (yes or negative):
+    elif stage == 4 and (yes or no):
         answered.add(4)
-    elif stage == 5 and (yes or negative or re.search(r'\b(final|firm|lowest|negotiable)\b|(?<!\d)\d{1,6}(?:[.,]\d{1,2})?(?!\d)', text)):
+    elif stage == 5 and (yes or no or re.search(r'\d|\b(final|firm|lowest|negotiable)\b', text)):
         answered.add(5)
     if stage not in answered:
         return 'review', answered, None
     next_stage = next((i for i in range(stage + 1, len(DIALOG_QUESTIONS)) if i not in answered), None)
     return ('complete' if next_stage is None else 'next'), answered, next_stage
-
-
-def dialogue_questions(value):
-    allowed=(DIALOG_QUESTIONS, LEGACY_DIALOG_QUESTIONS+(DIALOG_QUESTIONS[-1],))
-    if not isinstance(value,(list,tuple)) or tuple(value) not in allowed:
-        raise ValueError('Доступен фиксированный сценарий из семи вопросов.')
-    return tuple(value)
 
 
 class DialogueUnavailable(ValueError):
@@ -3063,7 +3052,6 @@ class OpenSooqChatBrowser:
                 self.profile_engine=str(meta.get('_opensooq_profile_engine') or '')
         self.blocked = False
         self.guard = lambda: True
-        self.questions = tuple(DIALOG_QUESTIONS)
 
     def configured(self):
         enabled=self.saved_enabled or os.getenv('OPENSOOQ_CHAT_ENABLED','0')=='1'
@@ -3172,7 +3160,7 @@ class OpenSooqChatBrowser:
 
     async def send(self, text, after):
         # Только заранее заданные вопросы; произвольный текст продавца не исполняется.
-        if text not in self.questions:
+        if text not in DIALOG_QUESTIONS:
             raise DialogueUnavailable('Вопрос отсутствует в согласованном сценарии.')
         box = self.page.get_by_placeholder('Message Text...', exact=True)
         await box.fill(text)
@@ -3200,7 +3188,7 @@ class OpenSooqChatBrowser:
             raise DialogueUnavailable('Профиль продавца в объявлении изменился. Отправка остановлена.')
         box = self.page.get_by_placeholder('Message...', exact=True)
         await box.wait_for(state='visible')
-        await box.fill(self.questions[0])
+        await box.fill(DIALOG_QUESTIONS[0])
         if not self.guard():
             raise DialogueUnavailable('Диалог остановлен владельцем.')
         await self.page.get_by_role('button', name='Send Message', exact=True).click()
@@ -3214,7 +3202,7 @@ class OpenSooqChatBrowser:
         if not room_url:
             raise DialogueUnavailable('Первая отправка не подтверждена в истории. Нужна ручная проверка; повтор запрещён.')
         messages = await self.messages()
-        outgoing = [m for m in messages if m['direction'] == 'out' and m['text'] == self.questions[0]]
+        outgoing = [m for m in messages if m['direction'] == 'out' and m['text'] == DIALOG_QUESTIONS[0]]
         if not outgoing:
             raise DialogueUnavailable('Первая отправка не подтверждена. Проверьте чат вручную.')
         return room_url, outgoing[-1]['id']
@@ -3256,68 +3244,7 @@ class SellerDialogues:
                 answered TEXT NOT NULL DEFAULT '[]', pending_stage INTEGER, pending_text TEXT NOT NULL DEFAULT '',
                 pending_after INTEGER NOT NULL DEFAULT 0, updated REAL NOT NULL, note TEXT NOT NULL DEFAULT '');
         ''')
-        self.db.executescript('''
-            CREATE TABLE IF NOT EXISTS dialogue_approvals(
-                dialogue TEXT PRIMARY KEY,stage INTEGER NOT NULL,cursor INTEGER NOT NULL,phrase TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS dialogue_notifications(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,dialogue TEXT NOT NULL,source INTEGER NOT NULL,
-                part INTEGER NOT NULL,text TEXT NOT NULL,created REAL NOT NULL,sent INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(dialogue,source,part));
-        ''')
-        columns={row['name'] for row in self.db.execute('PRAGMA table_info(seller_dialogues)')}
-        with self.db:
-            if 'questions' not in columns:
-                self.db.execute("ALTER TABLE seller_dialogues ADD COLUMN questions TEXT NOT NULL DEFAULT ''")
-            for row in self.db.execute('SELECT id,questions FROM seller_dialogues').fetchall():
-                try:
-                    values=tuple(json.loads(row['questions']))
-                except (ValueError,TypeError):
-                    values=()
-                if values==LEGACY_DIALOG_QUESTIONS:
-                    values=LEGACY_DIALOG_QUESTIONS+(DIALOG_QUESTIONS[-1],)
-                if values not in (DIALOG_QUESTIONS,LEGACY_DIALOG_QUESTIONS+(DIALOG_QUESTIONS[-1],)):
-                    values=DIALOG_QUESTIONS
-                self.db.execute('UPDATE seller_dialogues SET questions=? WHERE id=?',
-                                (json.dumps(values,ensure_ascii=False),row['id']))
-            # Old approvals are never carried across a deployment.
-            self.db.execute('DELETE FROM dialogue_approvals')
-            self.db.execute("UPDATE seller_dialogues SET state='review',pending_stage=NULL,pending_text='',note='Подтверди следующий вопрос.' WHERE state IN ('queued','approved')")
         self.db.commit()
-
-    def questions(self, row=None):
-        return dialogue_questions(json.loads(row['questions'])) if row is not None else DIALOG_QUESTIONS
-
-    def queue_replies(self, row, messages):
-        # Insert before advancing the conversation cursor. Failed Telegram delivery
-        # remains queued; a repeated observation is deduplicated by source ID.
-        with self.db:
-            for message in messages:
-                if message['direction'] != 'in' or message['id'] <= row['cursor']:
-                    continue
-                text=message['text'] or '📎 Вложение без текста. Открой чат для просмотра.'
-                parts=[text[i:i+2800] for i in range(0,len(text),2800)]
-                for index,part in enumerate(parts):
-                    label='Продавец' if len(parts)==1 else f'Продавец ({index+1}/{len(parts)})'
-                    self.db.execute('INSERT OR IGNORE INTO dialogue_notifications(dialogue,source,part,text,created) VALUES (?,?,?,?,?)',
-                                    (row['id'],message['id'],index,label+': '+part,time.time()))
-
-    async def flush_notifications(self):
-        if self.service.closing:
-            return
-        rows=list(self.db.execute('SELECT * FROM dialogue_notifications WHERE sent=0 ORDER BY id LIMIT 20'))
-        for event in rows:
-            try:
-                row=self.row(event['dialogue'])
-                ad=json.loads(row['ad'])
-                header='💬 '+ad.get('seller_name','Продавец')[:100]+' · '+ad.get('title','Товар')[:160]
-                markup=ui_keyboard([[('📋 Диалог','talk:status:'+row['id']),('⏸ Пауза','talk:pause:'+row['id'])]])
-                await telegram_call(self.service.bot.send_message,chat_id=ADMIN_ID,
-                                    text=header+'\n\n'+event['text'],reply_markup=markup)
-            except TelegramError:
-                log.warning('[dialogue_notification] delivery_pending')
-                break
-            with self.db:
-                self.db.execute('UPDATE dialogue_notifications SET sent=1 WHERE id=?',(event['id'],))
 
     def register(self, chat, ad):
         if chat != ADMIN_ID:
@@ -3345,10 +3272,10 @@ class SellerDialogues:
         if existing:
             return existing['id']
         if not self.transport.configured():
-            raise DialogueUnavailable('Подключи аккаунт: /account.')
+            raise DialogueUnavailable('Для переписки подключите аккаунт: /account. Вход в браузере ChatGPT не подключает Render автоматически.')
         with self.db:
-            self.db.execute("INSERT INTO seller_dialogues(id,chat,seller,ad,updated,questions,state,note) VALUES (?,?,?,?,?,?,'review','Подтверди первый вопрос.')",
-                (token, ADMIN_ID, ad['seller'], ad['data'], time.time(),json.dumps(self.questions(),ensure_ascii=False)))
+            self.db.execute('INSERT INTO seller_dialogues(id,chat,seller,ad,updated) VALUES (?,?,?,?,?)',
+                (token, ADMIN_ID, ad['seller'], ad['data'], time.time()))
         return token
 
     def save(self, token, **values):
@@ -3364,7 +3291,7 @@ class SellerDialogues:
 
     async def notify(self, row, text):
         ad = json.loads(row['ad'])
-        markup = ui_keyboard([[('⏸ Пауза','talk:pause:'+row['id']), ('📋 Статус','talk:status:'+row['id'])]])
+        markup = ui_keyboard([[('⏸ Остановить диалог','talk:pause:'+row['id']), ('📋 Статус','talk:status:'+row['id'])]])
         with suppress(TelegramError):
             await self.service.bot.send_message(chat_id=ADMIN_ID,
                 text=('💬 '+ad.get('seller_name','Продавец')+' · '+ad.get('title','Товар')+'\n\n'+text)[:3900], reply_markup=markup)
@@ -3374,134 +3301,99 @@ class SellerDialogues:
             self.db.executemany('INSERT OR IGNORE INTO dialogue_events VALUES (?,?,?,?,?)',
                 [(token,m['id'],m['direction'],m['text'][:3000],time.time()) for m in messages])
 
-    async def send_approved(self, row, ad, questions):
-        token=row['id']
-        permission=self.db.execute('SELECT stage,cursor,phrase FROM dialogue_approvals WHERE dialogue=?',(token,)).fetchone()
-        stage=row['pending_stage']
-        if (permission is None or stage is None or not 0<=stage<len(questions)
-                or permission['stage']!=stage or permission['cursor']!=row['pending_after']
-                or permission['phrase']!=questions[stage] or row['pending_text']!=questions[stage]):
-            self.save(token,state='review',pending_text='',pending_stage=None,note='Подтверди вопрос перед отправкой.')
-            return
-        room=row['room']
-        if stage==0:
-            room=room or await self.transport.locate(ad)
-            if room:
-                await self.transport.room(room,ad)
-                messages=await self.transport.messages()
-                self.record(token,messages)
-                if messages:
-                    self.save(token,room=room,state='review',pending_text='',pending_stage=None,
-                              note='В чате уже есть переписка. Проверь её вручную; первое сообщение не отправлено.')
-                    with self.db:
-                        self.db.execute('DELETE FROM dialogue_approvals WHERE dialogue=?',(token,))
-                    await self.notify(row,'В чате уже есть переписка. Первое сообщение не отправлено.')
-                    return
-        else:
-            if not room:
-                self.save(token,state='review',pending_text='',pending_stage=None,note='Открой чат и проверь историю.')
-                return
-            await self.transport.room(room,ad)
-            messages=await self.transport.messages()
-            self.record(token,messages)
-            self.queue_replies(row,messages)
-            await self.flush_notifications()
-            if any(m['id']>row['pending_after'] for m in messages):
-                self.save(token,state='review',cursor=max(m['id'] for m in messages),pending_text='',pending_stage=None,
-                          note='В чате появились новые сообщения. Проверь их и подтверди вопрос снова.')
-                with self.db:
-                    self.db.execute('DELETE FROM dialogue_approvals WHERE dialogue=?',(token,))
-                return
-        # Commit the attempt and consume the one-use approval before the click.
-        with self.db:
-            self.db.execute("UPDATE seller_dialogues SET state='sending',updated=? WHERE id=? AND chat=?",(time.time(),token,ADMIN_ID))
-            self.db.execute('DELETE FROM dialogue_approvals WHERE dialogue=?',(token,))
-        if stage==0 and not room:
-            room,message_id=await self.transport.first(ad)
-        else:
-            message_id=await self.transport.send(questions[stage],row['pending_after'])
-        final=stage==len(questions)-1
-        self.save(token,room=room,state='complete' if final else 'waiting',stage=stage,cursor=message_id,
-                  pending_text='',pending_stage=None,
-                  note='Сценарий завершён. Новые ответы придут сюда.' if final else 'Ожидаем ответ продавца.')
-        await self.notify(row,'Отправлено: '+questions[stage])
-
     async def update(self, row):
-        token,ad=row['id'],json.loads(row['ad'])
-        questions=self.questions(row)
-        self.transport.questions=questions
-        if row['state']=='queued':
-            self.save(token,state='review',pending_text='',pending_stage=None,note='Подтверди первый вопрос.')
-            return
-        if row['state']=='approved':
-            await self.send_approved(row,ad,questions)
+        token, ad = row['id'], json.loads(row['ad'])
+        if row['state'] == 'queued':
+            room = await self.transport.locate(ad)
+            if room:
+                messages = await self.transport.messages()
+                self.record(token,messages)
+                outgoing = [m for m in messages if m['direction']=='out']
+                if len(outgoing) == 1 and outgoing[0]['text'] == DIALOG_QUESTIONS[0]:
+                    self.save(token, room=room,state='waiting',stage=0,cursor=outgoing[0]['id'])
+                    await self.notify(row, 'Найден уже начатый диалог. Первое сообщение повторно не отправлено.')
+                elif not messages:
+                    self.save(token,room=room,state='sending',pending_stage=0,pending_text=DIALOG_QUESTIONS[0],pending_after=0)
+                    message_id = await self.transport.send(DIALOG_QUESTIONS[0],0)
+                    self.save(token,state='waiting',stage=0,cursor=message_id,pending_text='',pending_stage=None)
+                else:
+                    self.save(token,room=room,state='review',note='В чате есть более ранняя переписка. Нужна ручная проверка.')
+                    await self.notify(row, 'Уже есть переписка. Автоматический сценарий не запущен, чтобы не вмешиваться в разговор.')
+            else:
+                # Фиксируем попытку ДО внешнего действия. После сбоя не повторяем её.
+                self.save(token,state='sending',pending_stage=0,pending_text=DIALOG_QUESTIONS[0],pending_after=0)
+                room, message_id = await self.transport.first(ad)
+                self.save(token,room=room,state='waiting',stage=0,cursor=message_id,pending_text='',pending_stage=None)
+                await self.notify(row,'Отправлено: '+DIALOG_QUESTIONS[0])
             return
         if not row['room']:
-            if row['state']=='sending':
-                self.save(token,state='review',note='Результат отправки неизвестен. Проверь чат вручную; повтор не выполняется.')
+            self.save(token,state='review',note='Результат первой отправки неизвестен. Проверьте сайт вручную.')
+            await self.notify(row,'Нужна ручная проверка первой отправки. Автоматического повтора нет.')
             return
         await self.transport.room(row['room'],ad)
-        messages=await self.transport.messages()
+        messages = await self.transport.messages()
         self.record(token,messages)
-        self.queue_replies(row,messages)
-        await self.flush_notifications()
-        if row['state']=='sending':
-            sent=[m for m in messages if m['direction']=='out' and m['id']>row['pending_after'] and m['text']==row['pending_text']]
-            if sent:
-                final=row['pending_stage']==len(questions)-1
-                self.save(token,state='complete' if final else 'waiting',stage=row['pending_stage'],cursor=sent[-1]['id'],pending_stage=None,pending_text='',
-                          note='Сценарий завершён.' if final else 'Ожидаем ответ продавца.')
-                await self.notify(row,'Отправка подтверждена по истории чата.')
-            else:
-                self.save(token,state='review',note='Результат отправки неизвестен. Проверь чат вручную; повтор не выполняется.')
-            return
-        fresh=[m for m in messages if m['id']>row['cursor']]
-        if not fresh:
-            self.save(token,cursor=row['cursor'])
-            return
-        cursor=max(m['id'] for m in fresh)
-        if row['state'] in {'paused', 'complete', 'stopped'}:
-            self.save(token, cursor=cursor)
-            return
-        if row['state'] == 'review':
-            if row['pending_text'] or row['stage'] < 0:
-                self.save(token, cursor=cursor)
-            else:
-                self.save(token, cursor=cursor, note='В чате есть новые сообщения. Проверь переписку.')
-            return
-
-        note = 'Проверь переписку вручную.'
-        state = 'review'
-        if all(message['direction'] == 'in' and message['text'].strip() for message in fresh):
-            reply = '\n'.join(message['text'] for message in fresh)
-            stage = row['stage']
-            decision, _, next_stage = dialogue_answer(reply, stage, ())
-            if decision == 'stopped':
-                state = 'stopped'
-                note = 'Продавец отказался или товар недоступен. Диалог остановлен.'
-            elif decision == 'wait':
-                self.save(token, cursor=cursor, note='Продавец пока не ответил на вопрос. Ждём.')
+        if row['state'] == 'approved':
+            if any(m['id']>row['pending_after'] for m in messages):
+                self.save(token,state='review',cursor=max(m['id'] for m in messages),pending_text='',pending_stage=None,note='После подтверждения пришло новое сообщение. Откройте чат перед ответом.')
+                await self.notify(row,'Подтверждённый вопрос не отправлен: в диалоге появились новые сообщения.')
                 return
-            elif 0 <= stage < 5 and decision == 'next' and next_stage == stage + 1:
-                note = 'Подходящий следующий вопрос\n' + questions[next_stage]
-            elif stage == 5:
-                note = 'Проверь цену и условия доставки в чате.'
-        self.save(token, state=state, cursor=cursor, note=note)
-        await self.notify(row, note)
-
+            self.save(token,state='sending')
+            message_id = await self.transport.send(row['pending_text'],row['pending_after'])
+            self.save(token,state='waiting',stage=row['pending_stage'],cursor=message_id,pending_text='',pending_stage=None)
+            await self.notify(row,'Отправлено после вашего подтверждения: '+DIALOG_QUESTIONS[row['pending_stage']])
+            return
+        if row['state'] == 'sending':
+            sent = [m for m in messages if m['direction']=='out' and m['id']>row['pending_after'] and m['text']==row['pending_text']]
+            if sent:
+                self.save(token,state='waiting',stage=row['pending_stage'],cursor=sent[-1]['id'],pending_text='',pending_stage=None)
+                await self.notify(row,'Отправка подтверждена по истории чата. Вопрос не дублировался.')
+            else:
+                self.save(token,state='review',note='Не удалось подтвердить предыдущую отправку. Повтор автоматически не выполняется.')
+                await self.notify(row,'Не удалось подтвердить отправку. Проверьте чат вручную; вопрос повторно не отправлен.')
+            return
+        fresh = [m for m in messages if m['id']>row['cursor']]
+        if not fresh:
+            self.save(token,note='Ожидаем новый ответ продавца.')
+            return
+        if any(m['direction']!='in' for m in fresh):
+            self.save(token,state='review',note='В чате появился ручной ответ или неизвестный тип сообщения.')
+            await self.notify(row,'Автоматическая переписка приостановлена: ручной ответ или неизвестный тип сообщения.')
+            return
+        reply = '\n'.join(m['text'] for m in fresh)
+        if not reply.strip():
+            self.save(token,state='review',note='Ответ содержит вложение без распознанного текста.')
+            await self.notify(row,'Продавец прислал вложение. Нужен ручной просмотр.')
+            return
+        decision, answered, next_stage = dialogue_answer(reply,row['stage'],json.loads(row['answered']))
+        cursor = max(m['id'] for m in fresh)
+        self.save(token,cursor=cursor,answered=answered)
+        await self.notify(row,'Продавец: '+reply[:2200])
+        if decision == 'wait':
+            return
+        if decision in {'stopped','review','complete'}:
+            notes={'stopped':'Продавец сообщил о продаже или попросил остановиться.',
+                   'review':'Неоднозначный ответ. Нужен ответ человека.', 'complete':'Все вопросы заданы. Сделка автоматически не заключается.'}
+            self.save(token,state=decision,note=notes[decision])
+            await self.notify(row,notes[decision])
+            return
+        question = DIALOG_QUESTIONS[next_stage]
+        self.save(token,state='sending',pending_stage=next_stage,pending_text=question,pending_after=cursor,answered=answered)
+        message_id = await self.transport.send(question,cursor)
+        self.save(token,state='waiting',stage=next_stage,cursor=message_id,pending_text='',pending_stage=None)
+        await self.notify(row,'Отправлено: '+question)
 
     async def poll(self, context):
-        await self.flush_notifications()
         await self.service.account_login.expire()
         if self.service.account_login.active:
             return
         if self.service.closing or self.lock.locked() or not self.transport.configured():
             return
         async with self.lock:
-            rows = list(self.db.execute("SELECT * FROM seller_dialogues WHERE chat=? AND state IN ('queued','waiting','sending','approved','review','paused','complete','stopped') AND (state IN ('queued','approved') OR room!='') ORDER BY updated LIMIT 5",(ADMIN_ID,)))
+            rows = list(self.db.execute("SELECT * FROM seller_dialogues WHERE chat=? AND state IN ('queued','waiting','sending','approved') ORDER BY updated LIMIT 5",(ADMIN_ID,)))
             for db_row in rows:
                 row = dict(db_row)
-                self.transport.guard = lambda token=row['id']: token not in self.cancelled and not self.service.closing and not self.service.account_login.active and not self.transport.blocked
+                self.transport.guard = lambda token=row['id']: token not in self.cancelled and not self.service.closing and not self.service.account_login.active
                 try:
                     await self.update(row)
                 except Exception as exc:
@@ -3510,40 +3402,12 @@ class SellerDialogues:
                     if row['id'] in self.cancelled:
                         self.save(row['id'],state='paused',note='Остановлен владельцем.')
                         continue
-                    note='Не удалось проверить чат. Открой его вручную.'
-                    self.save(row['id'],state='review',note=note)
-                    if row.get('note')!=note:
-                        await self.notify(row,note)
+                    self.save(row['id'],state='review',note='Проверка или отправка не завершена. Нужен ручной просмотр.')
+                    await self.notify(row,'Переписка приостановлена: '+(str(exc)[:500] if isinstance(exc,DialogueUnavailable) else 'сайт не ответил или изменился интерфейс. Проверьте диалог вручную.'))
 
     async def close(self):
         async with self.lock:
             await self.transport.close()
-
-
-DIALOGUE_STAGE_LABELS = ('Наличие','Состояние','Срок использования','Причина продажи','Чек','Цена','Доставка')
-
-
-async def phrases_panel(update, context, notice=''):
-    if update.effective_user.id!=ADMIN_ID:
-        raise ValueError('Сценарий доступен владельцу.')
-    text='💬 <b>Семь вопросов</b>\n\n'
-    text+='\n\n'.join(f'<b>{i+1}. {DIALOGUE_STAGE_LABELS[i]}</b>\n{escape(q)}' for i,q in enumerate(DIALOG_QUESTIONS))
-    text+='\n\nКаждое сообщение отправляется только после твоего подтверждения. После вопроса о доставке сценарий завершается.'
-    await show_panel(update,text,ui_keyboard([[('‹ Диалоги','talk:list')]]))
-
-
-async def dialogue_settings_message(update, context):
-    text=update.effective_message.text.strip()
-    command=text.split(maxsplit=1)[0].split('@')[0].lower() if text else ''
-    form=context.user_data.get('panel_form') or {}
-    if command!='/phrases' and form.get('action')!='dialogue_phrase':
-        return False
-    context.user_data.pop('panel_form',None)
-    if update.effective_user.id!=ADMIN_ID:
-        await update.effective_message.reply_text('Сценарий доступен владельцу.')
-    else:
-        await phrases_panel(update,context)
-    return True
 
 
 async def dialogue_panel(update, context, token=''):
@@ -3552,24 +3416,25 @@ async def dialogue_panel(update, context, token=''):
     dialogs = context.application.bot_data['service'].dialogues
     if token:
         row = dialogs.row(token)
-        questions=dialogs.questions(row)
         ad = json.loads(row['ad'])
-        statuses={'queued':'в очереди','waiting':'ожидаем ответ','sending':'проверяем отправку','approved':'вопрос подтверждён владельцем','paused':'автоответы на паузе','review':'нужна ручная проверка','stopped':'остановлен','complete':'вопросы завершены'}
+        statuses={'queued':'в очереди','waiting':'ожидаем ответ','sending':'проверяем отправку','approved':'вопрос подтверждён владельцем','paused':'остановлен владельцем','review':'нужна ручная проверка','stopped':'остановлен','complete':'вопросы завершены'}
         text = f"💬 <b>{escape(ad['seller_name'])}</b>\n{escape(ad['title'])}\n\nСостояние: {statuses.get(row['state'],row['state'])}\n"
         if row['stage']>=0:
-            text += '\nПоследний вопрос: '+escape(questions[row['stage']])+'\n'
+            text += '\nПоследний вопрос: '+escape(DIALOG_QUESTIONS[row['stage']])+'\n'
         text += '\n'+escape(row['note'])
-        rows = [[('⏸ Пауза','talk:pause:'+token)]]
-        if row['state'] in {'review','paused'} and (row['room'] or row['stage']==-1) and -1 <= row['stage'] < len(DIALOG_QUESTIONS)-1 and not row['pending_text']:
+        rows = [[('⏸ Остановить','talk:pause:'+token)]]
+        if row['state']=='review' and row['stage']==-1 and not row['pending_text']:
+            rows.append([('Повторить подключение без отправки','talk:retry:'+token)])
+        if row['state'] in {'review','paused'} and row['room'] and 0 <= row['stage'] < len(DIALOG_QUESTIONS)-1 and not row['pending_text']:
             rows.append([('Следующий вопрос с подтверждением', 'talk:next:'+token)])
         keyboard = ui_keyboard(rows+[[('‹ Диалоги','talk:list')]])
         if row['room']:
             keyboard = InlineKeyboardMarkup(list(keyboard.inline_keyboard)+[[InlineKeyboardButton('✍️ Открыть чат',url=row['room'])]])
     else:
         rows = list(dialogs.db.execute('SELECT id,ad,state FROM seller_dialogues WHERE chat=? ORDER BY updated DESC LIMIT 20',(ADMIN_ID,)))
-        text = '💬 <b>Диалоги</b>\n\nОтветы продавцов приходят сюда. Каждое исходящее сообщение подтверждаешь ты.\n\n'
-        text += 'Аккаунт: '+('подключён' if dialogs.transport.configured() else 'не подключён — /account')
-        keyboard = ui_keyboard([[(json.loads(r['ad'])['seller_name']+' · '+r['state'],'talk:status:'+r['id'])] for r in rows]+[[('📋 Семь вопросов','talk:phrases')],[('⏸ Приостановить отправку','talk:pause_all')],[('‹ Главное меню','menu_home')]])
+        text = '💬 <b>Диалоги с продавцами</b>\n\nЗапуск — кнопкой у выбранного объявления. Один продавец — один диалог. Неясный ответ передаётся владельцу.\n\n'
+        text += 'Аккаунт на Render: '+('настройки заданы; вход проверяется при запуске диалога.' if dialogs.transport.configured() else 'не подключён. /chatstatus')
+        keyboard = ui_keyboard([[(json.loads(r['ad'])['seller_name']+' · '+r['state'],'talk:status:'+r['id'])] for r in rows]+[[('⏸ Остановить все','talk:pause_all')],[('‹ Главное меню','menu_home')]])
     await show_panel(update,text,keyboard)
 
 
@@ -3582,40 +3447,32 @@ async def dialogue_callback(update, context):
     dialogs = context.application.bot_data['service'].dialogues
     parts = (query.data or '').split(':')
     try:
-        if parts[1]=='phrases':
-            context.user_data.pop('panel_form',None)
-            await phrases_panel(update,context)
-        elif parts[1] == 'start' and len(parts)==3:
+        if parts[1] == 'start' and len(parts)==3:
             async with dialogs.lock:
                 token = dialogs.start(parts[2])
             await dialogue_panel(update,context,token)
         elif parts[1]=='next' and len(parts)==3:
             row = dialogs.row(parts[2])
-            questions=dialogs.questions(row)
-            if row['state'] not in {'review','paused'} or row['pending_text'] or (not row['room'] and row['stage']!=-1) or not -1 <= row['stage'] < len(DIALOG_QUESTIONS)-1:
+            if row['state'] not in {'review','paused'} or row['pending_text'] or not row['room'] or not 0 <= row['stage'] < len(DIALOG_QUESTIONS)-1:
                 raise ValueError('Сначала проверьте историю чата. Неизвестную отправку повторять нельзя.')
             stage = row['stage']+1
-            await show_panel(update,'Отправить следующий вопрос после вашего просмотра переписки?\n\n'+escape(questions[stage]),
+            await show_panel(update,'Отправить следующий вопрос после вашего просмотра переписки?\n\n'+escape(DIALOG_QUESTIONS[stage]),
                 ui_keyboard([[('Да, отправить',f"talk:approve:{row['id']}:{stage}:{row['cursor']}")],[('Отмена','talk:status:'+row['id'])]]))
         elif parts[1]=='approve' and len(parts)==5:
             async with dialogs.lock:
                 row=dialogs.row(parts[2])
-                questions=dialogs.questions(row)
                 stage,cursor=int(parts[3]),int(parts[4])
-                if row['state'] not in {'review','paused'} or row['pending_text'] or (not row['room'] and stage!=0) or stage!=row['stage']+1 or cursor!=row['cursor'] or not 0<=stage<len(DIALOG_QUESTIONS):
+                if row['state'] not in {'review','paused'} or row['pending_text'] or not row['room'] or stage!=row['stage']+1 or cursor!=row['cursor'] or not 0<=stage<len(DIALOG_QUESTIONS):
                     raise ValueError('Подтверждение устарело. Откройте статус диалога.')
                 dialogs.cancelled.discard(row['id'])
-                with dialogs.db:
-                    dialogs.db.execute('INSERT INTO dialogue_approvals VALUES (?,?,?,?) ON CONFLICT(dialogue) DO UPDATE SET stage=excluded.stage,cursor=excluded.cursor,phrase=excluded.phrase',
-                                       (row['id'],stage,cursor,questions[stage]))
-                    dialogs.save(row['id'],state='approved',pending_stage=stage,pending_text=questions[stage],pending_after=cursor)
+                dialogs.save(row['id'],state='approved',pending_stage=stage,pending_text=DIALOG_QUESTIONS[stage],pending_after=cursor)
             await dialogue_panel(update,context,row['id'])
         elif parts[1]=='pause' and len(parts)==3:
             dialogs.row(parts[2])
             dialogs.cancelled.add(parts[2])
             async with dialogs.lock:
                 dialogs.row(parts[2])
-                dialogs.save(parts[2],state='paused',note='Отправка на паузе. Ответы продавца приходят в Telegram.')
+                dialogs.save(parts[2],state='paused',note='Остановлен владельцем. Автоответы отключены.')
             await dialogue_panel(update,context,parts[2])
         elif parts[1]=='pause_all':
             dialogs.cancelled.update(r['id'] for r in dialogs.db.execute('SELECT id FROM seller_dialogues WHERE chat=?',(ADMIN_ID,)))
@@ -3627,7 +3484,7 @@ async def dialogue_callback(update, context):
             await dialogue_panel(update,context,parts[2])
         else:
             await dialogue_panel(update,context)
-    except (ValueError,IndexError) as exc:
+    except ValueError as exc:
         await query.message.reply_text(str(exc)[:1000])
 
 
@@ -3899,7 +3756,7 @@ class AccountLogin:
     def diagnostic_text(self):
         if not self.diag_exists:
             return 'Диагностика пуста. /account_diag не открывает сайт и не повторяет вход. Старые попытки этой версией не наблюдались.'
-        lines=['Диагностика входа v26 Chrome Desktop',
+        lines=['Диагностика входа v22.3 Chrome Desktop',
                'Страна: '+COUNTRY_LABELS.get(self.country,self.country),
                'Доступ к странице: '+('активен' if self.active and time.monotonic()<self.expires else 'закрыт или истёк'),
                'Браузер входа: Google Chrome с видимым окном, удалённый экран noVNC, постоянный профиль. '+('Настроен общий прокси OPENSOOQ_PROXY_URL; прямого повтора при его ошибке нет.' if self.service.reader.browser_proxy is not None else 'Прямое соединение: OPENSOOQ_PROXY_URL не задан.')]
@@ -4405,7 +4262,7 @@ class AccountWebServer:
             await manager.page.bring_to_front()
             token = manager.token
             remaining = max(1, int(manager.expires - time.monotonic()))
-        response = web.json_response({'message': 'Chrome готов. Войдите в OpenSooq на удалённом экране.', 'version': '26'})
+        response = web.json_response({'message': 'Chrome готов. Войдите в OpenSooq на удалённом экране.', 'version': '22.3'})
         response.set_cookie(self.COOKIE, token, max_age=remaining, path='/', secure=True, httponly=True, samesite='Strict')
         return response
 
@@ -4559,7 +4416,6 @@ def build_app(token, allowed, database):
                 BotCommand("testproxy", "Проверить прокси и просмотры"),
                 BotCommand("saved", "Сохранённые поиски"), BotCommand("cancel", "Отменить ввод"),
                 BotCommand("subscription", "Подписка и оплата"),
-                BotCommand("dialogs", "Диалоги"), BotCommand("phrases", "Семь вопросов"),
             ])
         except TelegramError as exc:
             # Список команд — оформление меню; временная ошибка этого вызова
@@ -4678,7 +4534,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v26_dialogues] Создание Telegram Application")
+    log.info("[boot_v22_3_chrome_desktop] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
