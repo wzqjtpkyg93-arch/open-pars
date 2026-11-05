@@ -3597,11 +3597,35 @@ class SellerDialogues:
             self.save(token,cursor=row['cursor'])
             return
         cursor=max(m['id'] for m in fresh)
-        if row['state'] in {'review','paused','complete','stopped'}:
-            self.save(token,cursor=cursor)
+        if row['state'] in {'paused', 'complete', 'stopped'}:
+            self.save(token, cursor=cursor)
             return
-        self.save(token,state='review',cursor=cursor,note='Пришёл ответ. Проверь его и подтверди следующий вопрос.')
-        await self.notify(row,'Пришёл ответ. Следующий вопрос можно подтвердить в статусе диалога.')
+        if row['state'] == 'review':
+            if row['pending_text'] or row['stage'] < 0:
+                self.save(token, cursor=cursor)
+            else:
+                self.save(token, cursor=cursor, note='В чате есть новые сообщения. Проверь переписку.')
+            return
+
+        note = 'Проверь переписку вручную.'
+        state = 'review'
+        if all(message['direction'] == 'in' and message['text'].strip() for message in fresh):
+            reply = '\n'.join(message['text'] for message in fresh)
+            stage = row['stage']
+            decision, _, next_stage = dialogue_answer(reply, stage, ())
+            if decision == 'stopped':
+                state = 'stopped'
+                note = 'Продавец отказался или товар недоступен. Диалог остановлен.'
+            elif decision == 'wait':
+                self.save(token, cursor=cursor, note='Продавец пока не ответил на вопрос. Ждём.')
+                return
+            elif 0 <= stage < 5 and decision == 'next' and next_stage == stage + 1:
+                note = 'Подходящий следующий вопрос\n' + questions[next_stage]
+            elif stage == 5:
+                note = 'Проверь цену и условия доставки в чате.'
+        self.save(token, state=state, cursor=cursor, note=note)
+        await self.notify(row, note)
+
 
     async def poll(self, context):
         await self.flush_notifications()
@@ -4012,7 +4036,7 @@ class AccountLogin:
     def diagnostic_text(self):
         if not self.diag_exists:
             return 'Диагностика пуста. /account_diag не открывает сайт и не повторяет вход. Старые попытки этой версией не наблюдались.'
-        lines=['Диагностика входа v24 Chrome Desktop',
+        lines=['Диагностика входа v25 Chrome Desktop',
                'Страна: '+COUNTRY_LABELS.get(self.country,self.country),
                'Доступ к странице: '+('активен' if self.active and time.monotonic()<self.expires else 'закрыт или истёк'),
                'Браузер входа: Google Chrome с видимым окном, удалённый экран noVNC, постоянный профиль. '+('Настроен общий прокси OPENSOOQ_PROXY_URL; прямого повтора при его ошибке нет.' if self.service.reader.browser_proxy is not None else 'Прямое соединение: OPENSOOQ_PROXY_URL не задан.')]
@@ -4528,7 +4552,7 @@ class AccountWebServer:
             await manager.page.bring_to_front()
             token = manager.token
             remaining = max(1, int(manager.expires - time.monotonic()))
-        response = web.json_response({'message': 'Chrome готов. Войдите в OpenSooq на удалённом экране.', 'version': '24'})
+        response = web.json_response({'message': 'Chrome готов. Войдите в OpenSooq на удалённом экране.', 'version': '25'})
         response.set_cookie(self.COOKIE, token, max_age=remaining, path='/', secure=True, httponly=True, samesite='Strict')
         return response
 
@@ -4801,7 +4825,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v24_manual_dialogues] Создание Telegram Application")
+    log.info("[boot_v25_dialogue_suggestions] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
