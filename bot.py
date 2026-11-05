@@ -2615,6 +2615,7 @@ class DialogueUnavailable(ValueError):
 class RemoteChromeDesktop:
     """xvfb-run owns X11/authentication; only local VNC reaches the relay."""
     width, height = 1000, 900
+    VNC_READY_SECONDS = 25
     HOLD_DISPLAY = (
         "import json,os,sys; "
         "print(json.dumps({'display':os.environ['DISPLAY'],'authority':os.environ['XAUTHORITY']}),flush=True); "
@@ -2642,6 +2643,7 @@ class RemoteChromeDesktop:
         self._monitors = []
         self._temporary = None
         self._startup_log = None
+        self.progress = set()
 
     @property
     def running(self):
@@ -2651,6 +2653,13 @@ class RemoteChromeDesktop:
         tail = ''
         while chunk := await stream.read(2048):
             tail = (tail + chunk.decode('utf-8', errors='replace'))[-4096:]
+            for label, pattern in {
+                'X_DISPLAY_OPENED': r'Using X display',
+                'FRAMEBUFFER_READY': r'Read initial data from X display into framebuffer',
+                'VNC_LISTENING': r'Listening for VNC connections on TCP port',
+            }.items():
+                if re.search(pattern, tail, re.I):
+                    self.progress.add(label)
             for code, pattern in self.ERROR_PATTERNS.items():
                 if re.search(pattern, tail, re.I):
                     self.flags.add(code)
@@ -2685,6 +2694,7 @@ class RemoteChromeDesktop:
             await self._stop()
             self.issue = 'DEPENDENCIES'
             self.flags.clear()
+            self.progress.clear()
             if any(shutil.which(name) is None for name in ('xvfb-run', 'Xvfb', 'xauth', 'x11vnc')):
                 raise DialogueUnavailable('Не найдены программы удалённого экрана (DEPENDENCIES). Нужна сборка с dockerfile v22.1.')
             try:
@@ -2728,41 +2738,65 @@ class RemoteChromeDesktop:
                     self.port = listener.getsockname()[1]
                 process = await asyncio.create_subprocess_exec(
                     'x11vnc', '-norc', '-display', display, '-auth', authority,
-                    '-listen', '127.0.0.1', '-localhost', '-rfbport', str(self.port),
+                    '-nolookup', '-listen', '127.0.0.1', '-allow', '127.0.0.1',
+                    '-rfbport', str(self.port),
                     '-rfbportv6', '-1', '-no6', '-nopw', '-forever', '-shared',
                     '-noxdamage', '-noxrecord', '-nosel', '-noshm',
                     stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
                 self.processes.append(process)
                 self._monitors.append(asyncio.create_task(self._observe_errors(process.stderr)))
-                deadline = time.monotonic() + 6
-                while True:
-                    if process.returncode is not None:
-                        self.issue = 'VNC_EXIT_' + str(process.returncode)
-                        raise RuntimeError('VNC exited')
-                    if self.processes[0].returncode is not None:
-                        self.issue = 'XVFB_EXIT_' + str(self.processes[0].returncode)
-                        raise RuntimeError('X display exited')
-                    if time.monotonic() >= deadline:
-                        self.issue = 'VNC_READY_TIMEOUT'
-                        raise RuntimeError('VNC did not become ready')
-                    try:
-                        reader, writer = await asyncio.wait_for(asyncio.open_connection('127.0.0.1', self.port), 0.5)
-                        try:
-                            greeting = await asyncio.wait_for(reader.readexactly(12), 0.5)
-                            if not re.fullmatch(rb'RFB \d{3}\.\d{3}\n', greeting):
-                                self.issue = 'VNC_PROTOCOL'
-                                raise RuntimeError('Invalid VNC greeting')
-                        finally:
-                            writer.close()
-                            with suppress(Exception):
-                                await writer.wait_closed()
-                        self.issue = ''
-                        return
-                    except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError):
-                        await asyncio.sleep(0.1)
+                await self._wait_for_vnc()
+                self.issue = ''
+                return
             except BaseException:
                 await self._stop()
                 raise
+
+    async def _wait_for_vnc(self):
+        # Keep the first accepted connection open while awaiting its greeting.
+        # Closing it every 0.5 seconds can prevent a slow server becoming ready.
+        deadline = time.monotonic() + self.VNC_READY_SECONDS
+        writer = None
+        connected = False
+        try:
+            while True:
+                for index, prefix in ((0, 'XVFB_EXIT_'), (1, 'VNC_EXIT_')):
+                    if self.processes[index].returncode is not None:
+                        self.issue = prefix + str(self.processes[index].returncode)
+                        raise RuntimeError('Desktop process exited')
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.issue = 'VNC_GREETING_TIMEOUT' if connected else 'VNC_PORT_TIMEOUT'
+                    raise RuntimeError('VNC readiness timed out')
+                self.issue = 'VNC_WAIT_PORT'
+                try:
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection('127.0.0.1', self.port), min(1, remaining))
+                except (OSError, asyncio.TimeoutError):
+                    await asyncio.sleep(min(0.2, max(0, deadline-time.monotonic())))
+                    continue
+                connected = True
+                self.progress.add('VNC_TCP_CONNECTED')
+                self.issue = 'VNC_WAIT_GREETING'
+                try:
+                    greeting = await asyncio.wait_for(
+                        reader.readexactly(12), max(0.001, deadline-time.monotonic()))
+                except asyncio.TimeoutError:
+                    self.issue = 'VNC_GREETING_TIMEOUT'
+                    raise RuntimeError('VNC greeting timed out') from None
+                except (OSError, asyncio.IncompleteReadError):
+                    self.issue = 'VNC_GREETING_CLOSED'
+                    raise RuntimeError('VNC closed before greeting') from None
+                if not re.fullmatch(rb'RFB \d{3}\.\d{3}\n', greeting):
+                    self.issue = 'VNC_PROTOCOL'
+                    raise RuntimeError('Invalid VNC greeting')
+                self.progress.add('VNC_RFB_READY')
+                return
+        finally:
+            if writer is not None:
+                writer.close()
+                with suppress(Exception):
+                    await asyncio.wait_for(writer.wait_closed(), 1)
 
     async def _stop(self):
         for index in range(len(self.processes)-1, -1, -1):
@@ -3514,7 +3548,7 @@ function blank(){if(rfb){rfb.viewOnly=true;rfb.disconnect();rfb=null}connected=f
 function finish(text){ended=true;blank();reconnect.style.display='none';notice(text+(lastStartError?'\n\nОшибка запуска: '+lastStartError:''))}
 async function request(path,body,initial=false){
  const headers={};if(body)headers['Content-Type']='application/json';if(token)headers.Authorization='Bearer '+token;
- const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),45000);
+ const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),path==='/account-api/connect'?120000:45000);
  try{const response=await fetch(path,{method:body?'POST':'GET',headers,body:body?JSON.stringify(body):undefined,cache:'no-store',credentials:'same-origin',referrerPolicy:'no-referrer',signal:controller.signal});
  let data={};try{data=await response.json()}catch{}
  if(!response.ok){if(response.status===401)finish(data.error||'Доступ истёк. Получите новую ссылку через /account.');throw Error(data.error||'Подключение не завершено. Отчёт: /account_diag.')}return data
@@ -3724,7 +3758,7 @@ class AccountLogin:
     def diagnostic_text(self):
         if not self.diag_exists:
             return 'Диагностика пуста. /account_diag не открывает сайт и не повторяет вход. Старые попытки этой версией не наблюдались.'
-        lines=['Диагностика входа v22.1 Chrome Desktop',
+        lines=['Диагностика входа v22.2 Chrome Desktop',
                'Страна: '+COUNTRY_LABELS.get(self.country,self.country),
                'Доступ к странице: '+('активен' if self.active and time.monotonic()<self.expires else 'закрыт или истёк'),
                'Браузер входа: Google Chrome с видимым окном, удалённый экран noVNC, постоянный профиль. '+('Настроен общий прокси OPENSOOQ_PROXY_URL; прямого повтора при его ошибке нет.' if self.service.reader.browser_proxy is not None else 'Прямое соединение: OPENSOOQ_PROXY_URL не задан.')]
@@ -3735,6 +3769,9 @@ class AccountLogin:
         flags=sorted(getattr(getattr(browser,'desktop',None),'flags',()))
         if flags:
             lines.append('Ошибки графического экрана: '+', '.join(flags))
+        progress=sorted(getattr(getattr(browser,'desktop',None),'progress',()))
+        if progress:
+            lines.append('Этапы запуска экрана: '+', '.join(progress))
         lines.append('Мышь и клавиатура удалённого экрана не нумеруются; метки действий относятся к кнопкам страницы управления.')
         flags={'captcha_failed':'На странице: reCAPTCHA verification failed.',
                'unauthorized':'На странице: Unauthorized. Точная причина не раскрыта.',
@@ -4220,7 +4257,7 @@ class AccountWebServer:
             await manager.page.bring_to_front()
             token = manager.token
             remaining = max(1, int(manager.expires - time.monotonic()))
-        response = web.json_response({'message': 'Chrome готов. Войдите в OpenSooq на удалённом экране.', 'version': '22.1'})
+        response = web.json_response({'message': 'Chrome готов. Войдите в OpenSooq на удалённом экране.', 'version': '22.2'})
         response.set_cookie(self.COOKIE, token, max_age=remaining, path='/', secure=True, httponly=True, samesite='Strict')
         return response
 
@@ -4492,7 +4529,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v22_1_chrome_desktop] Создание Telegram Application")
+    log.info("[boot_v22_2_chrome_desktop] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
