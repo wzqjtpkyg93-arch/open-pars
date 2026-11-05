@@ -3567,20 +3567,18 @@ async function connect(initial=false){
   rfb.addEventListener('securityfailure',()=>{if(rfb!==current)return;connected=false;controls();notice('Не удалось подключить удалённый экран. Отправьте /account_diag.')});
  }catch(error){if(!ended){lastStartError=error.name==='AbortError'?'Сервер не успел ответить. Повторного входа или ввода не было. Отправьте /account_diag.':error.message;notice(lastStartError);reconnect.style.display='inline-block'}}finally{connecting=false;controls()}
 }
-async function action(name){
+async function action(name,extra={}){
  if(ended||actionPending||(paused&&name!=='close'))return;actionPending=true;controls();
  const previous=rfb;if(previous)previous.viewOnly=true;
- try{const result=await request('/account-api/action',{action:name});if(result.finished){finish(result.message);return}notice(result.message||'Проверьте экран Chrome.')}
+ try{const result=await request('/account-api/action',{action:name,...extra});if(result.finished){finish(result.message);return}notice(result.message||'Проверьте экран Chrome.')}
  catch(error){if(!ended)notice(error.name==='AbortError'?'Результат действия неизвестен. Проверьте экран; автоматического повтора нет.':error.message)}
  finally{actionPending=false;if(rfb&&connected&&!paused&&!ended)rfb.viewOnly=false;controls()}
 }
 function key(symbol,code){if(connected&&!ended&&!paused&&!actionPending&&rfb)rfb.sendKey(symbol,code)}
-function selectAll(){rfb.sendKey(0xffe3,'ControlLeft',true);try{rfb.sendKey(0x61,'KeyA')}finally{rfb.sendKey(0xffe3,'ControlLeft',false)}}
 document.querySelector('#type').onclick=()=>{
  if(!connected||ended||paused||actionPending||!entry.value)return;
- const value=entry.value;entry.value='';actionPending=true;controls();
- try{selectAll();for(const character of value){const point=character.codePointAt(0);if(point<32||point===127)continue;rfb.sendKey(point<=255?point:0x01000000|point)}notice('Текст передан клавиатурой. Проверьте выбранное поле в Chrome; Enter не отправлялся.')}
- catch{notice('Ввод мог завершиться частично. Проверьте поле перед следующим действием; автоматического повтора нет.')}finally{actionPending=false;controls()}
+ const value=entry.value;entry.value='';
+ return action('text',{text:value});
 };
 document.querySelector('#enter').onclick=()=>key(0xff0d,'Enter');document.querySelector('#backspace').onclick=()=>key(0xff08,'Backspace');document.querySelector('#tab').onclick=()=>key(0xff09,'Tab');
 for(const name of ['login','chats','save','close','focus'])document.querySelector('#'+name).onclick=()=>action(name);
@@ -3758,7 +3756,7 @@ class AccountLogin:
     def diagnostic_text(self):
         if not self.diag_exists:
             return 'Диагностика пуста. /account_diag не открывает сайт и не повторяет вход. Старые попытки этой версией не наблюдались.'
-        lines=['Диагностика входа v22.2 Chrome Desktop',
+        lines=['Диагностика входа v22.3 Chrome Desktop',
                'Страна: '+COUNTRY_LABELS.get(self.country,self.country),
                'Доступ к странице: '+('активен' if self.active and time.monotonic()<self.expires else 'закрыт или истёк'),
                'Браузер входа: Google Chrome с видимым окном, удалённый экран noVNC, постоянный профиль. '+('Настроен общий прокси OPENSOOQ_PROXY_URL; прямого повтора при его ошибке нет.' if self.service.reader.browser_proxy is not None else 'Прямое соединение: OPENSOOQ_PROXY_URL не задан.')]
@@ -4053,18 +4051,25 @@ class AccountLogin:
             if not self.authorized(authorization):
                 raise PermissionError()
             action=data.get('action')
-            if action not in {'login','chats','save','close','focus'}:
+            if action not in {'login','chats','save','close','focus','text'}:
                 raise ValueError('Действие не поддерживается.')
             if action=='close':
                 await self._close()
                 return {'finished':True,'message':'Доступ по ссылке закрыт. Chrome и профиль остаются на сервере; прежние диалоги на паузе.'}
             await self._open()
             await self.collect_flags(force=True)
-            if 'wait' in self.diag_flags and action in {'login','chats','focus'}:
+            if 'wait' in self.diag_flags and action in {'login','chats','focus','text'}:
                 raise ValueError('OpenSooq просит подождать. Ввод остановлен; срок ожидания сайт не указал. Отчёт: /account_diag.')
             self.diag_action+=1
             self.diag_action_label={'login':'открытие главной','chats':'открытие чатов',
-                                    'save':'сохранение','focus':'показ вкладки'}[action]
+                                    'save':'сохранение','focus':'показ вкладки','text':'замена поля'}[action]
+            if action=='text':
+                value=data.get('text')
+                if (not isinstance(value,str) or not 1<=len(value)<=200
+                        or any(ord(char)<32 or ord(char)==127 for char in value)):
+                    raise ValueError('Введите от 1 до 200 символов без переносов строк.')
+                await self.replace_focused_field(value)
+                return {'message':'Текст заменён в выбранном поле. Проверьте его в Chrome; Enter и Next не нажимались.'}
             if action=='login':
                 await self.page.goto('https://'+self.country+'.opensooq.com/en',wait_until='domcontentloaded',timeout=30000)
                 login=self.page.get_by_role('button',name='Login or Sign Up',exact=True)
@@ -4257,7 +4262,7 @@ class AccountWebServer:
             await manager.page.bring_to_front()
             token = manager.token
             remaining = max(1, int(manager.expires - time.monotonic()))
-        response = web.json_response({'message': 'Chrome готов. Войдите в OpenSooq на удалённом экране.', 'version': '22.2'})
+        response = web.json_response({'message': 'Chrome готов. Войдите в OpenSooq на удалённом экране.', 'version': '22.3'})
         response.set_cookie(self.COOKIE, token, max_age=remaining, path='/', secure=True, httponly=True, samesite='Strict')
         return response
 
@@ -4273,7 +4278,7 @@ class AccountWebServer:
         from aiohttp import web
         credential = self.check(request, origin=True)
         data = await self.request_json(request)
-        if data.get('action') not in {'login', 'chats', 'save', 'close', 'focus'}:
+        if data.get('action') not in {'login', 'chats', 'save', 'close', 'focus', 'text'}:
             raise ValueError('Действие не поддерживается.')
         result = await asyncio.wait_for(self.service.account_login.action(credential, data), 40)
         response = web.json_response(result)
@@ -4529,7 +4534,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v22_2_chrome_desktop] Создание Telegram Application")
+    log.info("[boot_v22_3_chrome_desktop] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
