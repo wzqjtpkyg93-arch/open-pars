@@ -113,15 +113,14 @@ SECRET_RE = re.compile(r"(?:bot\d+:[A-Za-z0-9_-]+|Bearer\s+\S+)")
 
 def category_codes(value):
     if not isinstance(value, dict):
-        return "", ""
+        return ("", "")
     def first(keys):
         return next((value[k].strip() for k in keys if isinstance(value.get(k), str) and value[k].strip()), "")
-    # Берем строго два элемента, чтобы избежать ошибки too many values to unpack
-    res = (
+    res = [
         first(("cat1_code", "categoryReportingName", "category_reporting_name", "category_code", "cat_code")),
         first(("cat2_code", "subCategoryReportingName", "subcategory_reporting_name", "subcategory_code")),
-    )
-    return res[:2]
+    ]
+    return (res[0], res[1]) if len(res) >= 2 else ("", "")
 
 
 def excluded_topic(ad):
@@ -637,7 +636,8 @@ def parse_category_dom(soup, url, documents):
             continue
         seen.add(ad_id)
         post = metadata.get(ad_id, {})
-        main_category, subcategory = category_codes(post)[:2]
+        cat_data = category_codes(post)
+        main_category, subcategory = cat_data[0], cat_data[1]
         price_node = heading.find_previous_sibling("span")
         price_text = price_node.get_text(" ", strip=True) if price_node else ""
         currency_match = re.search(r"\b([A-Z]{3})\b", price_text)
@@ -700,7 +700,8 @@ def parse_category(raw, url):
             path = "/" + (locale if locale in {"ar", "en"} else "en") + path
         image = photo_url(row.get("image_uri"))
         ad = dict.fromkeys(METRICS)
-        main_category, subcategory = category_codes(row)
+        cat_data = category_codes(row)
+        main_category, subcategory = cat_data[0], cat_data[1]
         ad.update(
             id=str(row["id"]), url=safe_url(path, url), title=plain(row["title"]),
             description=plain(row.get("masked_description")),
@@ -739,7 +740,8 @@ def parse_listing(raw, ad):
         raise SourceError("Не удалось прочитать данные объявления.")
     info = data["commonInfo"]
     for metadata in walk(data.get("loggingData") or {}):
-        main_category, subcategory = category_codes(metadata)
+        cat_data = category_codes(metadata)
+        main_category, subcategory = cat_data[0], cat_data[1]
         if main_category:
             ad["category_code"] = main_category
             ad["subcategory_code"] = subcategory
@@ -1150,6 +1152,12 @@ class Service:
             );
         """)
         self.db.commit()
+        
+        # АВТО-ОЧИСТКА БИТЫХ URL В БАЗЕ (лечит от падений)
+        with self.db:
+            self.db.execute("UPDATE users SET urls = '[]' WHERE urls IS NULL OR urls = '' OR json_type(urls) != 'array'")
+            self.db.execute("UPDATE users SET rules = '{}' WHERE rules IS NULL OR rules = '' OR json_type(rules) != 'object'")
+            
         self.allowed.update(r["chat"] for r in self.db.execute("SELECT chat FROM authorized"))
         self.revoked = {r["chat"] for r in self.db.execute("SELECT chat FROM revoked") if r["chat"] != ADMIN_ID}
         self.allowed.difference_update(self.revoked)
@@ -1209,7 +1217,18 @@ class Service:
         with self.db:
             self.db.execute("INSERT OR IGNORE INTO users(chat) VALUES (?)", (chat,))
         row = dict(self.db.execute("SELECT * FROM users WHERE chat=?", (chat,)).fetchone())
-        row["urls"], row["rules"] = json.loads(row["urls"]), json.loads(row["rules"])
+        try:
+            urls = json.loads(row.get("urls", "[]"))
+            row["urls"] = [u for u in urls if isinstance(u, str)] if isinstance(urls, list) else []
+        except Exception:
+            row["urls"] = []
+            
+        try:
+            rules = json.loads(row.get("rules", "{}"))
+            row["rules"] = rules if isinstance(rules, dict) else {}
+        except Exception:
+            row["rules"] = {}
+            
         return row
 
     def save(self, chat, **changes):
@@ -1314,6 +1333,8 @@ class Service:
             async with self.lock:
                 self.reader.browser_failures = 0
                 for source in list(self.state(chat)["urls"]):
+                    if not isinstance(source, str):
+                        continue
                     url, pages_seen = recent_source(source), set()
                     known_pages = 0
                     scan_rules = self.state(chat)["rules"]
@@ -3178,6 +3199,8 @@ async def panel(update, context, screen="home", notice=""):
         lines = ["🔗 <b>Категории поиска</b>", "", "Каждую ссылку можно заменить или удалить."]
         rows = []
         for index, url in enumerate(state["urls"], 1):
+            if not isinstance(url, str):
+                continue
             lines.append(f"\n<b>{index}. {source_country(url)}</b>\n{ui_url(url)}")
             key = source_key(url)
             rows.append([(f"✏️ Заменить №{index}", "ui:replace:" + key),
@@ -3219,7 +3242,7 @@ async def panel(update, context, screen="home", notice=""):
         keyboard = get_main_menu()
     else:
         active = chat in service.tasks and not service.tasks[chat].done()
-        countries = ", ".join(dict.fromkeys(source_country(url) for url in state["urls"])) or "не выбрана"
+        countries = ", ".join(dict.fromkeys(source_country(url) for url in state["urls"] if isinstance(url, str))) or "не выбрана"
         text = ("🔎 <b>Панель поиска OpenSooq</b>\n\n"
                 f"🌍 {countries}\n"
                 f"🔗 Категорий: <b>{len(state['urls'])}/5</b>\n"
@@ -4632,7 +4655,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v28_auto_dialogues_fixed] Создание Telegram Application")
+    log.info("[boot_v29_auto_dialogues_fixed] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
