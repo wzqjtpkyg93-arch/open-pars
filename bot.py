@@ -116,10 +116,12 @@ def category_codes(value):
         return "", ""
     def first(keys):
         return next((value[k].strip() for k in keys if isinstance(value.get(k), str) and value[k].strip()), "")
-    return (
+    # Берем строго два элемента, чтобы избежать ошибки too many values to unpack
+    res = (
         first(("cat1_code", "categoryReportingName", "category_reporting_name", "category_code", "cat_code")),
         first(("cat2_code", "subCategoryReportingName", "subcategory_reporting_name", "subcategory_code")),
     )
+    return res[:2]
 
 
 def excluded_topic(ad):
@@ -635,7 +637,7 @@ def parse_category_dom(soup, url, documents):
             continue
         seen.add(ad_id)
         post = metadata.get(ad_id, {})
-        main_category, subcategory = category_codes(post)
+        main_category, subcategory = category_codes(post)[:2]
         price_node = heading.find_previous_sibling("span")
         price_text = price_node.get_text(" ", strip=True) if price_node else ""
         currency_match = re.search(r"\b([A-Z]{3})\b", price_text)
@@ -813,8 +815,8 @@ class Reader:
                 delay = float(retry)
             except ValueError:
                 try:
-                    delay = parsedate_to_datetime(retry).timestamp() - time.time()
-                except (ValueError, TypeError, OverflowError):
+                    delay = parsedate_to_datetime(retry.split(",")[0]).timestamp() - time.time()
+                except (ValueError, TypeError, OverflowError, AttributeError):
                     delay = 300
             self.pauses[host] = time.monotonic() + max(60, min(3600, delay))
             raise RateLimit("OpenSooq ограничил запросы: HTTP 429.")
@@ -4630,7 +4632,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v27_auto_dialogues] Создание Telegram Application")
+    log.info("[boot_v28_auto_dialogues_fixed] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
