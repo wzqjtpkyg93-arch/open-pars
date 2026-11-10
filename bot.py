@@ -102,8 +102,15 @@ PAYMENT_CAPTION = (
 PHOTO_STAGE = 7
 FINAL_STAGE = 8
 DIALOGUE_STAGE_LABELS = (
-    'Наличие', 'Состояние', 'Срок использования', 'Причина продажи',
-    'Чек', 'Цена', 'Доставка', 'Скриншот оплаты', 'Финальный чек',
+    'Наличие',
+    'Состояние',
+    'Срок использования',
+    'Причина продажи',
+    'Чек',
+    'Цена',
+    'Доставка',
+    'Скриншот оплаты',
+    'Финальный чек',
 )
 
 SECRET_ENV_KEYS = ("BOT_TOKEN", "XROCKET_API_TOKEN", "OPENSOOQ_PROXY_URL",
@@ -2260,8 +2267,8 @@ class SellerDialogues:
                     values = tuple(json.loads(row['questions']))
                 except (ValueError, TypeError):
                     values = ()
-                if values == LEGACY_DIALOG_QUESTIONS:
-                    values = LEGACY_DIALOG_QUESTIONS + (DIALOG_QUESTIONS[-1],)
+                if len(values) == 6:
+                    values = values + (DIALOG_QUESTIONS[-1],)
                 if values not in (DIALOG_QUESTIONS, LEGACY_DIALOG_QUESTIONS + (DIALOG_QUESTIONS[-1],)):
                     values = DIALOG_QUESTIONS
                 self.db.execute('UPDATE seller_dialogues SET questions=? WHERE id=?',
@@ -2436,8 +2443,8 @@ class SellerDialogues:
 
         if decision == 'complete':
             self.save(token, state='complete', cursor=cursor,
-                      note='Продавец подтвердил. Сценарий завершён.')
-            await self.notify(row, '✅ Продавец подтвердил. Сценарий завершён.')
+                      note='Вопросы о товаре завершены. Проверь ответы продавца.')
+            await self.notify(row, '✅ Вопросы о товаре завершены. Проверь ответы продавца и продолжи переписку вручную.')
             return
 
         if decision == 'photo':
@@ -4651,7 +4658,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v31_auto_dialogues_fixed] Создание Telegram Application")
+    log.info("[boot_v32_auto_dialogues_fixed] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
