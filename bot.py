@@ -1152,12 +1152,6 @@ class Service:
             );
         """)
         self.db.commit()
-        
-        # АВТО-ОЧИСТКА БИТЫХ URL В БАЗЕ (лечит от падений)
-        with self.db:
-            self.db.execute("UPDATE users SET urls = '[]' WHERE urls IS NULL OR urls = '' OR json_type(urls) != 'array'")
-            self.db.execute("UPDATE users SET rules = '{}' WHERE rules IS NULL OR rules = '' OR json_type(rules) != 'object'")
-            
         self.allowed.update(r["chat"] for r in self.db.execute("SELECT chat FROM authorized"))
         self.revoked = {r["chat"] for r in self.db.execute("SELECT chat FROM revoked") if r["chat"] != ADMIN_ID}
         self.allowed.difference_update(self.revoked)
@@ -3210,7 +3204,9 @@ async def panel(update, context, screen="home", notice=""):
         rows.extend([[("＋ Добавить ссылку", "ui:add"), ("🌍 Выбрать страну", "ui:countries")], back])
         text, keyboard = "\n".join(lines), ui_keyboard(rows)
     elif screen == "filters":
-        rows = [[(label, "ui:metric:" + key)] for key, label in FILTER_LABELS.items()]
+        rows = []
+        for key, label in FILTER_LABELS.items():
+            rows.append([(label, "ui:metric:" + key)])
         rows.extend([[("🔎 Искать слова", "ui:field:keywords"), ("🚫 Исключить слова", "ui:field:exclude")],
                      [("💱 Валюта", "ui:currency"), ("❔ Нет данных", "ui:unknown")],
                      [("↺ Сбросить фильтры", "ui:reset")], back])
@@ -4655,7 +4651,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v29_auto_dialogues_fixed] Создание Telegram Application")
+    log.info("[boot_v31_auto_dialogues_fixed] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
