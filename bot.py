@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import asyncio
 import hashlib
 import hmac
@@ -2443,8 +2442,8 @@ class SellerDialogues:
 
         if decision == 'complete':
             self.save(token, state='complete', cursor=cursor,
-                      note='Вопросы о товаре завершены. Проверь ответы продавца.')
-            await self.notify(row, '✅ Вопросы о товаре завершены. Проверь ответы продавца и продолжи переписку вручную.')
+                      note='Вопросы о товаре завершены.')
+            await self.notify(row, '✅ Вопросы о товаре завершены.')
             return
 
         if decision == 'photo':
@@ -3516,7 +3515,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                  ui_keyboard([[("Да, удалить", "ui:delete_yes:" + key)], [("Отмена", "menu_sources")]]))
         elif data == "ui:countries":
             await show_panel(update, "🌍 <b>Выберите страну</b>\n\nБудет предложена общая выдача выбранной страны.",
-                             ui_keyboard([[(label, "ui:country:" + code)] for code, label in COUNTRY_LABELS.items()] + [("‹ Главное меню", "menu_home")]))
+                             ui_keyboard([[(label, "ui:country:" + code)] for code, label in COUNTRY_LABELS.items()] + [("‹ Главное меню", "menu_home")]]))
         elif data.startswith("ui:country:"):
             code = data.rsplit(":", 1)[1]
             if code not in COUNTRY_LABELS:
@@ -4658,7 +4657,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v32_auto_dialogues_fixed] Создание Telegram Application")
+    log.info("[boot_v35_auto_dialogues_fixed] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
