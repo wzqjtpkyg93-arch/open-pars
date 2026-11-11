@@ -89,18 +89,8 @@ DIALOG_QUESTIONS = (
     'Why are u selling?',
     'Do u still have the receipt?',
     'Is that your final price?',
-    'Okay I’m ready to buy. Can I place an order with delivery through the OpenSooq app?',
 )
 LEGACY_DIALOG_QUESTIONS = ("Hi! I'm interested in this item. Is it still available?", 'Is everything in good condition?', 'How long have you been using it?', 'Why are you selling?', 'Do you still have the receipt?', 'Is that your final price?')
-FINAL_CHECK = "it’s ok?"
-PAYMENT_PHOTO = Path(os.getenv("PAYMENT_PHOTO_PATH", str(DATA_DIR / "opensooq-pay.png")))
-PAYMENT_CAPTION = (
-    "This is how OpenSooq Pay & Delivery works: 1) you pay the full amount in the app, "
-    "2) I get a QR and confirm my bank card, 3) the money reaches my card within 5 minutes, "
-    "4) the OpenSooq courier picks up the item. Safe and secure."
-)
-PHOTO_STAGE = 7
-FINAL_STAGE = 8
 DIALOGUE_STAGE_LABELS = (
     'Наличие',
     'Состояние',
@@ -108,9 +98,6 @@ DIALOGUE_STAGE_LABELS = (
     'Причина продажи',
     'Чек',
     'Цена',
-    'Доставка',
-    'Скриншот оплаты',
-    'Финальный чек',
 )
 
 SECRET_ENV_KEYS = ("BOT_TOKEN", "XROCKET_API_TOKEN", "OPENSOOQ_PROXY_URL",
@@ -1095,7 +1082,7 @@ HELP_TEXT = """ℹ️ Команды
 /seller_views — просмотры профиля продавца
 /listings_count — активные объявления продавца
 
-💬 Диалоги с продавцами идут автоматически: 7 вопросов → скриншот оплаты → «it’s ok?».
+💬 Диалоги с продавцами идут автоматически: шесть вопросов о товаре. После ответа о цене придёт уведомление о завершении.
 Если ответ неоднозначный, бот пришлёт уведомление и остановит автоотправку для этого диалога.
 Для добавления категории отправьте её ссылку.
 """
@@ -1530,13 +1517,6 @@ def dialogue_answer(text, stage, answered):
     if re.search(r"\b(stop messaging|stop contacting|do not contact|don't contact|leave me alone|not interested)\b|لا تراسل", text):
         return 'stopped', answered, None
 
-    if stage == FINAL_STAGE:
-        if re.search(r"\b(no|nope|not|cancel|won't|refuse)\b|لا\b", text):
-            return 'stopped', answered, None
-        if re.search(r"\b(ok|okay|yes|yeah|sure|fine|go ahead|proceed|confirm)\b|طيب|تمام|اوك", text):
-            return 'complete', answered, None
-        return 'review', answered, None
-
     if stage not in range(len(DIALOG_QUESTIONS)):
         return 'review', answered, None
 
@@ -1582,14 +1562,14 @@ def dialogue_answer(text, stage, answered):
 
     next_stage = next((i for i in range(stage + 1, len(DIALOG_QUESTIONS)) if i not in answered), None)
     if next_stage is None:
-        return 'photo', answered, PHOTO_STAGE
+        return 'complete', answered, None
     return 'next', answered, next_stage
 
 
 def dialogue_questions(value):
-    allowed = (DIALOG_QUESTIONS, LEGACY_DIALOG_QUESTIONS + (DIALOG_QUESTIONS[-1],))
+    allowed = (DIALOG_QUESTIONS, LEGACY_DIALOG_QUESTIONS)
     if not isinstance(value, (list, tuple)) or tuple(value) not in allowed:
-        raise ValueError('Доступен фиксированный сценарий из семи вопросов.')
+        raise ValueError('Доступен фиксированный сценарий из шести вопросов.')
     return tuple(value)
 
 
@@ -2145,7 +2125,7 @@ class OpenSooqChatBrowser:
         await send.click()
 
     async def send(self, text, after):
-        if text not in self.questions and text != FINAL_CHECK:
+        if text not in self.questions:
             raise DialogueUnavailable('Сообщение вне сценария.')
         box = self.page.get_by_placeholder('Message Text...', exact=True)
         await box.fill(text)
@@ -2157,32 +2137,6 @@ class OpenSooqChatBrowser:
                     return m['id']
         raise DialogueUnavailable('Результат отправки неизвестен; повтор запрещён.')
 
-    async def send_photo(self, image_path, caption, after):
-        if not Path(image_path).is_file():
-            raise DialogueUnavailable('Скриншот OpenSooq Pay не найден на сервере.')
-        box = self.page.get_by_placeholder('Message Text...', exact=True)
-        await box.fill(caption)
-        attach = self.page.locator(
-            'button:has(svg[data-icon="paperclip"]), button:has(svg[data-icon="image"]), label:has(input[type="file"])'
-        ).first
-        if await attach.count() == 0:
-            file_input = self.page.locator('input[type="file"]').first
-            if await file_input.count() == 0:
-                raise DialogueUnavailable('Не найдена кнопка вложения фото.')
-            await file_input.set_input_files(str(image_path))
-        else:
-            async with self.page.expect_file_chooser() as fc_info:
-                await attach.click()
-            chooser = await fc_info.value
-            await chooser.set_files(str(image_path))
-        await asyncio.sleep(0.5)
-        await self._click_send()
-        for delay in (0.5, 0.7, 1.0, 1.5, 2.0):
-            await asyncio.sleep(delay)
-            for m in await self.messages():
-                if m['id'] > after and m['direction'] == 'out':
-                    return m['id']
-        raise DialogueUnavailable('Результат отправки фото неизвестен.')
 
     async def first(self, ad):
         await self.goto(ad['url'])
@@ -2267,12 +2221,18 @@ class SellerDialogues:
                     values = tuple(json.loads(row['questions']))
                 except (ValueError, TypeError):
                     values = ()
-                if len(values) == 6:
-                    values = values + (DIALOG_QUESTIONS[-1],)
-                if values not in (DIALOG_QUESTIONS, LEGACY_DIALOG_QUESTIONS + (DIALOG_QUESTIONS[-1],)):
+                if len(values) == 7:
+                    values = values[:len(DIALOG_QUESTIONS)]
+                if values not in (DIALOG_QUESTIONS, LEGACY_DIALOG_QUESTIONS):
                     values = DIALOG_QUESTIONS
                 self.db.execute('UPDATE seller_dialogues SET questions=? WHERE id=?',
                                 (json.dumps(values, ensure_ascii=False), row['id']))
+            # Retire delivery/payment steps persisted by an older version.
+            self.db.execute(
+                "UPDATE seller_dialogues SET state='complete', pending_stage=NULL, "
+                "pending_text='', pending_after=0, note='Вопросы о товаре завершены.' "
+                "WHERE stage>=? OR pending_stage>=?",
+                (len(DIALOG_QUESTIONS), len(DIALOG_QUESTIONS)))
             self.db.execute("UPDATE seller_dialogues SET state='queued', pending_stage=NULL, pending_text='', note='Автоочередь.' "
                             "WHERE state IN ('review','approved','queued')")
         self.db.commit()
@@ -2381,8 +2341,8 @@ class SellerDialogues:
                 return
             self.save(token, room=room, state='waiting', stage=0, cursor=message_id,
                       pending_text='', pending_stage=None,
-                      note='Отправлен вопрос 1/7. Ждём ответ.')
-            await self.notify(row, 'Отправлен вопрос 1/7: ' + questions[0])
+                      note='Отправлен вопрос 1/6. Ждём ответ.')
+            await self.notify(row, 'Отправлен вопрос 1/6: ' + questions[0])
             return
 
         if not row['room']:
@@ -2447,10 +2407,6 @@ class SellerDialogues:
             await self.notify(row, '✅ Вопросы о товаре завершены. Проверь ответы продавца и продолжи переписку вручную.')
             return
 
-        if decision == 'photo':
-            await self.send_photo_step(token, ad, row, cursor)
-            return
-
         if next_stage is not None and next_stage < len(questions):
             self.save(token, state='sending', stage=next_stage,
                       pending_text=questions[next_stage], pending_stage=next_stage, pending_after=cursor)
@@ -2463,31 +2419,9 @@ class SellerDialogues:
                 return
             self.save(token, state='waiting', stage=next_stage, cursor=new_id,
                       pending_text='', pending_stage=None,
-                      note=f'Отправлен вопрос {next_stage + 1}/7. Ждём ответ.')
-            await self.notify(row, f'Отправлен вопрос {next_stage + 1}/7: ' + questions[next_stage])
+                      note=f'Отправлен вопрос {next_stage + 1}/6. Ждём ответ.')
+            await self.notify(row, f'Отправлен вопрос {next_stage + 1}/6: ' + questions[next_stage])
 
-    async def send_photo_step(self, token, ad, row, cursor):
-        self.save(token, state='sending', pending_stage=PHOTO_STAGE,
-                  pending_text='[photo]', pending_after=cursor,
-                  note='Отправляем фото оплаты.')
-        try:
-            new_id = await self.transport.send_photo(PAYMENT_PHOTO, PAYMENT_CAPTION, cursor)
-        except DialogueUnavailable as exc:
-            self.save(token, state='review', pending_text='', pending_stage=None,
-                      note='Не удалось отправить фото: ' + str(exc)[:200])
-            await self.notify(row, 'Не удалось отправить фото оплаты: ' + str(exc)[:300])
-            return
-        try:
-            final_id = await self.transport.send(FINAL_CHECK, new_id)
-        except DialogueUnavailable as exc:
-            self.save(token, state='review', cursor=new_id, pending_text='', pending_stage=None,
-                      note='Фото отправлено, но «it’s ok?» не ушло: ' + str(exc)[:200])
-            await self.notify(row, 'Фото ушло, но финальный вопрос нет.')
-            return
-        self.save(token, state='waiting', stage=FINAL_STAGE, cursor=final_id,
-                  pending_text='', pending_stage=None,
-                  note='Фото оплаты и «it’s ok?» отправлены. Ждём подтверждения.')
-        await self.notify(row, '📸 Отправлено фото оплаты и «it’s ok?».')
 
     async def poll(self, context=None):
         await self.flush_notifications()
@@ -3516,7 +3450,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                  ui_keyboard([[("Да, удалить", "ui:delete_yes:" + key)], [("Отмена", "menu_sources")]]))
         elif data == "ui:countries":
             await show_panel(update, "🌍 <b>Выберите страну</b>\n\nБудет предложена общая выдача выбранной страны.",
-                             ui_keyboard([[(label, "ui:country:" + code)] for code, label in COUNTRY_LABELS.items()] + [("‹ Главное меню", "menu_home")]))
+                             ui_keyboard([[(label, "ui:country:" + code)] for code, label in COUNTRY_LABELS.items()] + [[("‹ Главное меню", "menu_home")]]))
         elif data.startswith("ui:country:"):
             code = data.rsplit(":", 1)[1]
             if code not in COUNTRY_LABELS:
@@ -3625,9 +3559,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def phrases_panel(update, context, notice=''):
     if update.effective_user.id != ADMIN_ID:
         raise ValueError('Сценарий доступен владельцу.')
-    text = '💬 <b>Семь вопросов + скриншот + «it’s ok?»</b>\n\n'
+    text = '💬 <b>Шесть вопросов о товаре</b>\n\n'
     text += '\n\n'.join(f'<b>{i+1}. {DIALOGUE_STAGE_LABELS[i]}</b>\n{escape(q)}' for i, q in enumerate(DIALOG_QUESTIONS))
-    text += '\n\nПосле 7-го вопроса бот автоматически отправит скриншот OpenSooq Pay и спросит «it’s ok?». Все шаги выполняются без ручного подтверждения. При неоднозначном ответе продавца — уведомление в Telegram и остановка этого диалога.'
+    text += '\n\nПосле ответа на последний вопрос о цене бот завершит сценарий и пришлёт уведомление. Вопросы выполняются без ручного подтверждения. При неоднозначном ответе продавца — уведомление в Telegram и остановка этого диалога.'
     await show_panel(update, text, ui_keyboard([[('‹ Диалоги', 'talk:list')]]))
 
 
@@ -3672,7 +3606,7 @@ async def dialogue_panel(update, context, token=''):
         text += 'Аккаунт: ' + ('подключён' if dialogs.transport.configured() else 'не подключён — /account')
         keyboard = ui_keyboard(
             [[(json.loads(r['ad'])['seller_name'] + ' · ' + r['state'], 'talk:status:' + r['id'])] for r in rows]
-            + [[('📋 Семь вопросов', 'talk:phrases')],
+            + [[('📋 Шесть вопросов', 'talk:phrases')],
                [('⏸ Приостановить отправку', 'talk:pause_all')],
                [('‹ Главное меню', 'menu_home')]])
     await show_panel(update, text, keyboard)
@@ -4547,7 +4481,7 @@ def build_app(token, allowed, database):
                 BotCommand("testproxy", "Проверить прокси и просмотры"),
                 BotCommand("saved", "Сохранённые поиски"), BotCommand("cancel", "Отменить ввод"),
                 BotCommand("subscription", "Подписка и оплата"),
-                BotCommand("dialogs", "Диалоги"), BotCommand("phrases", "Семь вопросов"),
+                BotCommand("dialogs", "Диалоги"), BotCommand("phrases", "Шесть вопросов"),
             ])
         except TelegramError as exc:
             log.warning("[startup_commands] %s", error_text(exc))
@@ -4658,7 +4592,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v32_auto_dialogues_fixed] Создание Telegram Application")
+    log.info("[boot_v31_auto_dialogues_fixed] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
