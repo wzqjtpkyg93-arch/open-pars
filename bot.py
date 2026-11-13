@@ -335,7 +335,7 @@ def seller_keys(ad):
 
 def rules_key(rules):
     normalized = {k: int(v) if isinstance(v, float) and v.is_integer() else v for k, v in rules.items()}
-    return hashlib.sha256(json.dumps(normalized, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    return hashlib.sha256(("filter-v2:" + json.dumps(normalized, sort_keys=True, ensure_ascii=False)).encode()).hexdigest()
 
 
 def recent_source(url):
@@ -715,7 +715,7 @@ def parse_category(raw, url):
         ad.update(
             id=str(row["id"]), url=safe_url(path, url), title=plain(row["title"]),
             description=plain(row.get("masked_description")),
-            price=number(row.get("price_amount")), currency=plain(row.get("price_currency_iso")),
+            price=number(row.get("price_amount")), currency=plain(row.get("price_currency_iso")).upper(),
             photos=count(row.get("image_count")), images=[image] if image else [],
             views=count(row.get("views_count")), seller_id=str(row.get("member_id") or ""),
             seller_name=plain(row.get("member_display_name")), seller_url="",
@@ -798,8 +798,12 @@ def parse_listing(raw, ad):
             break
     prices = ((data.get("listing") or {}).get("price") or {}).get("prices", [])
     if prices:
-        ad["price"] = number(prices[0].get("price"))
-        ad["currency"] = plain(prices[0].get("key") or prices[0].get("currencyLabel")) or ad.get("currency", "")
+        price = number(prices[0].get("price"))
+        if price is not None:
+            ad["price"] = price
+        currency = plain(prices[0].get("key") or prices[0].get("currencyLabel")).upper()
+        if re.fullmatch(r"[A-Z]{3}", currency):
+            ad["currency"] = currency
     return ad
 
 
@@ -973,7 +977,7 @@ class Reader:
 
     async def enrich(self, ad, rules=None, seller_seen=None):
         if excluded_topic(ad):
-            ad["_filtered_before_profile"] = True
+            ad["_filtered_before_profile"] = "topic"
             return ad, ""
         raw, final = await self.get(ad["url"])
         if urlsplit(final).hostname != urlsplit(ad["url"]).hostname:
@@ -981,7 +985,7 @@ class Reader:
         ad["url"] = final
         ad = await asyncio.to_thread(parse_listing, raw, ad)
         if excluded_topic(ad):
-            ad["_filtered_before_profile"] = True
+            ad["_filtered_before_profile"] = "topic"
             return ad, ""
         if rules:
             early_keys = {"keywords", "exclude", "currency"} | {
@@ -992,7 +996,7 @@ class Reader:
             early_rules = {k: v for k, v in rules.items() if k in early_keys}
             early_rules["unknown"] = "include"
             if not matches(ad, early_rules)[0]:
-                ad["_filtered_before_profile"] = True
+                ad["_filtered_before_profile"] = "rules"
                 return ad, ""
         if seller_seen is not None and seller_seen(ad):
             ad["_seller_already_sent"] = True
@@ -1118,6 +1122,9 @@ def report_text(stats, elapsed, outcome):
             f"Страниц: {stats['pages']} · Карточек: {stats['found']}\n"
             f"Проверено карточек: {stats['checked']}\n"
             f"Отсеяно фильтрами: {stats['filtered']} · Ошибок: {stats['errors']}")
+    if stats["filtered"]:
+        text += (f"\nТематика: {stats['filtered_topic']} · Настройки: {stats['filtered_rules']}"
+                 f" · Нет данных для фильтра: {stats['filtered_missing']}")
     if stats["history_boundary"]:
         text += "\n\nСвежая часть выдачи проверена; дальше знакомые карточки. Глубокая проверка: /deepcheck."
     return text
@@ -1412,6 +1419,7 @@ class Service:
                             stats["checked"] += 1
                             if excluded_topic(ad):
                                 stats["filtered"] += 1
+                                stats["filtered_topic"] += 1
                                 self.mark_checked(chat, signature, key)
                                 continue
                             try:
@@ -1425,8 +1433,10 @@ class Service:
                                     stats["seller_duplicates"] += 1
                                     self.mark_checked(chat, signature, key)
                                     continue
-                                if ad.pop("_filtered_before_profile", False):
+                                rejection = ad.pop("_filtered_before_profile", False)
+                                if rejection:
                                     stats["filtered"] += 1
+                                    stats["filtered_topic" if rejection == "topic" else "filtered_rules"] += 1
                                     self.mark_checked(chat, signature, key)
                                     continue
                                 if warning:
@@ -1434,6 +1444,10 @@ class Service:
                                 accepted, absent = matches(ad, rules)
                                 if not accepted:
                                     stats["filtered"] += 1
+                                    if absent and rules.get("unknown") != "include":
+                                        stats["filtered_missing"] += 1
+                                    else:
+                                        stats["filtered_rules"] += 1
                                     if not absent and not warning:
                                         self.mark_checked(chat, signature, key)
                                     continue
@@ -3428,7 +3442,7 @@ async def panel(update, context, screen="home", notice=""):
                 f"Мониторинг: {'🟢 включён' if state['enabled'] else '⚪ выключен'}\n"
                 f"Проверка: {'выполняется или ожидает очереди' if active else 'не выполняется'}\n"
                 f"Категорий: {len(state['urls'])} · Интервал: {state['minutes']} мин.\n\n"
-                + (state["last"] or "Проверок ещё не было."))
+                + ("Последний отчёт:\n" + state["last"] if state["last"] else "Проверок ещё не было."))
         keyboard = get_main_menu()
     else:
         active = chat in service.tasks and not service.tasks[chat].done()
