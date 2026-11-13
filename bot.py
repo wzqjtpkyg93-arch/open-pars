@@ -2244,13 +2244,40 @@ class OpenSooqChatBrowser:
             if not self.guard():
                 raise DialogueUnavailable('Диалог остановлен владельцем.')
             step = 'нажатие кнопки Send Message'
-            await self.page.get_by_role('button', name='Send Message', exact=True).click()
+            rejected = await self._submit_first_message()
             step = 'поиск первого сообщения в истории'
-            return await self.confirm_first(ad)
+            try:
+                return await self.confirm_first(ad)
+            except DialogueUnavailable as exc:
+                if rejected:
+                    statuses = ', '.join(str(status) for status in sorted(rejected))
+                    raise DialogueUnavailable(f'{exc} После клика фоновый запрос OpenSooq вернул HTTP {statuses}.') from None
+                raise
         except DialogueUnavailable as exc:
             raise DialogueUnavailable(f'{step}. {exc}') from None
         except Exception as exc:
             raise DialogueUnavailable(f'{step}. Ошибка {type(exc).__name__}.') from None
+
+    async def _submit_first_message(self):
+        rejected = set()
+
+        def observe(response):
+            request = response.request
+            host = urlsplit(response.url).hostname or ''
+            if (host == 'opensooq.com' or host.endswith('.opensooq.com')) and (
+                    request.resource_type in {'fetch', 'xhr'} and request.method == 'POST'
+                    and response.status >= 400):
+                rejected.add(response.status)
+
+        page = self.page
+        page.on('response', observe)
+        try:
+            await page.get_by_role('button', name='Send Message', exact=True).click()
+            # Let the form process its reply before navigating away from the listing.
+            await asyncio.sleep(1)
+        finally:
+            page.remove_listener('response', observe)
+        return rejected
 
     async def confirm_first(self, ad):
         from playwright.async_api import TimeoutError as PlaywrightTimeout
