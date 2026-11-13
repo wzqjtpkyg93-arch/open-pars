@@ -1,4 +1,4 @@
-FROM ghcr.io/xtls/xray-core:26.10.29 AS xray
+FROM ghcr.io/xtls/xray-core:26.10.31 AS xray
 
 FROM python:3.12-slim-bookworm
 
