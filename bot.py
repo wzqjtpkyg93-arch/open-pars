@@ -2418,6 +2418,10 @@ class SellerDialogues:
             PRIMARY KEY(chat,prompt)
         )""")
         self.db.execute('CREATE TABLE IF NOT EXISTS dialogue_preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+        self.db.execute("""CREATE TABLE IF NOT EXISTS dialogue_example_candidates(
+            dialogue TEXT NOT NULL, message_id INTEGER NOT NULL, prompt TEXT NOT NULL,
+            reply TEXT NOT NULL, PRIMARY KEY(dialogue,message_id)
+        )""")
         columns = {row['name'] for row in self.db.execute('PRAGMA table_info(seller_dialogues)')}
         with self.db:
             if 'questions' not in columns:
@@ -2524,6 +2528,45 @@ class SellerDialogues:
                               (chat, self.example_key(prompt))).fetchone()
         return row['reply'] if row else None
 
+    def save_manual_examples(self, row, messages):
+        automated = {dialogue_message_key(q) for q in (*DIALOG_QUESTIONS, *LEGACY_DIALOG_QUESTIONS)}
+        previous = None
+        with self.db:
+            for message in sorted(messages, key=lambda item: item['id']):
+                if message['direction'] == 'in':
+                    previous = message['text'].strip()
+                    continue
+                reply = message['text'].strip()
+                if (message['direction'] == 'out' and message['id'] > row['cursor']
+                        and previous and reply and max(len(previous), len(reply)) <= 1000
+                        and dialogue_message_key(reply) not in automated):
+                    if not re.search(
+                            r"https?://|www\.|@|(?:\d[ .()+-]*){7,}|"
+                            r"\b(payment|pay|deposit|transfer|bank|iban|card|qr|otp|password)\b"
+                            r"|بطاقة|تحويل|عربون|رابط",
+                            previous + '\n' + reply, re.I):
+                        self.db.execute(
+                            'INSERT OR IGNORE INTO dialogue_examples VALUES (?,?,?)',
+                            (row['chat'], self.example_key(previous), reply))
+                previous = None
+
+    def resolve_example(self, token, message_id, remember):
+        row = self.row(token)
+        with self.db:
+            candidate = self.db.execute(
+                'SELECT prompt,reply FROM dialogue_example_candidates WHERE dialogue=? AND message_id=?',
+                (token, message_id)).fetchone()
+            if candidate is None:
+                return False
+            if remember:
+                self.db.execute(
+                    'INSERT INTO dialogue_examples VALUES (?,?,?) '
+                    'ON CONFLICT(chat,prompt) DO UPDATE SET reply=excluded.reply',
+                    (row['chat'], self.example_key(candidate['prompt']), candidate['reply']))
+            self.db.execute('DELETE FROM dialogue_example_candidates WHERE dialogue=? AND message_id=?',
+                            (token, message_id))
+        return True
+
     def queue_replies(self, row, messages):
         with self.db:
             for message in messages:
@@ -2550,6 +2593,11 @@ class SellerDialogues:
                     buttons = [InlineKeyboardButton('📋 Диалог', callback_data='talk:status:' + row['id'])]
                     if event['part'] == -1 and row['room']:
                         buttons.append(InlineKeyboardButton('✍️ Открыть чат', url=row['room']))
+                    elif event['part'] == -2:
+                        buttons = [
+                            InlineKeyboardButton('Запомнить', callback_data=f"talk:remember:{row['id']}:{event['source']}"),
+                            InlineKeyboardButton('Пропустить', callback_data=f"talk:forget:{row['id']}:{event['source']}"),
+                        ]
                     elif event['part'] != -1:
                         buttons.append(InlineKeyboardButton('⏸ Пауза', callback_data='talk:pause:' + row['id']))
                     markup = InlineKeyboardMarkup([buttons])
@@ -2606,9 +2654,18 @@ class SellerDialogues:
             await self.transport.room(row['room'], ad)
             messages = await self.transport.messages()
         except DialogueUnavailable as exc:
-            self.save(token, state='review', note='Не удалось открыть чат: ' + str(exc)[:200])
+            if row['state'] in {'review', 'complete', 'paused'}:
+                self.save(token, cursor=row['cursor'])
+            else:
+                self.save(token, state='review', note='Не удалось открыть чат: ' + str(exc)[:200])
             return
         self.record(token, messages)
+        if row['state'] != 'sending':
+            self.save_manual_examples(row, messages)
+        if row['state'] in {'review', 'complete', 'paused'}:
+            self.save(token, cursor=max([row['cursor']] + [m['id'] for m in messages]))
+            await self.flush_notifications()
+            return
         self.queue_replies(row, messages)
         await self.flush_notifications()
 
@@ -2708,6 +2765,17 @@ class SellerDialogues:
             rows = list(self.db.execute(
                 "SELECT * FROM seller_dialogues WHERE chat=? AND state IN ('queued','waiting','sending') "
                 "ORDER BY updated LIMIT 5", (ADMIN_ID,)))
+            observed = self.db.execute(
+                "SELECT * FROM seller_dialogues WHERE chat=? AND room<>'' "
+                "AND state IN ('review','complete','paused') ORDER BY updated LIMIT 1",
+                (ADMIN_ID,)).fetchone()
+            if observed is not None and not self.transport.blocked:
+                row = dict(observed)
+                try:
+                    await self.run_one(row)
+                except Exception as exc:
+                    log.warning('[dialogue_observation] type=%s', type(exc).__name__)
+                    self.save(row['id'], cursor=row['cursor'])
             for db_row in rows:
                 row = dict(db_row)
                 self.transport.guard = lambda token=row['id']: (
@@ -3991,6 +4059,13 @@ async def dialogue_callback(update, context):
         if parts[1] == 'phrases':
             context.user_data.pop('panel_form', None)
             await phrases_panel(update, context)
+        elif parts[1] in {'remember', 'forget'} and len(parts) == 4:
+            saved = dialogs.resolve_example(parts[2], int(parts[3]), parts[1] == 'remember')
+            if not saved:
+                await query.message.reply_text('Этот пример уже обработан.')
+            else:
+                await query.message.edit_reply_markup(reply_markup=None)
+                await query.message.reply_text('Пример сохранён.' if parts[1] == 'remember' else 'Пример пропущен.')
         elif parts[1] == 'my_phrases':
             context.user_data.pop('panel_form', None)
             await custom_phrases_panel(update, dialogs)
