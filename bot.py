@@ -2155,7 +2155,6 @@ class OpenSooqChatBrowser:
         await self.goto('https://my.opensooq.com/chats')
         search = self.page.get_by_role('textbox', name='Search', exact=True)
         await search.wait_for(state='visible')
-        await self.page.locator('li').first.wait_for(state='visible')
         if not ad.get('seller_name') or not ad.get('title'):
             raise DialogueUnavailable('Нужны имя продавца и заголовок товара.')
         await search.fill(ad['seller_name'])
@@ -2240,16 +2239,25 @@ class OpenSooqChatBrowser:
             raise DialogueUnavailable(f'{step}. Ошибка {type(exc).__name__}.') from None
 
     async def confirm_first(self, ad):
-        room_url = await self.locate(ad)
-        if not room_url:
-            raise DialogueUnavailable('Первая отправка не подтверждена в истории.')
-        for attempt in range(5):
-            messages = await self.messages()
-            outgoing = [m for m in messages if m['direction'] == 'out' and m['text'] == self.questions[0]]
-            if outgoing:
-                return room_url, outgoing[-1]['id']
-            if attempt < 4:
-                await asyncio.sleep(0.5)
+        from playwright.async_api import TimeoutError as PlaywrightTimeout
+
+        for attempt in range(3):
+            try:
+                room_url = await self.locate(ad)
+            except PlaywrightTimeout:
+                if attempt == 2:
+                    raise DialogueUnavailable('Список чатов или выбранный чат не загрузился вовремя.') from None
+                room_url = ''
+            if room_url:
+                for check in range(5):
+                    messages = await self.messages()
+                    outgoing = [m for m in messages if m['direction'] == 'out' and m['text'] == self.questions[0]]
+                    if outgoing:
+                        return room_url, outgoing[-1]['id']
+                    if check < 4:
+                        await asyncio.sleep(0.5)
+            if attempt < 2:
+                await asyncio.sleep(1)
         raise DialogueUnavailable('Первый вопрос пока не найден в истории.')
 
 
