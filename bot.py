@@ -4209,6 +4209,23 @@ class AccountLogin:
         return (('request', self.request_seen), ('requestfinished', self.request_finished),
                 ('response', self.response_seen), ('requestfailed', self.request_failed))
 
+    async def _fit_chrome_window(self):
+        desktop = self.service.account_browser.desktop
+        session = await self.context.new_cdp_session(self.page)
+        try:
+            window = await session.send('Browser.getWindowForTarget')
+            window_id = window['windowId']
+            if window['bounds'].get('windowState') != 'normal':
+                await session.send('Browser.setWindowBounds', {
+                    'windowId': window_id, 'bounds': {'windowState': 'normal'},
+                })
+            await session.send('Browser.setWindowBounds', {
+                'windowId': window_id,
+                'bounds': {'left': 0, 'top': 0, 'width': desktop.width, 'height': desktop.height},
+            })
+        finally:
+            await session.detach()
+
     async def _open(self):
         if self.page is not None and not self.page.is_closed():
             return
@@ -4228,6 +4245,7 @@ class AccountLogin:
                 await self.page.goto('https://' + requested_host + '/en', wait_until='domcontentloaded', timeout=30000)
             self._account_entry_pending = False
             await self.page.bring_to_front()
+            await self._fit_chrome_window()
         except asyncio.CancelledError:
             await self._detach_page()
             raise
@@ -4278,6 +4296,8 @@ class AccountLogin:
             elif action == 'save':
                 return await self._save()
             await self.page.bring_to_front()
+            if action == 'focus':
+                await self._fit_chrome_window()
             await self.collect_flags(force=True)
             return {'message': 'Проверьте результат в окне Chrome. Вход подтверждается отдельно кнопкой «Сохранить вход».'}
 
