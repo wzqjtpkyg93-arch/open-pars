@@ -120,12 +120,11 @@ def category_codes(value):
 def excluded_topic(ad):
     codes = [re.sub(r"[^a-z0-9]", "", str(ad.get(k) or "").lower())
              for k in ("category_code", "subcategory_code")]
-    if codes[0]:
-        if codes[0].startswith(EXCLUDED_CATEGORY_PREFIXES):
-            return "category:" + codes[0]
-        if codes[1] and codes[1].startswith(EXCLUDED_CATEGORY_PREFIXES):
-            return "category:" + codes[1]
-    elif codes[1] and codes[1].startswith(EXCLUDED_CATEGORY_PREFIXES):
+    if codes[0].startswith(EXCLUDED_CATEGORY_PREFIXES):
+        return "category:" + codes[0]
+    if codes[0] in {"mobiletablet", "electronics", "fashionandkids", "homeandfurniture", "businessindustrial"}:
+        return ""
+    if codes[1].startswith(EXCLUDED_CATEGORY_PREFIXES):
         return "category:" + codes[1]
     title = unicodedata.normalize("NFKC", str(ad.get("title") or ""))
     title = re.sub(r"[\u064b-\u065f\u0670ـ]", "", title)
@@ -811,7 +810,7 @@ class Reader:
                 delay = float(retry)
             except ValueError:
                 try:
-                    delay = parsedate_to_datetime(retry.split(",")[0]).timestamp() - time.time()
+                    delay = parsedate_to_datetime(retry).timestamp() - time.time()
                 except (ValueError, TypeError, OverflowError, AttributeError):
                     delay = 300
             self.pauses[host] = time.monotonic() + max(60, min(3600, delay))
@@ -1323,7 +1322,14 @@ class Service:
                 for source in list(self.state(chat)["urls"]):
                     if not isinstance(source, str):
                         continue
-                    url, pages_seen = recent_source(source), set()
+                    try:
+                        url = recent_source(source)
+                    except ValueError:
+                        warnings["Сохранённая ссылка на категорию некорректна."] = True
+                        stats["errors"] += 1
+                        outcome = "partial"
+                        continue
+                    pages_seen = set()
                     known_pages = 0
                     scan_rules = self.state(chat)["rules"]
                     signature = rules_key(scan_rules)
@@ -2284,6 +2290,7 @@ class SellerDialogues:
         self.transport = OpenSooqChatBrowser(getattr(service, 'account_browser', None))
         self.lock = asyncio.Lock()
         self.cancelled = set()
+        self.notification_lock = asyncio.Lock()
         self.db.executescript('''
             CREATE TABLE IF NOT EXISTS dialogue_ads(
                 token TEXT PRIMARY KEY, chat INTEGER NOT NULL, ad_key TEXT NOT NULL,
@@ -2391,26 +2398,27 @@ class SellerDialogues:
                         (row['id'], message['id'], index, label + ': ' + part, time.time()))
 
     async def flush_notifications(self):
-        if self.service.closing:
-            return
-        rows = list(self.db.execute('SELECT * FROM dialogue_notifications WHERE sent=0 ORDER BY id LIMIT 20'))
-        for event in rows:
-            try:
-                row = self.row(event['dialogue'])
-                ad = json.loads(row['ad'])
-                header = '💬 ' + ad.get('seller_name', 'Продавец')[:100] + ' · ' + ad.get('title', 'Товар')[:160]
-                buttons = [InlineKeyboardButton('📋 Диалог', callback_data='talk:status:' + row['id'])]
-                if event['part'] == -1 and row['room']:
-                    buttons.append(InlineKeyboardButton('✍️ Открыть чат', url=row['room']))
-                elif event['part'] != -1:
-                    buttons.append(InlineKeyboardButton('⏸ Пауза', callback_data='talk:pause:' + row['id']))
-                markup = InlineKeyboardMarkup([buttons])
-                await telegram_call(self.service.bot.send_message, chat_id=ADMIN_ID,
-                                    text=header + '\n\n' + event['text'], reply_markup=markup)
-            except TelegramError:
-                break
-            with self.db:
-                self.db.execute('UPDATE dialogue_notifications SET sent=1 WHERE id=?', (event['id'],))
+        async with self.notification_lock:
+            if self.service.closing:
+                return
+            rows = list(self.db.execute('SELECT * FROM dialogue_notifications WHERE sent=0 ORDER BY id LIMIT 20'))
+            for event in rows:
+                try:
+                    row = self.row(event['dialogue'])
+                    ad = json.loads(row['ad'])
+                    header = '💬 ' + ad.get('seller_name', 'Продавец')[:100] + ' · ' + ad.get('title', 'Товар')[:160]
+                    buttons = [InlineKeyboardButton('📋 Диалог', callback_data='talk:status:' + row['id'])]
+                    if event['part'] == -1 and row['room']:
+                        buttons.append(InlineKeyboardButton('✍️ Открыть чат', url=row['room']))
+                    elif event['part'] != -1:
+                        buttons.append(InlineKeyboardButton('⏸ Пауза', callback_data='talk:pause:' + row['id']))
+                    markup = InlineKeyboardMarkup([buttons])
+                    await telegram_call(self.service.bot.send_message, chat_id=ADMIN_ID,
+                                        text=header + '\n\n' + event['text'], reply_markup=markup)
+                except TelegramError:
+                    break
+                with self.db:
+                    self.db.execute('UPDATE dialogue_notifications SET sent=1 WHERE id=?', (event['id'],))
 
     def start(self, token):
         ad = self.db.execute('SELECT * FROM dialogue_ads WHERE token=? AND chat=?', (token, ADMIN_ID)).fetchone()
