@@ -2140,17 +2140,25 @@ class OpenSooqChatBrowser:
         if urlsplit(self.page.url).hostname not in HOSTS | {'my.opensooq.com'}:
             raise DialogueUnavailable('OpenSooq перенаправил на вход.')
 
-    async def room(self, url, ad):
+    def _matches_room(self, url, ad):
         parsed = urlsplit(url)
         query = dict(parse_qsl(parsed.query))
         match = re.fullmatch(r'(\d+)-(\d+)-(\d+)', query.get('selectedRoom', ''))
-        if (parsed.hostname != 'my.opensooq.com' or parsed.path != '/chats'
-                or not match or match[1] != str(ad['id']) or match[3] != self.account
-                or (str(ad.get('seller_id') or '').isdecimal() and match[2] != str(ad['seller_id']))):
+        seller_id = str(ad.get('seller_id') or '')
+        return (parsed.scheme == 'https' and parsed.hostname == 'my.opensooq.com'
+                and parsed.path == '/chats' and match is not None
+                and match[1] == str(ad['id']) and match[3] == self.account
+                and (not seller_id.isdecimal() or match[2] == seller_id))
+
+    async def room(self, url, ad, *, reuse_open=False):
+        if not self._matches_room(url, ad):
             raise DialogueUnavailable('Диалог не совпадает с объявлением.')
-        await self.goto(url)
+        if not reuse_open or self.page is None or self.page.is_closed() or self.page.url != url:
+            await self.goto(url)
         textarea = self.page.get_by_placeholder('Message Text...', exact=True)
         await textarea.wait_for(state='visible')
+        if not self._matches_room(self.page.url, ad):
+            raise DialogueUnavailable('Открыт другой диалог.')
         header_links = self.page.locator('main a[href*="/search/"]')
         links = await header_links.evaluate_all('(els) => els.map(el => el.href)')
         if not any(urlsplit(h).path.rstrip('/').endswith('/search/' + str(ad['id'])) for h in links):
@@ -2176,8 +2184,8 @@ class OpenSooqChatBrowser:
         if count_rows == 0:
             return ''
         await rows.click()
-        await self.page.get_by_placeholder('Message Text...', exact=True).wait_for(state='visible')
-        return await self.room(self.page.url, ad)
+        await self.page.wait_for_url(lambda url: self._matches_room(url, ad), timeout=12000)
+        return await self.room(self.page.url, ad, reuse_open=True)
 
     async def messages(self):
         rows = await self.page.locator('[id^="msg-"]').evaluate_all('''els => els.map(el => ({
@@ -2249,7 +2257,10 @@ class OpenSooqChatBrowser:
 
         for attempt in range(3):
             try:
-                room_url = await self.locate(ad)
+                if self.page is not None and not self.page.is_closed() and self._matches_room(self.page.url, ad):
+                    room_url = await self.room(self.page.url, ad, reuse_open=True)
+                else:
+                    room_url = await self.locate(ad)
             except PlaywrightTimeout:
                 if attempt == 2:
                     raise DialogueUnavailable('Список чатов или выбранный чат не загрузился вовремя.') from None
