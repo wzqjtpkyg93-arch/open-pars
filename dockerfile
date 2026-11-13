@@ -32,6 +32,7 @@ RUN mkdir -p /opt/novnc \
     && rm /tmp/novnc.tar.gz
 
 COPY bot.py .
+COPY start.sh /app/start.sh
 
 RUN python -u /app/bot.py --check-desktop
 
