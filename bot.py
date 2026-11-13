@@ -100,6 +100,12 @@ DIALOGUE_STAGE_LABELS = (
     'Цена',
 )
 
+DIALOGUE_STATUSES = {
+    'queued': 'В очереди', 'waiting': 'Ждём ответ', 'sending': 'Проверяем отправку',
+    'paused': 'На паузе', 'review': 'Нужна проверка', 'stopped': 'Остановлен',
+    'complete': 'Завершён', 'approved': 'Одобрен',
+}
+
 SECRET_ENV_KEYS = ("BOT_TOKEN", "XROCKET_API_TOKEN", "OPENSOOQ_PROXY_URL",
                    "OPENSOOQ_CHAT_ACCOUNT_ID", "SUPPORT_USERNAME", "OPENAI_API_KEY")
 SECRET_RE = re.compile(r"(?:bot\d+:[A-Za-z0-9_-]+|Bearer\s+\S+)")
@@ -1581,6 +1587,10 @@ def dialogue_next(stage, answered):
 
 async def classify_seller_reply(text, stage, answered, question):
     fallback = dialogue_answer(text, stage, answered)
+    short_reply = unicodedata.normalize('NFKC', text).casefold().strip()
+    short_reply = re.sub(r'[\u064b-\u065f\u0670ـ]', '', short_reply).rstrip('.!?؟…').strip()
+    if stage in {0, 1, 4, 5} and short_reply in {'yes', 'yeah', 'yep', 'نعم', 'ايوه', 'أيوه'}:
+        return dialogue_next(stage, set(answered) | {stage})
     api_key = os.getenv('OPENAI_API_KEY', '').strip()
     if not api_key or fallback[0] == 'stopped':
         return fallback
@@ -1647,9 +1657,12 @@ async def classify_seller_reply(text, stage, answered, question):
 
 
 def dialogue_questions(value):
-    allowed = (DIALOG_QUESTIONS, LEGACY_DIALOG_QUESTIONS)
-    if not isinstance(value, (list, tuple)) or tuple(value) not in allowed:
-        raise ValueError('Доступен фиксированный сценарий из шести вопросов.')
+    if isinstance(value, (list, tuple)) and tuple(value) == LEGACY_DIALOG_QUESTIONS:
+        return tuple(value)
+    if (not isinstance(value, (list, tuple)) or not value or value[0] != DIALOG_QUESTIONS[0]
+            or any(not isinstance(q, str) or q not in DIALOG_QUESTIONS for q in value)
+            or len(set(value)) != len(value)):
+        raise ValueError('Выбери уникальные вопросы. Первый вопрос — о наличии.')
     return tuple(value)
 
 
@@ -2349,6 +2362,11 @@ class SellerDialogues:
                 part INTEGER NOT NULL,text TEXT NOT NULL,created REAL NOT NULL,sent INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(dialogue,source,part));
         ''')
+        self.db.execute("""CREATE TABLE IF NOT EXISTS dialogue_examples(
+            chat INTEGER NOT NULL, prompt TEXT NOT NULL, reply TEXT NOT NULL,
+            PRIMARY KEY(chat,prompt)
+        )""")
+        self.db.execute('CREATE TABLE IF NOT EXISTS dialogue_preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
         columns = {row['name'] for row in self.db.execute('PRAGMA table_info(seller_dialogues)')}
         with self.db:
             if 'questions' not in columns:
@@ -2360,7 +2378,9 @@ class SellerDialogues:
                     values = ()
                 if len(values) == 7:
                     values = values[:len(DIALOG_QUESTIONS)]
-                if values not in (DIALOG_QUESTIONS, LEGACY_DIALOG_QUESTIONS):
+                try:
+                    values = dialogue_questions(values)
+                except ValueError:
                     values = DIALOG_QUESTIONS
                 self.db.execute('UPDATE seller_dialogues SET questions=? WHERE id=?',
                                 (json.dumps(values, ensure_ascii=False), row['id']))
@@ -2375,7 +2395,15 @@ class SellerDialogues:
         self.db.commit()
 
     def questions(self, row=None):
-        return dialogue_questions(json.loads(row['questions'])) if row is not None else DIALOG_QUESTIONS
+        if row is not None:
+            return dialogue_questions(json.loads(row['questions']))
+        record = self.db.execute("SELECT value FROM dialogue_preferences WHERE key='questions'").fetchone()
+        return dialogue_questions(json.loads(record['value'])) if record else DIALOG_QUESTIONS
+
+    def set_preference(self, key, value):
+        with self.db:
+            self.db.execute('INSERT INTO dialogue_preferences VALUES (?,?) '
+                            'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, value))
 
     def register(self, chat, ad):
         if chat != ADMIN_ID:
@@ -2421,6 +2449,26 @@ class SellerDialogues:
         with self.db:
             self.db.executemany('INSERT OR IGNORE INTO dialogue_events VALUES (?,?,?,?,?)',
                                 [(token, m['id'], m['direction'], m['text'][:3000], time.time()) for m in messages])
+
+    @staticmethod
+    def example_key(text):
+        return ' '.join(unicodedata.normalize('NFKC', text).casefold().split())
+
+    def save_example(self, chat, prompt, reply):
+        key = self.example_key(prompt)
+        reply = reply.strip()
+        if not key or not reply or len(key) > 1000 or len(reply) > 1000:
+            raise ValueError('Нужны две непустые строки до 1000 символов каждая.')
+        with self.db:
+            self.db.execute(
+                'INSERT INTO dialogue_examples VALUES (?,?,?) '
+                'ON CONFLICT(chat,prompt) DO UPDATE SET reply=excluded.reply',
+                (chat, key, reply))
+
+    def example_reply(self, chat, prompt):
+        row = self.db.execute('SELECT reply FROM dialogue_examples WHERE chat=? AND prompt=?',
+                              (chat, self.example_key(prompt))).fetchone()
+        return row['reply'] if row else None
 
     def queue_replies(self, row, messages):
         with self.db:
@@ -2491,8 +2539,8 @@ class SellerDialogues:
                 return
             self.save(token, room=room, state='waiting', stage=0, cursor=message_id,
                       pending_text='', pending_stage=None,
-                      note='Отправлен вопрос 1/6. Ждём ответ.')
-            await self.notify(row, 'Отправлен вопрос 1/6: ' + questions[0])
+                      note=f'Отправлен вопрос 1/{len(questions)}. Ждём ответ.')
+            await self.notify(row, f'Отправлен вопрос 1/{len(questions)}: ' + questions[0])
             return
 
         if not row['room']:
@@ -2542,7 +2590,15 @@ class SellerDialogues:
         stage = row['stage']
         answered = json.loads(row['answered'])
         if stage in range(len(questions)):
-            decision, answered_set, next_stage = await classify_seller_reply(reply, stage, answered, questions[stage])
+            topics = (list(range(len(questions))) if questions == LEGACY_DIALOG_QUESTIONS
+                      else [DIALOG_QUESTIONS.index(question) for question in questions])
+            decision, recognized, _ = await classify_seller_reply(
+                reply, topics[stage], {topics[i] for i in answered if i in range(len(topics))}, questions[stage])
+            answered_set = {i for i, topic in enumerate(topics) if topic in recognized}
+            next_stage = None
+            if decision in {'next', 'complete'}:
+                next_stage = next((i for i in range(stage + 1, len(topics)) if i not in answered_set), None)
+                decision = 'next' if next_stage is not None else 'complete'
         else:
             decision, answered_set, next_stage = 'review', set(answered), None
         if token in self.cancelled or self.service.closing or self.service.account_login.active:
@@ -2557,7 +2613,11 @@ class SellerDialogues:
         if decision == 'review':
             self.save(token, state='review', cursor=cursor,
                       note='Неоднозначный ответ. Проверь и продолжи вручную.')
-            await self.notify(row, 'Неоднозначный ответ продавца. Проверь вручную.')
+            draft = self.example_reply(row['chat'], reply)
+            notice = 'Неоднозначный ответ продавца. Проверь вручную.'
+            if draft:
+                notice = 'Черновик из твоих примеров. Проверь перед отправкой:\n\n' + draft
+            await self.notify(row, notice)
             return
 
         if decision == 'complete':
@@ -2579,8 +2639,8 @@ class SellerDialogues:
                 return
             self.save(token, state='waiting', stage=next_stage, cursor=new_id,
                       pending_text='', pending_stage=None,
-                      note=f'Отправлен вопрос {next_stage + 1}/6. Ждём ответ.')
-            await self.notify(row, f'Отправлен вопрос {next_stage + 1}/6: ' + questions[next_stage])
+                      note=f'Отправлен вопрос {next_stage + 1}/{len(questions)}. Ждём ответ.')
+            await self.notify(row, f'Отправлен вопрос {next_stage + 1}/{len(questions)}: ' + questions[next_stage])
 
 
     async def poll(self, context=None):
@@ -3721,14 +3781,62 @@ async def phrases_panel(update, context, notice=''):
         raise ValueError('Сценарий доступен владельцу.')
     text = '💬 <b>Шесть вопросов о товаре</b>\n\n'
     text += '\n\n'.join(f'<b>{i+1}. {DIALOGUE_STAGE_LABELS[i]}</b>\n{escape(q)}' for i, q in enumerate(DIALOG_QUESTIONS))
-    text += '\n\nПосле ответа на последний вопрос о цене бот завершит сценарий и пришлёт уведомление. Вопросы выполняются без ручного подтверждения. При неоднозначном ответе продавца — уведомление в Telegram и остановка этого диалога.'
-    await show_panel(update, text, ui_keyboard([[('‹ Диалоги', 'talk:list')]]))
+    dialogs = context.application.bot_data['service'].dialogues
+    order = ' '.join(str(DIALOG_QUESTIONS.index(q) + 1) for q in dialogs.questions())
+    text += '\n\nПорядок для новых диалогов: ' + order
+    await show_panel(update, text, ui_keyboard([
+        [('Изменить порядок', 'talk:order'), ('Фото-черновик', 'talk:photo')],
+        [('‹ Диалоги', 'talk:list')],
+    ]))
 
 
 async def dialogue_settings_message(update, context):
     text = update.effective_message.text.strip()
     command = text.split(maxsplit=1)[0].split('@')[0].lower() if text else ''
     form = context.user_data.get('panel_form') or {}
+    if form.get('action') == 'dialogue_order' and not text.startswith('/'):
+        if update.effective_user.id != ADMIN_ID:
+            return True
+        if form['expires'] < time.time():
+            context.user_data.pop('panel_form', None)
+            await update.effective_message.reply_text('Открой настройку заново.')
+            return True
+        try:
+            indices = [int(part) for part in text.split()]
+            if any(i not in range(1, len(DIALOG_QUESTIONS) + 1) for i in indices):
+                raise ValueError
+            questions = dialogue_questions([DIALOG_QUESTIONS[i - 1] for i in indices])
+        except ValueError:
+            await update.effective_message.reply_text('Укажи уникальные номера от 1 до 6 через пробел. Начни с 1.')
+            return True
+        dialogs = context.application.bot_data['service'].dialogues
+        dialogs.set_preference('questions', json.dumps(questions, ensure_ascii=False))
+        context.user_data.pop('panel_form', None)
+        await phrases_panel(update, context)
+        return True
+    if command == '/example' or (form.get('action') == 'dialogue_example' and not text.startswith('/')):
+        if update.effective_user.id != ADMIN_ID:
+            return True
+        if command == '/example':
+            await ask_field(update, context, 'dialogue_example',
+                            'Отправь две строки. Первая — сообщение продавца, вторая — твой ответ.')
+            return True
+        if form['expires'] < time.time():
+            context.user_data.pop('panel_form', None)
+            await update.effective_message.reply_text('Время ввода истекло. Открой /example.')
+            return True
+        lines = text.splitlines()
+        try:
+            if len(lines) != 2:
+                raise ValueError('Отправь ровно две строки.')
+            dialogs = context.application.bot_data['service'].dialogues
+            dialogs.save_example(ADMIN_ID, *lines)
+        except ValueError as exc:
+            await update.effective_message.reply_text(str(exc))
+            return True
+        context.user_data.pop('panel_form', None)
+        await update.effective_message.reply_text('✅ Пример сохранён.')
+        return True
     if command != '/phrases' and form.get('action') != 'dialogue_phrase':
         return False
     context.user_data.pop('panel_form', None)
@@ -3747,10 +3855,7 @@ async def dialogue_panel(update, context, token=''):
         row = dialogs.row(token)
         questions = dialogs.questions(row)
         ad = json.loads(row['ad'])
-        statuses = {'queued': 'в очереди', 'waiting': 'ожидаем ответ', 'sending': 'проверяем отправку',
-                    'paused': 'автоответы на паузе', 'review': 'нужна ручная проверка',
-                    'stopped': 'остановлен', 'complete': 'сценарий завершён'}
-        text = f"💬 <b>{escape(ad['seller_name'])}</b>\n{escape(ad['title'])}\n\nСостояние: {statuses.get(row['state'], row['state'])}\n"
+        text = f"💬 <b>{escape(ad['seller_name'])}</b>\n{escape(ad['title'])}\n\nСостояние: {DIALOGUE_STATUSES.get(row['state'], 'Неизвестно')}\n"
         if 0 <= row['stage'] < len(DIALOGUE_STAGE_LABELS):
             text += '\nПоследний шаг: ' + escape(DIALOGUE_STAGE_LABELS[row['stage']]) + '\n'
         text += '\n' + escape(row['note'])
@@ -3764,14 +3869,29 @@ async def dialogue_panel(update, context, token=''):
             keyboard = InlineKeyboardMarkup(list(keyboard.inline_keyboard) + [[InlineKeyboardButton('✍️ Открыть чат', url=row['room'])]])
     else:
         rows = list(dialogs.db.execute('SELECT id,ad,state FROM seller_dialogues WHERE chat=? ORDER BY updated DESC LIMIT 20', (ADMIN_ID,)))
-        text = '💬 <b>Диалоги</b>\n\nОтветы продавцов приходят сюда. Все шаги выполняются автоматически.\nПри неоднозначном ответе автоотправка для этого диалога останавливается, придёт уведомление.\n\n'
+        text = '💬 <b>Диалоги</b>\n\n'
         text += 'Аккаунт: ' + ('подключён' if dialogs.transport.configured() else 'не подключён — /account')
         keyboard = ui_keyboard(
-            [[(json.loads(r['ad'])['seller_name'] + ' · ' + r['state'], 'talk:status:' + r['id'])] for r in rows]
-            + [[('📋 Шесть вопросов', 'talk:phrases')],
+            [[(json.loads(r['ad'])['seller_name'] + ' · ' + DIALOGUE_STATUSES.get(r['state'], 'Неизвестно'), 'talk:status:' + r['id'])] for r in rows]
+            + [[('📋 Шесть вопросов', 'talk:phrases'), ('＋ Пример ответа', 'talk:example')],
                [('⏸ Приостановить отправку', 'talk:pause_all')],
                [('‹ Главное меню', 'menu_home')]])
     await show_panel(update, text, keyboard)
+
+
+async def dialogue_photo_draft(update, context):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    form = context.user_data.get('panel_form') or {}
+    if form.get('action') != 'dialogue_photo' or form['expires'] < time.time():
+        return
+    dialogs = context.application.bot_data['service'].dialogues
+    message = update.effective_message
+    dialogs.set_preference('photo', json.dumps({
+        'file_id': message.photo[-1].file_id, 'caption': message.caption or '',
+    }, ensure_ascii=False))
+    context.user_data.pop('panel_form', None)
+    await message.reply_text('Фото сохранено в черновик.')
 
 
 async def dialogue_callback(update, context):
@@ -3786,6 +3906,18 @@ async def dialogue_callback(update, context):
         if parts[1] == 'phrases':
             context.user_data.pop('panel_form', None)
             await phrases_panel(update, context)
+        elif parts[1] == 'order':
+            await ask_field(update, context, 'dialogue_order', 'Отправь номера через пробел. Например, 1 2 6.')
+        elif parts[1] == 'photo':
+            record = dialogs.db.execute("SELECT value FROM dialogue_preferences WHERE key='photo'").fetchone()
+            if record:
+                draft = json.loads(record['value'])
+                await query.message.reply_photo(photo=draft['file_id'], caption=draft['caption'])
+            context.user_data['panel_form'] = dict(action='dialogue_photo', expires=time.time() + 600)
+            await query.message.reply_text('Пришли фото с подписью, чтобы сохранить черновик. Отмена: /cancel.')
+        elif parts[1] == 'example':
+            await ask_field(update, context, 'dialogue_example',
+                            'Отправь две строки. Первая — сообщение продавца, вторая — твой ответ.')
         elif parts[1] == 'start' and len(parts) == 3:
             async with dialogs.lock:
                 token = dialogs.start(parts[2])
@@ -4705,6 +4837,7 @@ def build_app(token, allowed, database):
     app = (Application.builder().token(token).concurrent_updates(False)
            .post_init(setup).post_stop(cleanup).post_shutdown(cleanup).build())
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, handle))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.PHOTO, dialogue_photo_draft))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_error_handler(on_error)
     return app
