@@ -2212,22 +2212,32 @@ class OpenSooqChatBrowser:
 
 
     async def first(self, ad):
-        await self.goto(ad['url'])
-        if urlsplit(self.page.url).path.rstrip('/') != urlsplit(ad['url']).path.rstrip('/'):
-            raise DialogueUnavailable('Объявление перенаправило на другую страницу.')
-        profiles = await self.page.locator('a[href*="/mid/"]').evaluate_all('(els) => els.map(el => el.href)')
-        expected = urlsplit(safe_url(ad['seller_url'], ad['url']))
-        if not any(urlsplit(u).hostname == expected.hostname
-                   and unquote(urlsplit(u).path).rstrip('/') == unquote(expected.path).rstrip('/')
-                   for u in profiles):
-            raise DialogueUnavailable('Профиль продавца изменился.')
-        box = self.page.get_by_placeholder('Message...', exact=True)
-        await box.wait_for(state='visible')
-        await box.fill(self.questions[0])
-        if not self.guard():
-            raise DialogueUnavailable('Диалог остановлен владельцем.')
-        await self.page.get_by_role('button', name='Send Message', exact=True).click()
-        return await self.confirm_first(ad)
+        step = 'открытие объявления'
+        try:
+            await self.goto(ad['url'])
+            step = 'проверка продавца'
+            if urlsplit(self.page.url).path.rstrip('/') != urlsplit(ad['url']).path.rstrip('/'):
+                raise DialogueUnavailable('Объявление перенаправило на другую страницу.')
+            profiles = await self.page.locator('a[href*="/mid/"]').evaluate_all('(els) => els.map(el => el.href)')
+            expected = urlsplit(safe_url(ad['seller_url'], ad['url']))
+            if not any(urlsplit(u).hostname == expected.hostname
+                       and unquote(urlsplit(u).path).rstrip('/') == unquote(expected.path).rstrip('/')
+                       for u in profiles):
+                raise DialogueUnavailable('Профиль продавца изменился.')
+            step = 'поиск и заполнение поля сообщения'
+            box = self.page.get_by_placeholder('Message...', exact=True)
+            await box.wait_for(state='visible')
+            await box.fill(self.questions[0])
+            if not self.guard():
+                raise DialogueUnavailable('Диалог остановлен владельцем.')
+            step = 'нажатие кнопки Send Message'
+            await self.page.get_by_role('button', name='Send Message', exact=True).click()
+            step = 'поиск первого сообщения в истории'
+            return await self.confirm_first(ad)
+        except DialogueUnavailable as exc:
+            raise DialogueUnavailable(f'{step}. {exc}') from None
+        except Exception as exc:
+            raise DialogueUnavailable(f'{step}. Ошибка {type(exc).__name__}.') from None
 
     async def confirm_first(self, ad):
         room_url = await self.locate(ad)
@@ -2418,10 +2428,12 @@ class SellerDialogues:
             self.save(token, state='sending', pending_text=questions[0], pending_stage=0, pending_after=0)
             try:
                 room, message_id = await self.transport.first(ad)
-            except DialogueUnavailable:
-                self.save(token, state='review', pending_text='', pending_stage=None,
-                          note='Отправка не подтверждена. Проверь историю чата.')
-                await self.notify(row, 'Отправка не подтверждена. Открой статус диалога и нажми «Проверить отправку».')
+            except DialogueUnavailable as exc:
+                reason = error_text(exc)[:300]
+                log.warning('[seller_dialogue] id=%s first=%s', token, reason)
+                note = 'Отправка не подтверждена. Этап: ' + reason
+                self.save(token, state='review', pending_text='', pending_stage=None, note=note)
+                await self.notify(row, note + '\nОткрой статус диалога и нажми «Проверить отправку».')
                 return
             self.save(token, room=room, state='waiting', stage=0, cursor=message_id,
                       pending_text='', pending_stage=None,
