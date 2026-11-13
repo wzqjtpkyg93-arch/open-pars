@@ -418,6 +418,12 @@ def parse_profile(raw, expected_id):
                     put("seller_views", match.group(1))
                     if result["seller_views"] is not None:
                         break
+                if not match and re.search(follower_label, text, re.I):
+                    match = re.search(rf"\b{view_label}\s*:\s*({numeric})(?![\w.,٬٫])", text, re.I)
+                    if match:
+                        put("seller_views", match.group(1))
+                        if result["seller_views"] is not None:
+                            break
                 parent = parent.parent
             if result["seller_views"] is not None:
                 break
@@ -920,11 +926,12 @@ class Reader:
                     self.check_html(raw)
                     profile = await asyncio.to_thread(parse_profile, raw, seller_id)
                     if all(profile.get(key) is not None for key in ("seller_views", "listings_count")):
+                        self.browser_failures = 0
                         return profile
                     if attempt < 3:
                         await asyncio.sleep(1.0)
                 if profile and any(v is not None for v in profile.values()):
-                    self.browser_failures += 1
+                    self.browser_failures = 0
                     return profile
                 raise SourceError("Статистика отсутствует в загруженном профиле.")
             except RateLimit:
