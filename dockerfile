@@ -1,3 +1,5 @@
+FROM ghcr.io/xtls/xray-core:26.10.29 AS xray
+
 FROM python:3.12-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
@@ -6,9 +8,13 @@ ENV PYTHONUNBUFFERED=1 \
     DATABASE_PATH=/var/data/bot.sqlite3 \
     DATA_DIR=/var/data \
     APP_TIMEZONE=Europe/Moscow \
-    PROFILE_BROWSER=1
+    PROFILE_BROWSER=1 \
+    XRAY_LOCATION_ASSET=/usr/local/share/xray
 
 WORKDIR /app
+
+COPY --from=xray /usr/local/bin/xray /usr/local/bin/xray
+COPY --from=xray /usr/local/share/xray/ /usr/local/share/xray/
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends xvfb xauth x11vnc curl ca-certificates fonts-dejavu-core \
