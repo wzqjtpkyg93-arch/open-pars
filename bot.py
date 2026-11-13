@@ -3324,7 +3324,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     raise ValueError('Включите Web Service с PORT на Render для страницы входа.')
                 token = await service.account_login.issue(country)
                 keyboard = InlineKeyboardMarkup([[InlineKeyboardButton('🔐 Войти в OpenSooq', url=origin + '/account#' + token)]])
-                await message.reply_text("Страна входа: " + COUNTRY_LABELS[country] + "\n\n🔐 Личный удалённый экран Chrome на 15 минут. Откройте ссылку в Safari. Внутри будет настоящее окно Chrome с адресной строкой. Сначала войдите через главную OpenSooq, затем откройте существующий чат и нажмите «Сохранить вход». На iPhone текст можно вводить полем под экраном. Бот продолжит использовать этот же браузер и профиль. Активные диалоги на паузе. После сохранения переписка начнёт работать автоматически.", reply_markup=keyboard)
+                await message.reply_text("🔐 Личный удалённый экран Chrome на 15 минут.", reply_markup=keyboard)
             else:
                 await disconnect_opensooq_account(service)
                 await message.reply_text("⏸ Аккаунт отключён от автоответчика, активные диалоги остановлены. Парсер работает как раньше.")
