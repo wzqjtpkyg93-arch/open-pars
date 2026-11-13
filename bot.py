@@ -2434,6 +2434,10 @@ class SellerDialogues:
             self.db.execute('INSERT INTO dialogue_preferences VALUES (?,?) '
                             'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, value))
 
+    def custom_phrases(self):
+        row = self.db.execute("SELECT value FROM dialogue_preferences WHERE key='custom_phrases'").fetchone()
+        return json.loads(row['value']) if row else []
+
     def register(self, chat, ad):
         if chat != ADMIN_ID:
             return ''
@@ -3814,7 +3818,8 @@ async def phrases_panel(update, context, notice=''):
     order = ' '.join(str(DIALOG_QUESTIONS.index(q) + 1) for q in dialogs.questions())
     text += '\n\nПорядок для новых диалогов: ' + order
     await show_panel(update, text, ui_keyboard([
-        [('Изменить порядок', 'talk:order'), ('Фото-черновик', 'talk:photo')],
+        [('Мои фразы', 'talk:my_phrases'), ('Фото-черновик', 'talk:photo')],
+        [('Изменить порядок', 'talk:order')],
         [('‹ Диалоги', 'talk:list')],
     ]))
 
@@ -3823,6 +3828,24 @@ async def dialogue_settings_message(update, context):
     text = update.effective_message.text.strip()
     command = text.split(maxsplit=1)[0].split('@')[0].lower() if text else ''
     form = context.user_data.get('panel_form') or {}
+    if form.get('action') == 'dialogue_custom_phrases' and not text.startswith('/'):
+        if update.effective_user.id != ADMIN_ID:
+            return True
+        if form['expires'] < time.time():
+            context.user_data.pop('panel_form', None)
+            await update.effective_message.reply_text('Время ввода истекло. Открой «Мои фразы» заново.')
+            return True
+        dialogs = context.application.bot_data['service'].dialogues
+        drafts = dialogs.custom_phrases()
+        additions = [line.strip() for line in text.splitlines() if line.strip()]
+        if not additions or len(drafts) + len(additions) > 20 or any(len(line) > 160 for line in additions):
+            await update.effective_message.reply_text('Всего можно сохранить до 20 фраз, до 160 символов каждая.')
+            return True
+        drafts.extend(additions)
+        dialogs.set_preference('custom_phrases', json.dumps(drafts, ensure_ascii=False))
+        context.user_data.pop('panel_form', None)
+        await update.effective_message.reply_text(f'Сохранено фраз в черновике: {len(drafts)}.')
+        return True
     if form.get('action') == 'dialogue_order' and not text.startswith('/'):
         if update.effective_user.id != ADMIN_ID:
             return True
@@ -3923,6 +3946,18 @@ async def dialogue_photo_draft(update, context):
     await message.reply_text('Фото сохранено в черновик.')
 
 
+async def custom_phrases_panel(update, dialogs):
+    drafts = dialogs.custom_phrases()
+    lines = ['<b>Мои фразы</b>']
+    buttons = []
+    version = hashlib.sha256(json.dumps(drafts).encode()).hexdigest()[:16]
+    for index, draft in enumerate(drafts):
+        lines.append(f'{index + 1}. {escape(draft)}')
+        buttons.append([(f'Удалить №{index + 1}', f'talk:delete_phrase:{index}:{version}')])
+    buttons.extend([[('＋ Добавить фразу', 'talk:add_phrase')], [('‹ Вопросы', 'talk:phrases')]])
+    await show_panel(update, '\n'.join(lines), ui_keyboard(buttons))
+
+
 async def dialogue_callback(update, context):
     query, user, chat = update.callback_query, update.effective_user, update.effective_chat
     if not user or user.id != ADMIN_ID or not chat or chat.type != 'private':
@@ -3935,6 +3970,20 @@ async def dialogue_callback(update, context):
         if parts[1] == 'phrases':
             context.user_data.pop('panel_form', None)
             await phrases_panel(update, context)
+        elif parts[1] == 'my_phrases':
+            context.user_data.pop('panel_form', None)
+            await custom_phrases_panel(update, dialogs)
+        elif parts[1] == 'add_phrase':
+            await ask_field(update, context, 'dialogue_custom_phrases',
+                            'Пришли свою фразу. Можно добавить несколько, по одной на строку.')
+        elif parts[1] == 'delete_phrase' and len(parts) == 4:
+            drafts = dialogs.custom_phrases()
+            version = hashlib.sha256(json.dumps(drafts).encode()).hexdigest()[:16]
+            index = int(parts[2])
+            if parts[3] == version and 0 <= index < len(drafts):
+                del drafts[index]
+                dialogs.set_preference('custom_phrases', json.dumps(drafts, ensure_ascii=False))
+            await custom_phrases_panel(update, dialogs)
         elif parts[1] == 'order':
             await ask_field(update, context, 'dialogue_order', 'Отправь только номера через пробел, без текста вопросов. Например: 1 2 7 10 6. Начни с 1.')
         elif parts[1] == 'photo':
