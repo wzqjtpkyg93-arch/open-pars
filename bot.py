@@ -674,7 +674,7 @@ def parse_category_dom(soup, url, documents):
                   published="", posted_label=relative_label(status.get_text(" ", strip=True)) if status else "")
         ads.append(ad)
     if cards and not ads:
-        raise SourceError("Новый формат карточек категории не удалось прочитать.")
+        raise SourceError("Новый формат объявлений категории не удалось прочитать.")
     next_link = soup.select_one("a[aria-label='Go to next page'][href], a[rel~='next'][href], link[rel~='next'][href]")
     next_url = safe_url(next_link["href"], url) if next_link and ads else None
     if ads and not next_url:
@@ -736,7 +736,7 @@ def parse_category(raw, url):
             ad["seller_url"] = safe_url(f"/{locale}/mid/{username}", url)
         ads.append(ad)
     if block["items"] and not ads:
-        raise SourceError("Карточки категории имеют неизвестную структуру.")
+        raise SourceError("Объявления категории имеют неизвестную структуру.")
     return ads, next_category_url(data, block, url)
 
 
@@ -816,14 +816,40 @@ def parse_listing(raw, ad):
 class Reader:
     def __init__(self):
         self.proxy_url, self.browser_proxy = proxy_settings(os.getenv("OPENSOOQ_PROXY_URL", ""))
-        self.http = httpx.AsyncClient(timeout=30, follow_redirects=False,
-                                      proxy=self.proxy_url, trust_env=False,
-                                      headers={"User-Agent": "OpenSooqTelegramBot/2.0", "Accept-Language": "en"})
+        backup_file = Path(os.getenv("OPENSOOQ_PROXY_BACKUPS_FILE", "/etc/secrets/opensooq-proxies.txt"))
+        try:
+            lines = backup_file.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            lines = []
+        backups = [proxy_settings(line)[0] for line in lines if line.strip() and not line.lstrip().startswith("#")]
+        self.proxy_pool = list(dict.fromkeys([self.proxy_url, *backups]))
+        if backups and not self.proxy_url:
+            raise ValueError("Для запасных прокси задайте основной OPENSOOQ_PROXY_URL.")
+        self.proxy_index = 0
+        self.proxy_clients = [self._http_client(proxy) for proxy in self.proxy_pool]
+        self.http = self.proxy_clients[0]
+        self.on_proxy_switch = None
+        self.request_lock = asyncio.Lock()
         self.lock = asyncio.Lock()
         self.browser_lock = asyncio.Lock()
         self.last, self.pauses, self.cache = 0.0, {}, {}
         self.pw = self.browser = self.browser_context = None
         self.browser_failures = 0
+
+    @staticmethod
+    def _http_client(proxy):
+        return httpx.AsyncClient(timeout=30, follow_redirects=False, proxy=proxy, trust_env=False,
+                                 headers={"User-Agent": "OpenSooqTelegramBot/2.0", "Accept-Language": "en"})
+
+    async def _next_proxy(self):
+        if self.proxy_index + 1 == len(self.proxy_clients):
+            return False
+        self.proxy_index += 1
+        self.http = self.proxy_clients[self.proxy_index]
+        log.warning("[proxy] HTTP-запросы парсера переключены на прокси №%s", self.proxy_index + 1)
+        if self.on_proxy_switch:
+            await self.on_proxy_switch(self.proxy_index + 1)
+        return True
 
     async def throttle(self):
         async with self.lock:
@@ -851,13 +877,18 @@ class Reader:
             raise SourceError("OpenSooq показал проверку доступа.")
 
     async def get(self, url):
+        async with self.request_lock:
+            return await self._get(url)
+
+    async def _get(self, url):
         url = safe_url(url)
         for _ in range(6):
             host = urlsplit(url).hostname
             if self.pauses.get(host, 0) > time.monotonic():
                 raise RateLimit("Пауза после ограничения OpenSooq ещё не закончилась.")
             response = None
-            for attempt in range(3):
+            attempt = 0
+            while attempt < 3:
                 await self.throttle()
                 try:
                     async with self.http.stream("GET", url) as response:
@@ -867,14 +898,23 @@ class Reader:
                             if len(body) > 8 * 1024 * 1024:
                                 raise SourceError("Слишком большой ответ OpenSooq.")
                         raw = body.decode(response.encoding or "utf-8", errors="replace")
+                    if response.status_code == 407 and await self._next_proxy():
+                        attempt = 0
+                        continue
                     if response.status_code >= 500 and attempt < 2:
                         await asyncio.sleep(2 ** (attempt + 1))
+                        attempt += 1
                         continue
                     break
-                except httpx.RequestError:
+                except httpx.RequestError as exc:
+                    if self.proxy_url and isinstance(exc, (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout)):
+                        if await self._next_proxy():
+                            attempt = 0
+                            continue
                     if attempt == 2:
                         raise SourceError("OpenSooq не ответил вовремя.") from None
                     await asyncio.sleep(2 ** (attempt + 1))
+                    attempt += 1
             if response is None:
                 raise SourceError("Нет ответа OpenSooq.")
             if response.status_code in {301, 302, 303, 307, 308}:
@@ -986,6 +1026,15 @@ class Reader:
         if excluded_topic(ad):
             ad["_filtered_before_profile"] = "topic"
             return ad, ""
+        # Category prices are sufficient for rejecting known price/currency mismatches.
+        # Missing values and description-dependent rules still require the listing page.
+        if rules:
+            summary_rules = {k: v for k, v in rules.items()
+                             if k in {"price_min", "price_max", "currency"}}
+            summary_rules["unknown"] = "include"
+            if not matches(ad, summary_rules)[0]:
+                ad["_filtered_before_profile"] = "rules"
+                return ad, ""
         raw, final = await self.get(ad["url"])
         if urlsplit(final).hostname != urlsplit(ad["url"]).hostname:
             raise SourceError("Объявление перенаправило на другую страну.")
@@ -1022,7 +1071,8 @@ class Reader:
         if self.pw is not None:
             with suppress(Exception):
                 await self.pw.stop()
-        await self.http.aclose()
+        for client in dict.fromkeys([self.http, *self.proxy_clients]):
+            await client.aclose()
 
 
 def _show(ad, key):
@@ -1052,7 +1102,7 @@ def card(ad):
                   f"📦 Активных объявлений: <b>{_show(ad, 'listings_count')}</b>",
                   "📅 Регистрация продавца: <b>" + escape(str(ad.get("seller_registered") or "нет данных")) + "</b>"])
     if ad.get("listings_count") is None and ad.get("seller_listings_hint") is not None:
-        lines.append(f"По карточке продавца: {_show(ad, 'seller_listings_hint')} объявлений — активность не подтверждена")
+        lines.append(f"В профиле продавца: {_show(ad, 'seller_listings_hint')} объявлений — активность не подтверждена")
     rating = []
     if ad.get("rating") is not None:
         rating.append(f"⭐ Рейтинг: <b>{_show(ad, 'rating')}</b>")
@@ -1093,7 +1143,7 @@ HELP_TEXT = """ℹ️ Команды
 /filters unknown=exclude — исключать их при активных ограничениях
 /reset — сбросить фильтры
 /check — проверить ещё не просмотренные объявления
-/deepcheck — пройти старые страницы, пропуская проверенные карточки
+/deepcheck — пройти старые страницы, пропуская проверенные объявления
 /restart — перезапустить проверку
 /watch — регулярная проверка
 /interval 15 — интервал 5–1440 минут
@@ -1126,14 +1176,14 @@ def report_text(stats, elapsed, outcome):
             f"Проверены ранее: <b>{stats['previously_checked']}</b>\n"
             f"Повторы продавцов: <b>{stats['seller_duplicates']}</b>\n"
             f"Время: <b>{duration}</b>\n\n"
-            f"Страниц: {stats['pages']} · Карточек: {stats['found']}\n"
-            f"Проверено карточек: {stats['checked']}\n"
+            f"Страниц: {stats['pages']} · Объявлений: {stats['found']}\n"
+            f"Проверено объявлений: {stats['checked']}\n"
             f"Отсеяно фильтрами: {stats['filtered']} · Ошибок: {stats['errors']}")
     if stats["filtered"]:
         text += (f"\nТематика: {stats['filtered_topic']} · Настройки: {stats['filtered_rules']}"
                  f" · Нет данных для фильтра: {stats['filtered_missing']}")
     if stats["history_boundary"]:
-        text += "\n\nСвежая часть выдачи проверена; дальше знакомые карточки. Глубокая проверка: /deepcheck."
+        text += "\n\nСвежая часть выдачи проверена; дальше знакомые объявления. Глубокая проверка: /deepcheck."
     return text
 
 
@@ -1180,12 +1230,17 @@ class Service:
         self.revoked = {r["chat"] for r in self.db.execute("SELECT chat FROM revoked") if r["chat"] != ADMIN_ID}
         self.allowed.difference_update(self.revoked)
         self.reader, self.tasks, self.lock = Reader(), {}, asyncio.Lock()
+        self.reader.on_proxy_switch = self.notify_proxy_switch
         self.closing = False
         self.subscription_table = "subscriptions_test" if XROCKET_TESTNET else "subscriptions"
         self.billing = Billing(self)
         self.account_browser = PersistentOpenSooqBrowser()
         self.dialogues = SellerDialogues(self)
         self.account_login = AccountLogin(self)
+
+    async def notify_proxy_switch(self, number):
+        with suppress(TelegramError):
+            await self.bot.send_message(chat_id=ADMIN_ID, text=f"Парсер проверяет запасной прокси №{number - 1}.")
 
     def permitted(self, chat):
         if chat == ADMIN_ID:
@@ -1322,7 +1377,7 @@ class Service:
             text = (
                 "⏳ Проверка продолжается…\n"
                 f"Страниц: {stats['pages']}\n"
-                f"Проверено карточек: {stats['checked']}\n"
+                f"Проверено объявлений: {stats['checked']}\n"
                 f"Отправлено: {stats['sent']}\n"
                 f"Уже отправлялись: {stats['duplicates']}\n"
                 f"Проверены ранее: {stats['previously_checked']}\n"
@@ -2611,7 +2666,7 @@ class SellerDialogues:
     def start(self, token):
         ad = self.db.execute('SELECT * FROM dialogue_ads WHERE token=? AND chat=?', (token, ADMIN_ID)).fetchone()
         if ad is None:
-            raise ValueError('Карточка не найдена. Откройте /dialogs.')
+            raise ValueError('Объявление не найдено. Откройте /dialogs.')
         existing = self.db.execute('SELECT id FROM seller_dialogues WHERE seller=?', (ad['seller'],)).fetchone()
         if existing:
             return existing['id']
@@ -3381,14 +3436,16 @@ def checked_source(value):
 
 
 def get_main_menu():
-    return ui_keyboard([
-        [("🚀 Начать поиск", "menu_check")],
-        [("🔗 Категории", "menu_sources"), ("⚙️ Фильтры", "menu_filters")],
-        [("💾 Мои поиски", "ui:saved"), ("🌍 Страна", "ui:countries")],
-        [("⏱ Мониторинг", "ui:monitor"), ("📊 Статус", "menu_status")],
-        [("⏸ Остановить", "menu_stop"), ("❔ Помощь", "menu_help")],
-        [("💳 Подписка", "bill:plans")],
-    ])
+    rows = [
+        [("🔎 Найти объявления", "menu_check")],
+        [("🌍 Страна", "ui:countries"), ("📂 Категории", "menu_sources")],
+        [("⚙️ Фильтры поиска", "menu_filters"), ("💾 Мои поиски", "ui:saved")],
+        [("⏱ Мониторинг", "ui:monitor"), ("📊 Результаты", "menu_status")],
+        [("⏸ Остановить поиск", "menu_stop"), ("❔ Помощь", "menu_help")],
+    ]
+    if SUBSCRIPTIONS_ENABLED:
+        rows.append([("💳 Подписка", "bill:plans")])
+    return ui_keyboard(rows)
 
 
 def filters_text(state):
@@ -3507,7 +3564,7 @@ async def panel(update, context, screen="home", notice=""):
         text = ("⏱ <b>Мониторинг</b>\n\n"
                 f"Состояние: {'🟢 включён' if state['enabled'] else '⚪ выключен'}\n"
                 f"Интервал: <b>{state['minutes']} мин.</b>\n\n"
-                "Поиск начинается со свежих объявлений и пропускает уже проверенные карточки.")
+                "Поиск начинается со свежих объявлений и пропускает уже проверенные объявления.")
         keyboard = ui_keyboard([[("🟢 Включить", "ui:watch"), ("⏸ Остановить", "menu_stop")],
                                 [(f"{n} мин.", f"ui:interval:{n}") for n in (5, 15, 30, 60)],
                                 [("Другой интервал", "ui:custom_interval")], back])
@@ -3522,20 +3579,22 @@ async def panel(update, context, screen="home", notice=""):
     else:
         active = chat in service.tasks and not service.tasks[chat].done()
         countries = ", ".join(dict.fromkeys(source_country(url) for url in state["urls"] if isinstance(url, str))) or "не выбрана"
-        text = ("🔎 <b>Панель поиска OpenSooq</b>\n\n"
-                f"🌍 {countries}\n"
-                f"🔗 Категорий: <b>{len(state['urls'])}/5</b>\n"
-                f"⚙️ Настроек фильтров: <b>{len(state['rules'])}</b>\n"
-                f"💾 Сохранённых поисков: <b>{len(saved_rows(service, chat))}</b>\n"
-                f"⏱ Мониторинг: {'включён' if state['enabled'] else 'выключен'} · {state['minutes']} мин.\n"
-                f"{'⏳ Поиск выполняется или ожидает очереди.' if active else 'Готов к запуску.'}\n\n"
-                "Выберите действие ниже.")
+        search_status = "⏳ Выполняется или ожидает очереди" if active else "Готов к поиску"
+        watch_status = "🟢 Включён" if state["enabled"] else "⚪ Выключен"
+        text = ("<b>ParsSTAFF · Объявления</b>\n"
+                "Поиск и общение с продавцами\n\n"
+                f"🌍 <b>{escape(countries)}</b>\n"
+                f"Категорий: {len(state['urls'])}/5 · Сохранённых поисков: {len(saved_rows(service, chat))}\n\n"
+                f"<b>Поиск</b> · {search_status}\n"
+                f"<b>Мониторинг</b> · {watch_status} · {state['minutes']} мин.\n\n"
+                "Настройте поиск или откройте диалоги ниже.")
         keyboard = get_main_menu()
     if screen == "home" and update.effective_user.id == ADMIN_ID:
-        keyboard = InlineKeyboardMarkup(list(keyboard.inline_keyboard) + [
-            [InlineKeyboardButton("👑 Пользователи", callback_data="ui:admin"),
-             InlineKeyboardButton("💬 Диалоги", callback_data="talk:list")],
-        ])
+        rows = list(keyboard.inline_keyboard)
+        rows.insert(1, [InlineKeyboardButton("💬 Диалоги", callback_data="talk:list"),
+                        InlineKeyboardButton("✏️ Вопросы", callback_data="talk:phrases")])
+        rows.append([InlineKeyboardButton("👑 Управление пользователями", callback_data="ui:admin")])
+        keyboard = InlineKeyboardMarkup(rows)
     if notice:
         text = escape(notice) + "\n\n" + text
     await show_panel(update, text, keyboard)
@@ -4990,7 +5049,7 @@ def build_app(token, allowed, database):
                 BotCommand("status", "Статус и отчёт"), BotCommand("help", "Справка"), BotCommand("id", "Мой ID"),
                 BotCommand("testproxy", "Проверить прокси и просмотры"),
                 BotCommand("saved", "Сохранённые поиски"), BotCommand("cancel", "Отменить ввод"),
-                BotCommand("subscription", "Подписка и оплата"),
+                *([BotCommand("subscription", "Подписка и оплата")] if SUBSCRIPTIONS_ENABLED else []),
                 BotCommand("dialogs", "Диалоги"), BotCommand("phrases", "Вопросы"),
             ])
         except TelegramError as exc:
