@@ -1350,6 +1350,10 @@ class Service:
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(users)")}
         if "disabled_countries" not in columns:
             self.db.execute("ALTER TABLE users ADD COLUMN disabled_countries TEXT NOT NULL DEFAULT '[]'")
+        if "country_mode" not in columns:
+            self.db.execute("ALTER TABLE users ADD COLUMN country_mode TEXT NOT NULL DEFAULT 'single'")
+        if "selected_country" not in columns:
+            self.db.execute("ALTER TABLE users ADD COLUMN selected_country TEXT NOT NULL DEFAULT ''")
         self.db.commit()
         self.allowed.update(r["chat"] for r in self.db.execute("SELECT chat FROM authorized"))
         self.revoked = {r["chat"] for r in self.db.execute("SELECT chat FROM revoked") if r["chat"] != ADMIN_ID}
@@ -1459,10 +1463,16 @@ class Service:
             row["disabled_countries"] = list(dict.fromkeys(code for code in disabled if code in COUNTRIES)) if isinstance(disabled, list) else []
         except (ValueError, TypeError):
             row["disabled_countries"] = []
+        row["country_mode"] = "all" if row.get("country_mode") == "all" else "single"
+        selected = row.get("selected_country", "")
+        if selected not in COUNTRIES:
+            selected = next((country_code(url) for url in row["urls"]
+                             if country_code(url) in COUNTRIES and country_code(url) not in row["disabled_countries"]), "")
+        row["selected_country"] = selected
         return row
 
     def save(self, chat, **changes):
-        if not changes or not changes.keys() <= {"urls", "rules", "enabled", "minutes", "next_check", "last", "disabled_countries"}:
+        if not changes or not changes.keys() <= {"urls", "rules", "enabled", "minutes", "next_check", "last", "disabled_countries", "country_mode", "selected_country"}:
             raise ValueError("Некорректные настройки.")
         values = [json.dumps(v, ensure_ascii=False) if k in {"urls", "rules", "disabled_countries"} else v for k, v in changes.items()]
         with self.db:
@@ -3588,7 +3598,11 @@ def country_code(url):
 
 def active_sources(state):
     disabled = set(state.get("disabled_countries", []))
-    return [url for url in state["urls"] if isinstance(url, str) and country_code(url) not in disabled]
+    urls = [url for url in state["urls"] if isinstance(url, str) and country_code(url) not in disabled]
+    if state.get("country_mode", "single") == "all":
+        return urls
+    selected = state.get("selected_country") or (country_code(urls[0]) if urls else "")
+    return [url for url in urls if country_code(url) == selected]
 
 
 async def country_panel(update, context, notice="", code=None):
@@ -3596,21 +3610,31 @@ async def country_panel(update, context, notice="", code=None):
     state = service.state(update.effective_chat.id)
     disabled = set(state.get("disabled_countries", []))
     present = {country_code(url) for url in state["urls"] if isinstance(url, str)}
+    mode = state.get("country_mode", "single")
+    selected = state.get("selected_country") or next((country_code(url) for url in active_sources(state)), "")
+    mode_text = "🌐 Все включённые страны" if mode == "all" else "🎯 Одна страна: " + COUNTRY_LABELS.get(selected, "выберите ниже")
     if code is not None:
         if code not in COUNTRY_LABELS:
             raise ValueError("Неизвестная страна.")
         enabled = code in present and code not in disabled
         status = "🟢 Включена" if enabled else ("⏸ Отключена" if code in present else "Ещё не добавлена")
-        text = (f"<b>{COUNTRY_LABELS[code]}</b>\n\n{status}\n\n"
-                "Включение добавляет страну к поиску. Отключение сохраняет её категории.\n"
-                "Фильтры общие для всех стран; пересчёта валют нет.")
-        rows = [[("⏸ Отключить" if enabled else "＋ Включить страну", f"ui:country_toggle:{code}:" + ("off" if enabled else "on"))],
+        text = (f"<b>{COUNTRY_LABELS[code]}</b>\n\n{mode_text}\n{status}\n\n"
+                "«Искать только здесь» выбирает одну страну.\n"
+                "Общий поиск запускается только в режиме «Все включённые страны».\n"
+                "Фильтры общие; пересчёта валют нет.")
+        rows = [[("🎯 Искать только здесь", "ui:country_select:" + code)],
+                [("⏸ Отключить" if enabled else "＋ Включить страну", f"ui:country_toggle:{code}:" + ("off" if enabled else "on"))],
                 [("📂 Категории", "menu_sources")], [("‹ Все страны", "ui:countries")]]
     else:
-        text = "🌍 <b>Страны поиска</b>\n\n🟢 Включена · ⏸ Отключена · ＋ Не добавлена\nВыберите страну для управления."
-        rows = [[(("🟢 " if item in present and item not in disabled else "⏸ " if item in present else "＋ ") + label,
+        text = ("🌍 <b>Страны поиска</b>\n\n" + mode_text + "\n\n"
+                "Выберите страну и нажмите «Искать только здесь».\n"
+                "Для общего поиска включите отдельный режим ниже.")
+        rows = [[(("🎯 " if mode == "single" and item == selected and item not in disabled
+                   else "🟢 " if item in present and item not in disabled else "⏸ " if item in present else "＋ ") + label,
                   "ui:country:" + item)] for item, label in COUNTRY_LABELS.items()]
-        rows.append([("‹ Главное меню", "menu_home")])
+        rows.extend([[("✓ Одна страна" if mode == "single" else "🎯 Одна страна", "ui:country_mode:single")],
+                     [("✓ Все включённые страны" if mode == "all" else "🌐 Все включённые страны", "ui:country_mode:all")],
+                     [("‹ Главное меню", "menu_home")]])
     if notice:
         text = escape(notice) + "\n\n" + text
     await show_panel(update, text, ui_keyboard(rows))
@@ -3678,7 +3702,7 @@ def save_search(service, chat, name):
         raise ValueError("Сначала добавьте хотя бы одну категорию.")
     if len(saved_rows(service, chat)) >= 20:
         raise ValueError("Можно сохранить до 20 поисков. Удалите один из старых.")
-    config = {key: state[key] for key in ("urls", "rules", "minutes", "disabled_countries")}
+    config = {key: state[key] for key in ("urls", "rules", "minutes", "disabled_countries", "country_mode", "selected_country")}
     try:
         with service.db:
             service.db.execute("INSERT INTO saved_searches(chat,name,config,created) VALUES (?,?,?,?)",
@@ -3701,6 +3725,8 @@ async def load_search(service, chat, search_id):
     await service.cancel_scan(chat)
     service.save(chat, urls=urls, rules=rules, minutes=minutes,
                  disabled_countries=[code for code in config.get("disabled_countries", []) if code in COUNTRIES],
+                 country_mode="all" if config.get("country_mode") == "all" else "single",
+                 selected_country=config.get("selected_country", "") if config.get("selected_country", "") in COUNTRIES else "",
                  enabled=0, next_check=time.time() + minutes * 60)
     return row["name"]
 
@@ -3779,6 +3805,7 @@ async def panel(update, context, screen="home", notice=""):
         text = ("<b>ParsSTAFF · Объявления</b>\n"
                 + ("Поиск и общение с продавцами\n\n" if update.effective_user.id == ADMIN_ID
                    else "Поиск свежих объявлений\n\n")
+                + ("🌐 Все включённые страны\n" if state.get("country_mode") == "all" else "🎯 Поиск по одной стране\n")
                 + f"🌍 <b>{escape(countries)}</b>\n"
                 f"Активных категорий: {len(active_sources(state))} из {len(state['urls'])} · Сохранённых поисков: {len(saved_rows(service, chat))}\n\n"
                 f"<b>Поиск</b> · {search_status}\n"
@@ -4124,6 +4151,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await country_panel(update, context)
         elif data.startswith("ui:country:"):
             await country_panel(update, context, code=data.rsplit(":", 1)[1])
+        elif data.startswith("ui:country_mode:"):
+            mode = data.rsplit(":", 1)[1]
+            if mode not in {"single", "all"}:
+                raise ValueError("Неизвестный режим поиска.")
+            service.save(chat.id, country_mode=mode, selected_country=state.get("selected_country", ""))
+            await service.cancel_scan(chat.id)
+            if not active_sources(service.state(chat.id)):
+                service.save(chat.id, enabled=0)
+            elif state["enabled"]:
+                service.save(chat.id, next_check=time.time())
+            await country_panel(update, context, "✅ Режим поиска сохранён.")
+        elif data.startswith("ui:country_select:"):
+            code = data.rsplit(":", 1)[1]
+            if code not in COUNTRY_LABELS:
+                raise ValueError("Неизвестная страна.")
+            urls = list(state["urls"])
+            if not any(country_code(url) == code for url in urls):
+                if len(urls) >= 5:
+                    raise ValueError("Максимум 5 категорий. Сначала удалите ненужную категорию.")
+                urls.append(f"https://{code}.opensooq.com/en/find?search=true&sort_code=recent")
+            service.save(chat.id, urls=urls, country_mode="single", selected_country=code,
+                         disabled_countries=[item for item in state.get("disabled_countries", []) if item != code])
+            await service.cancel_scan(chat.id)
+            if state["enabled"]:
+                service.save(chat.id, next_check=time.time())
+            await panel(update, context, notice="🎯 Выбрана только " + COUNTRY_LABELS[code] + ". Нажмите «Найти объявления».")
         elif data.startswith("ui:country_toggle:"):
             _, _, code, action = data.split(":")
             if code not in COUNTRY_LABELS or action not in {"on", "off"}:
@@ -4138,13 +4191,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 disabled.discard(code)
             else:
                 disabled.add(code)
-            service.save(chat.id, urls=urls, disabled_countries=sorted(disabled))
+            selected = state.get("selected_country", "")
+            if action == "on" and state.get("country_mode", "single") == "single":
+                selected = code
+            service.save(chat.id, urls=urls, disabled_countries=sorted(disabled), selected_country=selected)
             await service.cancel_scan(chat.id)
             if not active_sources(service.state(chat.id)):
                 service.save(chat.id, enabled=0)
             elif state["enabled"]:
                 service.save(chat.id, next_check=time.time())
-            notice = ("✅ Страна включена. Остальные категории сохранены." if action == "on"
+            notice = ("✅ Страна включена. Режим поиска указан ниже." if action == "on"
                       else "⏸ Страна отключена. Её категории сохранены для повторного включения.")
             await country_panel(update, context, notice, code=code)
         elif data.startswith("ui:country_yes:"):
@@ -4154,7 +4210,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             service.save(chat.id, enabled=0)
             await service.cancel_scan(chat.id)
             service.save(chat.id, urls=[f"https://{code}.opensooq.com/en/find?search=true&sort_code=recent"],
-                         disabled_countries=[item for item in state.get("disabled_countries", []) if item != code])
+                         disabled_countries=[item for item in state.get("disabled_countries", []) if item != code],
+                         country_mode="single", selected_country=code)
             await panel(update, context, "sources", "✅ Страна изменена. Проверьте фильтры и нажмите «Начать поиск».")
         elif data.startswith("ui:metric:"):
             metric = data.rsplit(":", 1)[1]
@@ -5462,7 +5519,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v35_jordan_countries] Создание Telegram Application")
+    log.info("[boot_v36_country_modes] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
