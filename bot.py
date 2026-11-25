@@ -32,13 +32,13 @@ from zoneinfo import ZoneInfo
 import httpx
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import Application, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 load_dotenv()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1110325917"))
-DATABASE = Path(os.getenv("DATABASE_PATH", "bot.sqlite3"))
+DATABASE = Path(os.getenv("DATABASE_PATH", "/var/data/bot.sqlite3" if os.getenv("RENDER") == "true" else "bot.sqlite3"))
 DATA_DIR = Path(os.getenv("DATA_DIR", str(DATABASE.parent)))
 PASSWORD_FILE = DATA_DIR / "passwords.json"
 BLOCKED_FILE = DATA_DIR / "blocked.txt"
@@ -119,7 +119,7 @@ DIALOGUE_STATUSES = {
 
 SECRET_ENV_KEYS = ("BOT_TOKEN", "XROCKET_API_TOKEN", "OPENSOOQ_PROXY_URL",
                    "OPENSOOQ_CHAT_ACCOUNT_ID", "SUPPORT_USERNAME", "OPENAI_API_KEY")
-SECRET_RE = re.compile(r"(?:bot\d+:[A-Za-z0-9_-]+|Bearer\s+\S+)")
+SECRET_RE = re.compile(r"(?:bot\d+:[A-Za-z0-9_-]+|Bearer\s+\S+|https?://[^\s/@]+:[^\s/@]+@[^\s]+)")
 
 
 def category_codes(value):
@@ -181,6 +181,49 @@ def proxy_settings(value):
         return value, browser
     except ValueError:
         raise ValueError("OPENSOOQ_PROXY_URL: нужен HTTP URI вида http://USER:PASS@HOST:PORT.") from None
+
+
+def load_proxy_config():
+    """Saved runtime choices override initial environment configuration."""
+    path = DATA_DIR / "proxies.json"
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (ValueError, OSError):
+        raise ValueError("Не удалось прочитать сохранённые прокси в DATA_DIR/proxies.json.") from None
+    try:
+        pool = config["pool"]
+        active = config["active"]
+        if not isinstance(pool, list) or not 1 <= len(pool) <= 11 or type(active) is not int or not 0 <= active < len(pool):
+            raise ValueError()
+        parsed = [proxy_settings(value)[0] for value in pool]
+        if not all(parsed) or len(set(parsed)) != len(parsed):
+            raise ValueError()
+    except (ValueError, TypeError, KeyError, AttributeError):
+        raise ValueError("Некорректные сохранённые настройки прокси. Проверьте DATA_DIR/proxies.json.") from None
+    return parsed, active
+
+
+def save_proxy_config(pool, active):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=DATA_DIR, prefix=".proxies-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump({"pool": pool, "active": active}, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, DATA_DIR / "proxies.json")
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def proxy_label(uri):
+    if not uri:
+        return "Прямое соединение"
+    parsed = urlsplit(uri)
+    return f"{parsed.hostname}:{parsed.port}"
 
 
 def error_text(error):
@@ -815,19 +858,26 @@ def parse_listing(raw, ad):
 
 class Reader:
     def __init__(self):
-        self.proxy_url, self.browser_proxy = proxy_settings(os.getenv("OPENSOOQ_PROXY_URL", ""))
-        backup_file = Path(os.getenv("OPENSOOQ_PROXY_BACKUPS_FILE", "/etc/secrets/opensooq-proxies.txt"))
-        try:
-            lines = backup_file.read_text(encoding="utf-8").splitlines()
-        except FileNotFoundError:
-            lines = []
-        backups = [proxy_settings(line)[0] for line in lines if line.strip() and not line.lstrip().startswith("#")]
-        self.proxy_pool = list(dict.fromkeys([self.proxy_url, *backups]))
-        if backups and not self.proxy_url:
-            raise ValueError("Для запасных прокси задайте основной OPENSOOQ_PROXY_URL.")
-        self.proxy_index = 0
+        saved = load_proxy_config()
+        if saved:
+            self.proxy_pool, self.proxy_index = saved
+        else:
+            primary, _ = proxy_settings(os.getenv("OPENSOOQ_PROXY_URL", ""))
+            backup_file = Path(os.getenv("OPENSOOQ_PROXY_BACKUPS_FILE", "/etc/secrets/opensooq-proxies.txt"))
+            try:
+                lines = backup_file.read_text(encoding="utf-8").splitlines()
+            except FileNotFoundError:
+                lines = []
+            backups = [proxy_settings(line)[0] for line in lines if line.strip() and not line.lstrip().startswith("#")]
+            if backups and not primary:
+                raise ValueError("Для запасных прокси задайте основной OPENSOOQ_PROXY_URL.")
+            self.proxy_pool = list(dict.fromkeys([primary, *backups]))
+            self.proxy_index = 0
+        if len(self.proxy_pool) > 11:
+            raise ValueError("Можно сохранить основной и до 10 резервных прокси.")
+        self.proxy_url, self.browser_proxy = proxy_settings(self.proxy_pool[self.proxy_index] or "")
         self.proxy_clients = [self._http_client(proxy) for proxy in self.proxy_pool]
-        self.http = self.proxy_clients[0]
+        self.http = self.proxy_clients[self.proxy_index]
         self.on_proxy_switch = None
         self.request_lock = asyncio.Lock()
         self.lock = asyncio.Lock()
@@ -846,10 +896,75 @@ class Reader:
             return False
         self.proxy_index += 1
         self.http = self.proxy_clients[self.proxy_index]
+        self.proxy_url, self.browser_proxy = proxy_settings(self.proxy_pool[self.proxy_index])
+        await self.reset_profile_browser()
         log.warning("[proxy] HTTP-запросы парсера переключены на прокси №%s", self.proxy_index + 1)
         if self.on_proxy_switch:
             await self.on_proxy_switch(self.proxy_index + 1)
         return True
+
+    async def reset_profile_browser(self):
+        async with self.browser_lock:
+            if self.browser is not None:
+                with suppress(Exception):
+                    await self.browser.close()
+            self.browser = self.browser_context = None
+            self.browser_failures = 0
+            self.cache.clear()
+
+    async def configure_proxies(self, action, value=""):
+        async with self.request_lock:
+            pool, active = list(self.proxy_pool), self.proxy_index
+            if action in {"new", "add"}:
+                uri, _ = proxy_settings(value)
+                if not uri:
+                    raise ValueError("Пришлите HTTP-прокси: http://ЛОГИН:ПАРОЛЬ@СЕРВЕР:ПОРТ")
+                if action == "new":
+                    pool = [uri] + [p for p in pool[1:] if p and p != uri]
+                    active = 0
+                elif uri not in pool:
+                    if not pool[0]:
+                        raise ValueError("Сначала задайте основной прокси: /newproxy.")
+                    if len(pool) >= 11:
+                        raise ValueError("Можно сохранить основной и до 10 резервных прокси.")
+                    pool.append(uri)
+            elif action == "next":
+                if len(pool) < 2:
+                    raise ValueError("Резервных прокси пока нет. Добавьте через /addproxy.")
+                active = (active + 1) % len(pool)
+            elif action == "delete":
+                try:
+                    index = int(value) - 1
+                except ValueError:
+                    raise ValueError("Используйте /delproxy НОМЕР из /proxies.") from None
+                if index <= 0 or index >= len(pool):
+                    raise ValueError("Удалять можно только резервные прокси из /proxies.")
+                if index == active:
+                    raise ValueError("Этот прокси сейчас активен. Сначала /nextproxy.")
+                pool.pop(index)
+                active -= index < active
+            else:
+                raise ValueError("Неизвестное действие с прокси.")
+            changed = pool[active] != self.proxy_pool[self.proxy_index]
+            clients = []
+            try:
+                for proxy in pool:
+                    clients.append(self._http_client(proxy))
+                save_proxy_config(pool, active)
+            except BaseException:
+                for client in clients:
+                    await client.aclose()
+                raise
+            old_clients = self.proxy_clients
+            self.proxy_pool, self.proxy_index, self.proxy_clients = pool, active, clients
+            self.http = clients[active]
+            self.proxy_url, self.browser_proxy = proxy_settings(pool[active])
+            if changed:
+                await self.reset_profile_browser()
+            for client in old_clients:
+                with suppress(Exception):
+                    await client.aclose()
+            return changed
 
     async def throttle(self):
         async with self.lock:
@@ -907,7 +1022,7 @@ class Reader:
                         continue
                     break
                 except httpx.RequestError as exc:
-                    if self.proxy_url and isinstance(exc, (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout)):
+                    if self.proxy_url and isinstance(exc, (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ReadError)):
                         if await self._next_proxy():
                             attempt = 0
                             continue
@@ -1165,6 +1280,13 @@ HELP_TEXT = """ℹ️ Команды
 """
 
 
+def help_text(user_id):
+    if user_id == ADMIN_ID:
+        return HELP_TEXT + "\n/proxies — список прокси\n/newproxy — заменить основной\n/addproxy — добавить резервный\n/nextproxy — переключить без деплоя"
+    text = HELP_TEXT.split("💬 Диалоги с продавцами", 1)[0]
+    return "\n".join(line for line in text.splitlines() if "(для владельца)" not in line) + "\nДля добавления категории отправьте её ссылку."
+
+
 def report_text(stats, elapsed, outcome):
     titles = {"complete": "✅ Поиск завершён", "partial": "⏹ Поиск завершён",
               "error": "❌ Поиск прерван", "stopped": "⏸ Поиск остановлен", "limit": "📦 Достигнут лимит поиска"}
@@ -1237,10 +1359,37 @@ class Service:
         self.account_browser = PersistentOpenSooqBrowser()
         self.dialogues = SellerDialogues(self)
         self.account_login = AccountLogin(self)
+        self.proxy_browser_pending = False
+        if getattr(self.reader, "proxy_url", None):
+            os.environ["OPENSOOQ_PROXY_URL"] = self.reader.proxy_url
+
+    async def apply_browser_proxy(self):
+        if self.account_login.active:
+            raise ValueError("Сначала завершите открытый экран /account, затем смените прокси.")
+        await self.dialogues.transport.close()
+        await self.account_browser.close()
+        self.dialogues.transport.blocked = False
+        self.proxy_browser_pending = False
+
+    async def change_proxy(self, action, value=""):
+        async with self.dialogues.lock:
+            if self.account_login.active and action in {"new", "next"}:
+                raise ValueError("Сначала завершите открытый экран /account, затем смените прокси.")
+            changed = await self.reader.configure_proxies(action, value)
+            os.environ["OPENSOOQ_PROXY_URL"] = self.reader.proxy_url
+            if changed:
+                self.proxy_browser_pending = True
+                await self.apply_browser_proxy()
 
     async def notify_proxy_switch(self, number):
+        os.environ["OPENSOOQ_PROXY_URL"] = self.reader.proxy_url
+        self.proxy_browser_pending = True
+        try:
+            save_proxy_config(self.reader.proxy_pool, self.reader.proxy_index)
+        except OSError:
+            log.error("[proxy] Не удалось сохранить переключение прокси на диск.")
         with suppress(TelegramError):
-            await self.bot.send_message(chat_id=ADMIN_ID, text=f"Парсер проверяет запасной прокси №{number - 1}.")
+            await self.bot.send_message(chat_id=ADMIN_ID, text=f"🔄 Парсер переключился на прокси №{number}. Диалоги применят его между проверками.")
 
     def permitted(self, chat):
         if chat == ADMIN_ID:
@@ -2817,6 +2966,8 @@ class SellerDialogues:
         if self.service.closing or self.lock.locked() or not self.transport.configured():
             return
         async with self.lock:
+            if getattr(self.service, "proxy_browser_pending", False):
+                await self.service.apply_browser_proxy()
             rows = list(self.db.execute(
                 "SELECT * FROM seller_dialogues WHERE chat=? AND state IN ('queued','waiting','sending') "
                 "ORDER BY updated LIMIT 5", (ADMIN_ID,)))
@@ -3298,7 +3449,7 @@ async def handle_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if command == "/start":
             await message.reply_text("👋 Отправьте ссылку на категорию OpenSooq или выберите действие.", reply_markup=get_main_menu())
         elif command == "/help":
-            await message.reply_text(HELP_TEXT)
+            await message.reply_text(help_text(user.id))
         elif command in {"/filters", "/set"}:
             if argument:
                 state["rules"] = update_filters(state["rules"], argument)
@@ -3582,18 +3733,21 @@ async def panel(update, context, screen="home", notice=""):
         search_status = "⏳ Выполняется или ожидает очереди" if active else "Готов к поиску"
         watch_status = "🟢 Включён" if state["enabled"] else "⚪ Выключен"
         text = ("<b>ParsSTAFF · Объявления</b>\n"
-                "Поиск и общение с продавцами\n\n"
-                f"🌍 <b>{escape(countries)}</b>\n"
+                + ("Поиск и общение с продавцами\n\n" if update.effective_user.id == ADMIN_ID
+                   else "Поиск свежих объявлений\n\n")
+                + f"🌍 <b>{escape(countries)}</b>\n"
                 f"Категорий: {len(state['urls'])}/5 · Сохранённых поисков: {len(saved_rows(service, chat))}\n\n"
                 f"<b>Поиск</b> · {search_status}\n"
                 f"<b>Мониторинг</b> · {watch_status} · {state['minutes']} мин.\n\n"
-                "Настройте поиск или откройте диалоги ниже.")
+                + ("Настройте поиск или откройте диалоги ниже." if update.effective_user.id == ADMIN_ID
+                   else "Настройте фильтры и начните поиск."))
         keyboard = get_main_menu()
     if screen == "home" and update.effective_user.id == ADMIN_ID:
         rows = list(keyboard.inline_keyboard)
         rows.insert(1, [InlineKeyboardButton("💬 Диалоги", callback_data="talk:list"),
                         InlineKeyboardButton("✏️ Вопросы", callback_data="talk:phrases")])
-        rows.append([InlineKeyboardButton("👑 Управление пользователями", callback_data="ui:admin")])
+        rows.append([InlineKeyboardButton("🌐 Прокси", callback_data="ui:proxies"),
+                     InlineKeyboardButton("👑 Пользователи", callback_data="ui:admin")])
         keyboard = InlineKeyboardMarkup(rows)
     if notice:
         text = escape(notice) + "\n\n" + text
@@ -3606,10 +3760,71 @@ async def ask_field(update, context, action, prompt, **payload):
                      ui_keyboard([[("Отмена", "ui:cancel")]]))
 
 
+async def proxy_management_message(update, context):
+    message, user, chat = update.effective_message, update.effective_user, update.effective_chat
+    if not message or not message.text or not user or not chat:
+        return False
+    text = message.text.strip()
+    parts = text.split(maxsplit=1)
+    command = parts[0].split("@")[0].lower() if parts else ""
+    actions = {"/newproxy": "new", "/addproxy": "add", "/nextproxy": "next", "/delproxy": "delete"}
+    pending = context.user_data.get("proxy_form")
+    is_command = command in actions or command == "/proxies"
+    if text.startswith("/") and not is_command:
+        context.user_data.pop("proxy_form", None)
+        return False
+    if not is_command and not pending:
+        return False
+    if user.id != ADMIN_ID or chat.id != ADMIN_ID or chat.type != "private":
+        context.user_data.pop("proxy_form", None)
+        await message.reply_text("Управление прокси доступно только владельцу.")
+        return True
+    service = context.application.bot_data["service"]
+    if command == "/proxies":
+        context.user_data.pop("proxy_form", None)
+        reader = service.reader
+        lines = ["🌐 Прокси", ""]
+        for index, uri in enumerate(reader.proxy_pool):
+            label = "Основной" if index == 0 else "Резервный"
+            active = " · активен" if index == reader.proxy_index else ""
+            lines.append(f"{index + 1}. {label}: {proxy_label(uri)}{active}")
+        lines.append("\n/newproxy — заменить основной\n/addproxy — добавить резервный\n/nextproxy — переключиться\n/delproxy НОМЕР — удалить резервный")
+        await message.reply_text("\n".join(lines))
+        return True
+    if is_command:
+        context.user_data.pop("proxy_form", None)
+        action, value = actions[command], parts[1] if len(parts) == 2 else ""
+        if action in {"new", "add"} and not value:
+            context.user_data["proxy_form"] = {"action": action, "expires": time.time() + 600}
+            context.user_data.pop("panel_form", None)
+            await message.reply_text("Пришлите HTTP-прокси одним сообщением:\nhttp://ЛОГИН:ПАРОЛЬ@СЕРВЕР:ПОРТ\nОтмена: /cancel")
+            return True
+    else:
+        if pending["expires"] < time.time():
+            context.user_data.pop("proxy_form", None)
+            await message.reply_text("Время ввода истекло. Повторите /newproxy или /addproxy.")
+            return True
+        action, value = pending["action"], text
+    try:
+        await service.change_proxy(action, value)
+    except (ValueError, OSError) as exc:
+        label = str(exc) if isinstance(exc, ValueError) else "Не удалось сохранить прокси. Проверьте постоянный диск и DATA_DIR."
+        await message.reply_text(label)
+        return True
+    context.user_data.pop("proxy_form", None)
+    if action in {"new", "add"}:
+        with suppress(TelegramError):
+            await message.delete()
+    await message.reply_text("✅ Настройки прокси сохранены и применены без деплоя. Проверка: /testproxy. Список: /proxies.")
+    return True
+
+
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, user, chat = update.effective_message, update.effective_user, update.effective_chat
     service = context.application.bot_data["service"]
     if not message or not message.text or not user or not chat or chat.type != "private":
+        return
+    if await proxy_management_message(update, context):
         return
     command = message.text.strip().split(maxsplit=1)[0].split("@")[0].lower() if message.text.strip() else ""
     if command in {"/account", "/account_off", "/account_diag"}:
@@ -3807,6 +4022,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("panel_form", None)
     data, state = query.data or "", service.state(chat.id)
     try:
+        if data == "ui:proxies":
+            if user.id != ADMIN_ID:
+                await query.message.reply_text("Управление прокси доступно только владельцу.")
+                return
+            reader = service.reader
+            lines = ["🌐 Прокси", ""]
+            for index, uri in enumerate(reader.proxy_pool):
+                active = " · активен" if index == reader.proxy_index else ""
+                lines.append(f"{index + 1}. {proxy_label(uri)}{active}")
+            lines.append("\n/newproxy — заменить основной\n/addproxy — добавить резервный\n/nextproxy — переключиться\n/delproxy НОМЕР — удалить резервный")
+            await query.message.reply_text("\n".join(lines))
+            return
         navigation = {"menu_home": "home", "menu_sources": "sources", "menu_filters": "filters",
                       "menu_status": "status", "ui:saved": "saved", "ui:monitor": "monitor", "ui:cancel": "home"}
         if data.startswith("ui:admin"):
@@ -3830,7 +4057,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await service.cancel_scan(chat.id)
             await panel(update, context, notice="⏸ Поиск и мониторинг остановлены.")
         elif data == "menu_help":
-            await show_panel(update, HELP_TEXT + "\n/saved — сохранённые поиски\n/cancel — отменить ввод\n\nОтправленная ссылка сохраняется; запуск выполняется кнопкой «Начать поиск».", get_main_menu())
+            await show_panel(update, help_text(user.id) + "\n/saved — сохранённые поиски\n/cancel — отменить ввод\n\nОтправленная ссылка сохраняется; запуск выполняется кнопкой «Начать поиск».", get_main_menu())
         elif data == "ui:add":
             await ask_field(update, context, "add", "🔗 <b>Добавить категорию</b>\nОтправьте ссылку на категорию или выдачу OpenSooq.")
         elif data.startswith(("ui:replace:", "ui:delete:", "ui:delete_yes:")):
@@ -5050,8 +5277,16 @@ def build_app(token, allowed, database):
                 BotCommand("testproxy", "Проверить прокси и просмотры"),
                 BotCommand("saved", "Сохранённые поиски"), BotCommand("cancel", "Отменить ввод"),
                 *([BotCommand("subscription", "Подписка и оплата")] if SUBSCRIPTIONS_ENABLED else []),
-                BotCommand("dialogs", "Диалоги"), BotCommand("phrases", "Вопросы"),
             ])
+            await app.bot.set_my_commands([
+                BotCommand("start", "Меню"), BotCommand("check", "Найти объявления"),
+                BotCommand("status", "Результаты"), BotCommand("pause", "Остановить поиск"),
+                BotCommand("dialogs", "Диалоги"), BotCommand("phrases", "Вопросы"),
+                BotCommand("account", "Подключить аккаунт"), BotCommand("proxies", "Прокси"),
+                BotCommand("newproxy", "Заменить основной прокси"), BotCommand("addproxy", "Добавить резервный"),
+                BotCommand("nextproxy", "Переключить прокси"), BotCommand("testproxy", "Проверить прокси"),
+                BotCommand("users", "Пользователи"),
+            ], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
         except TelegramError as exc:
             log.warning("[startup_commands] %s", error_text(exc))
 
@@ -5090,7 +5325,9 @@ def check_startup(network=True, client=None):
         raise StartupCheckError(12, "ADMIN_ID: укажите положительный числовой Telegram ID владельца.")
     try:
         {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-        proxy_settings(os.getenv("OPENSOOQ_PROXY_URL", ""))
+        saved_proxy = load_proxy_config()
+        if saved_proxy is None:
+            proxy_settings(os.getenv("OPENSOOQ_PROXY_URL", ""))
         if os.getenv("PORT") and not 0 <= int(os.environ["PORT"]) <= 65535:
             raise ValueError()
     except ValueError:
@@ -5162,7 +5399,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v31_auto_dialogues_fixed] Создание Telegram Application")
+    log.info("[boot_v34_owner_proxy_runtime] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
