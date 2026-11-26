@@ -1799,7 +1799,10 @@ def browser_startup_code(error, stage, desktop_issue=''):
     detail = str(error).lower()
     if 'executable doesn' in detail or 'executable not found' in detail or 'distribution' in detail and 'not found' in detail:
         return 'CHROME_NOT_INSTALLED'
-    if 'singleton' in detail or 'processsingleton' in detail or isinstance(error, BlockingIOError):
+    if isinstance(error, BlockingIOError) or any(marker in detail for marker in (
+        'profile appears to be in use', 'user data directory is already in use',
+        'failed to create a processsingleton', 'failed to create singletonlock',
+    )):
         return 'PROFILE_IN_USE'
     if 'permission denied' in detail or 'read-only file system' in detail:
         return 'PROFILE_NOT_WRITABLE'
@@ -2046,6 +2049,7 @@ class PublicChromeBrowser:
         self.lock = asyncio.Lock()
         self.pw = self.context = self.page = None
         self._file_lock = None
+        self._session_profile = None
         self.desktop = RemoteChromeDesktop()
         self.startup_stage, self.startup_issue = ('idle', '')
         self.on_blocked = None
@@ -2113,6 +2117,11 @@ class PublicChromeBrowser:
                 log.error('[browser_startup] stage=profile code=%s detail=%s', code, error_text(error)[:3000])
                 raise BrowserUnavailable(code + ': ' + browser_startup_hint(code)) from None
             try:
+                # Keep the application lock on DATA_DIR, but never reuse Chrome's
+                # machine-specific Singleton files left by a previous container.
+                # The anonymous session is shared by both tabs until shutdown.
+                self.startup_stage = 'profile'
+                self._session_profile = tempfile.TemporaryDirectory(prefix='opensooq-reader-')
                 self.startup_stage = 'display'
                 await self.desktop.start()
                 self.startup_stage = 'chrome'
@@ -2120,7 +2129,7 @@ class PublicChromeBrowser:
                 self.pw = await async_playwright().start()
                 launch_options = opensooq_browser_launch_options()
                 launch_options.update(headless=False, channel='chrome', env={**os.environ, **self.desktop.environment}, no_viewport=True, args=['--disable-dev-shm-usage', '--window-position=0,0', '--window-size=1000,900'])
-                self.context = await self.pw.chromium.launch_persistent_context(str(self.directory), **launch_options, locale='en-US', accept_downloads=False, timeout=30000)
+                self.context = await self.pw.chromium.launch_persistent_context(self._session_profile.name, **launch_options, locale='en-US', accept_downloads=False, timeout=30000)
                 self.context.on('close', self._context_closed)
                 await self.context.route('**/*', self._restrict_navigation)
                 pages = [page for page in self.context.pages if not page.is_closed()]
@@ -2154,7 +2163,12 @@ class PublicChromeBrowser:
                 try:
                     await self.desktop.close()
                 finally:
-                    self._release_profile()
+                    try:
+                        if self._session_profile is not None:
+                            profile, self._session_profile = self._session_profile, None
+                            profile.cleanup()
+                    finally:
+                        self._release_profile()
 
     async def close(self):
         async with self.lock:
@@ -2733,7 +2747,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text('В этой версии оставлен публичный парсер. Вход в OpenSooq и диалоги отключены. Используйте /testsource и /check.')
         return
     if command == '/version':
-        await message.reply_text('Версия v39.7 · Поиск объявлений · Chrome')
+        await message.reply_text('Версия v39.8 · Поиск объявлений · Chrome')
         return
     if not service.permitted(user.id):
         await handle_commands(update, context)
@@ -3198,7 +3212,7 @@ def main():
     if not token:
         raise SystemExit('Задайте BOT_TOKEN в Environment на Render.')
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv('ALLOWED_TELEGRAM_IDS', '').split(',') if v.strip()}
-    log.info('[boot_v39_7_browser_diagnostics] Создание Telegram Application')
+    log.info('[boot_v39_8_profile_recovery] Создание Telegram Application')
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=['message', 'callback_query'], bootstrap_retries=3)
