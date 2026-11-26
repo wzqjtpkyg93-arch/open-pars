@@ -455,7 +455,7 @@ def matches(ad, rules):
             missing.add(metric)
         elif low is not None and value < low or (high is not None and value > high):
             accepted = False
-    allow_missing = not missing or rules.get('unknown') == 'include'
+    allow_missing = not missing or (rules.get('unknown') == 'include' and 'currency' not in missing)
     return (accepted and allow_missing, missing)
 
 def _load_passwords():
@@ -1054,6 +1054,8 @@ class Reader:
         if rules:
             summary_rules = {k: v for k, v in rules.items() if k in {'price_min', 'price_max', 'currency'}}
             summary_rules['unknown'] = 'include'
+            if not ad.get('currency'):
+                summary_rules.pop('currency', None)
             if not matches(ad, summary_rules)[0]:
                 ad['_filtered_before_profile'] = 'rules'
                 return (ad, '')
@@ -1069,6 +1071,8 @@ class Reader:
             early_keys = {'keywords', 'exclude', 'currency'} | {metric + '_' + bound for metric in ('price', 'photos', 'views') for bound in ('min', 'max')}
             early_rules = {k: v for k, v in rules.items() if k in early_keys}
             early_rules['unknown'] = 'include'
+            if not ad.get('currency'):
+                early_rules.pop('currency', None)
             if not matches(ad, early_rules)[0]:
                 ad['_filtered_before_profile'] = 'rules'
                 return (ad, '')
@@ -1433,6 +1437,15 @@ class Service:
     def save(self, chat, **changes):
         if not changes or not changes.keys() <= {'urls', 'rules', 'enabled', 'minutes', 'next_check', 'last', 'disabled_countries', 'country_mode', 'selected_country'}:
             raise ValueError('Некорректные настройки.')
+        if 'urls' in changes and 'selected_country' not in changes:
+            current = self.state(chat)
+            selected = current.get('selected_country', '')
+            if current['country_mode'] == 'single' and selected and not any(country_code(url) == selected for url in changes['urls']):
+                disabled = set(changes.get('disabled_countries', current['disabled_countries']))
+                changes['selected_country'] = next((country_code(url) for url in changes['urls'] if country_code(url) not in disabled), '')
+                # Category replacement can select its new country, but must not
+                # silently resume monitoring another country's advertisements.
+                changes['enabled'] = 0
         values = [json.dumps(v, ensure_ascii=False) if k in {'urls', 'rules', 'disabled_countries'} else v for k, v in changes.items()]
         with self.db:
             self.db.execute('UPDATE users SET ' + ','.join((k + '=?' for k in changes)) + ' WHERE chat=?', values + [chat])
@@ -2314,7 +2327,7 @@ async def handle_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text(escape(status) + (state['last'] or 'Проверок ещё не было.'), parse_mode='HTML')
         elif command in {'/check', '/deepcheck', '/watch', '/restart', '/add'} or text.startswith(('https://', 'http://')):
             if command == '/add' or text.startswith(('https://', 'http://')):
-                url = safe_url(argument if command == '/add' else text)
+                url = checked_source(argument if command == '/add' else text)
                 if re.search('/(?:search|lists)/\\d+', urlsplit(url).path):
                     raise ValueError('Нужна ссылка на категорию, а не на отдельное объявление.')
                 if url not in state['urls']:
@@ -2410,8 +2423,11 @@ def source_country(url):
     return COUNTRY_LABELS.get(code, 'OpenSooq')
 
 def checked_source(value):
-    url = safe_url(value)
-    if re.search('/(?:search|lists)/\\d+', urlsplit(url).path):
+    try:
+        url = public_browser_url(value)
+    except SourceError:
+        raise ValueError('Нужна публичная ссылка на категорию выбранной страны OpenSooq, например /en/find.') from None
+    if re.search('/(?:search|lists)/\\d+|/mid(?:/|$)', urlsplit(url).path):
         raise ValueError('Нужна ссылка на категорию или выдачу, а не на отдельное объявление.')
     return url
 
@@ -2640,6 +2656,7 @@ async def proxy_management_message(update, context):
         await message.reply_text('\n'.join(lines))
         return True
     if is_command:
+        context.user_data.pop('panel_form', None)
         context.user_data.pop('proxy_form', None)
         action, value = (actions[command], parts[1] if len(parts) == 2 else '')
         if action in {'new', 'add'} and (not value):
@@ -2678,7 +2695,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text('В этой версии оставлен публичный парсер. Вход в OpenSooq и диалоги отключены. Используйте /testsource и /check.')
         return
     if command == '/version':
-        await message.reply_text('Версия v39.5 · Поиск объявлений · Chrome')
+        await message.reply_text('Версия v39.6 · Поиск объявлений · Chrome')
         return
     if not service.permitted(user.id):
         await handle_commands(update, context)
@@ -2737,6 +2754,11 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     urls.append(url)
                 service.save(chat.id, urls=urls)
                 screen = 'sources'
+                updated = service.state(chat.id)
+                if state.get('selected_country') != updated.get('selected_country') and state['country_mode'] == 'single':
+                    notice = '✅ Категория сохранена. Выбрана ' + COUNTRY_LABELS.get(updated.get('selected_country'), 'новая страна') + '. Для запуска нажмите «Найти объявления».'
+                    if state['enabled']:
+                        notice += ' Мониторинг остановлен после смены страны.'
             elif action in {'filter', 'range'}:
                 if action == 'range':
                     metric = payload['metric']
@@ -2856,10 +2878,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await ask_field(update, context, 'replace', '✏️ <b>Заменить категорию</b>\nТекущая ссылка:\n' + ui_url(url) + '\n\nОтправьте новую ссылку.', url=url)
             elif data.startswith('ui:delete_yes:'):
                 service.save(chat.id, urls=[item for item in state['urls'] if item != url])
-                if len(state['urls']) == 1:
+                if not service.state(chat.id)['enabled'] or not active_sources(service.state(chat.id)):
                     service.save(chat.id, enabled=0)
                     await service.cancel_scan(chat.id)
-                await panel(update, context, 'sources', '🗑 Категория удалена.')
+                notice = '🗑 Категория удалена.'
+                if state['enabled'] and not service.state(chat.id)['enabled']:
+                    notice += ' Мониторинг остановлен. Проверьте выбранную страну перед новым запуском.'
+                await panel(update, context, 'sources', notice)
             else:
                 await show_panel(update, '🗑 <b>Удалить эту категорию?</b>\n\n' + ui_url(url), ui_keyboard([[('Да, удалить', 'ui:delete_yes:' + key)], [('Отмена', 'menu_sources')]]))
         elif data == 'ui:countries':
@@ -3135,7 +3160,7 @@ def main():
     if not token:
         raise SystemExit('Задайте BOT_TOKEN в Environment на Render.')
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv('ALLOWED_TELEGRAM_IDS', '').split(',') if v.strip()}
-    log.info('[boot_v39_5_country_banners] Создание Telegram Application')
+    log.info('[boot_v39_6_settings] Создание Telegram Application')
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=['message', 'callback_query'], bootstrap_retries=3)
