@@ -535,6 +535,19 @@ def relative_label(value):
         return f'{match[1]} {label} назад'
     return text[:100]
 
+def following_page(url):
+    parsed = urlsplit(safe_url(url))
+    params = parse_qsl(parsed.query, keep_blank_values=True)
+    try:
+        current = int(dict(params).get('page', '1'))
+    except ValueError:
+        raise SourceError('Некорректный номер страницы выдачи.') from None
+    if current < 1:
+        raise SourceError('Некорректный номер страницы выдачи.')
+    query = [(key, value) for key, value in params if key != 'page']
+    query.append(('page', str(current + 1)))
+    return safe_url(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), '')))
+
 def next_category_url(data, block, url):
     next_path = (data.get('seoPage') or {}).get('nextPageUrl')
     if next_path:
@@ -544,7 +557,9 @@ def next_category_url(data, block, url):
         return None
     current = count(meta.get('current_page'))
     pages = count(meta.get('pages'))
-    if current is None or pages is None or (not 1 <= current < pages):
+    if current is None or pages is None:
+        return following_page(url)
+    if not 1 <= current < pages:
         return None
     parsed = urlsplit(safe_url(url))
     query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True) if key != 'page']
@@ -605,6 +620,10 @@ def parse_category_dom(soup, url, documents):
             if candidate.hostname == parsed.hostname and candidate.path == parsed.path and (dict(query).get('page') == str(current + 1)) and (sorted(((key, value) for key, value in query if key != 'page')) == expected):
                 next_url = safe_url(link['href'], url)
                 break
+    if ads and not next_url:
+        # Some server-rendered pages omit their navigation controls. Probe one
+        # following page; the scan stops on empty or repeated listing IDs.
+        next_url = following_page(url)
     return (ads, next_url)
 
 def parse_category(raw, url):
@@ -1013,6 +1032,21 @@ class Reader:
                         await page.close()
 
     async def profile(self, url, seller_id):
+        # Share concurrent requests for the same profile without detached tasks.
+        if not hasattr(self, 'profile_locks'):
+            self.profile_locks = {}
+        key = (url, seller_id)
+        entry = self.profile_locks.setdefault(key, [asyncio.Lock(), 0])
+        entry[1] += 1
+        try:
+            async with entry[0]:
+                return await self._profile(url, seller_id)
+        finally:
+            entry[1] -= 1
+            if not entry[1]:
+                self.profile_locks.pop(key, None)
+
+    async def _profile(self, url, seller_id):
         key = (url, seller_id)
         cached = self.cache.get(key)
         if cached and cached[0] > time.monotonic():
@@ -1052,7 +1086,10 @@ class Reader:
             ad['_filtered_before_profile'] = 'topic'
             return (ad, '')
         if rules:
-            summary_rules = {k: v for k, v in rules.items() if k in {'price_min', 'price_max', 'currency'}}
+            summary_keys = {'currency', 'exclude'} | {
+                metric + '_' + bound for metric in ('price', 'photos', 'rating', 'ratings')
+                for bound in ('min', 'max')}
+            summary_rules = {k: v for k, v in rules.items() if k in summary_keys}
             summary_rules['unknown'] = 'include'
             if not ad.get('currency'):
                 summary_rules.pop('currency', None)
@@ -1216,6 +1253,20 @@ def report_text(stats, elapsed, outcome):
 
 def public_document_ready(raw, url):
     path = urlsplit(url).path
+    listing_id = re.search(r'/(?:search|lists)/(\d+)(?:/|$)', path)
+    if listing_id:
+        soup = BeautifulSoup(raw, 'html.parser')
+        documents = []
+        with suppress(SourceError):
+            documents.append(props(soup))
+        documents.extend(flight(soup))
+        for obj in walk(documents):
+            listing = obj.get('listingData')
+            if isinstance(listing, dict):
+                info = listing.get('commonInfo')
+                if isinstance(info, dict) and str(info.get('postId')) == listing_id[1]:
+                    return True
+        return False
     if re.search('/(?:search|lists)/\\d+', path) or '/mid/' in path:
         soup = BeautifulSoup(raw, 'html.parser')
         node = soup.select_one('script#__NEXT_DATA__')
@@ -1462,18 +1513,20 @@ class Service:
         with self.db:
             self.db.execute('INSERT OR IGNORE INTO checked_ads VALUES (?,?,?)', (chat, signature, key))
 
-    def trigger(self, chat, deep=False):
+    def trigger(self, chat, deep=False, monitoring=False):
         if self.closing or not self.permitted(chat) or (not active_sources(self.state(chat))):
             return False
         if chat in self.tasks and (not self.tasks[chat].done()):
             return False
         self.save(chat, next_check=time.time() + self.state(chat)['minutes'] * 60)
-        self.tasks[chat] = asyncio.create_task(self.scan(chat, deep=deep))
+        # Manual searches scan the available depth. History shortcuts are only
+        # used for scheduled monitoring, where a recent scan already exists.
+        self.tasks[chat] = asyncio.create_task(self.scan(chat, deep=deep or not monitoring))
         return True
 
     async def tick(self, context):
         for row in list(self.db.execute('SELECT chat FROM users WHERE enabled=1 AND next_check<=?', (time.time(),))):
-            self.trigger(row['chat'])
+            self.trigger(row['chat'], deep=False, monitoring=True)
 
     async def cancel_scan(self, chat):
         task = self.tasks.get(chat)
@@ -1563,9 +1616,10 @@ class Service:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def scan(self, chat, deep=False):
+    async def scan(self, chat, deep=True):
         stats, warnings, seen = (Counter(), {}, set())
         failure_reasons = []
+        stop_reasons = []
         outcome, started, stop = ('complete', time.monotonic(), False)
         report_allowed = True
         progress_task = None
@@ -1599,6 +1653,7 @@ class Service:
                             break
                         if url in pages_seen:
                             warnings['Обнаружен повтор страницы категории.'] = True
+                            stop_reasons.append('Сайт повторил адрес страницы выдачи.')
                             break
                         pages_seen.add(url)
                         try:
@@ -1617,8 +1672,14 @@ class Service:
                             stats['errors'] += 1
                             outcome = 'partial'
                             break
-                        page_known = bool(ads)
-                        for candidate in ads:
+                        if not ads:
+                            stop_reasons.append(source_country(source) + ': выдача закончилась — пустая страница.')
+                            break
+                        if all(urlsplit(ad['url']).hostname + ':' + ad['id'] in seen for ad in ads):
+                            stop_reasons.append(source_country(source) + ': сайт повторил уже просмотренную выдачу.')
+                            break
+                        page_known = bool(ads) and not deep
+                        for candidate in ads if not deep else []:
                             candidate_key = urlsplit(candidate['url']).hostname + ':' + candidate['id']
                             known = self.db.execute('SELECT 1 FROM delivered WHERE chat=? AND key=?', (chat, candidate_key)).fetchone() or self.db.execute('SELECT 1 FROM checked_ads WHERE chat=? AND rules=? AND key=?', (chat, signature, candidate_key)).fetchone() or self.seller_seen(chat, candidate)
                             if not known:
@@ -1727,6 +1788,8 @@ class Service:
                             stats['history_boundary'] += 1
                             break
                         if stop or not next_url:
+                            if not stop:
+                                stop_reasons.append(source_country(source) + ': достигнута последняя страница по данным сайта.')
                             break
                         if urlsplit(next_url).hostname != urlsplit(final).hostname:
                             warnings['Следующая страница ведёт на другую страну.'] = True
@@ -1735,6 +1798,7 @@ class Service:
                         url = next_url
                         if page_index + 1 == MAX_PAGES:
                             outcome = 'limit'
+                            stop_reasons.append(source_country(source) + f': проверен лимит {MAX_PAGES} страниц.')
                     if stop:
                         break
         except asyncio.CancelledError:
@@ -1760,6 +1824,12 @@ class Service:
             for warning in warnings:
                 log.warning('[scan_detail] chat=%s %s', chat, error_text(warning))
             report = report_text(stats, time.monotonic() - started, outcome)
+            if stop_reasons:
+                report += '\n\n' + '\n'.join(escape(value) for value in dict.fromkeys(stop_reasons))[:800]
+            if warnings and stats['pages']:
+                # Surface actual failures instead of a bare error counter.
+                details = list(dict.fromkeys(error_text(value)[:200] for value in warnings))[:3]
+                report += '\n\n<b>Замечания:</b>\n' + '\n'.join(escape(value) for value in details)
             if failure_reasons:
                 report += '\n\n<b>Причина:</b>\n' + '\n'.join((escape(reason) for reason in dict.fromkeys(failure_reasons)))[:1200]
             elif stats['errors'] and (not stats['pages']):
@@ -2747,7 +2817,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text('В этой версии оставлен публичный парсер. Вход в OpenSooq и диалоги отключены. Используйте /testsource и /check.')
         return
     if command == '/version':
-        await message.reply_text('Версия v39.8 · Поиск объявлений · Chrome')
+        await message.reply_text('Версия v39.9 · Поиск объявлений · Chrome')
         return
     if not service.permitted(user.id):
         await handle_commands(update, context)
@@ -3212,7 +3282,7 @@ def main():
     if not token:
         raise SystemExit('Задайте BOT_TOKEN в Environment на Render.')
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv('ALLOWED_TELEGRAM_IDS', '').split(',') if v.strip()}
-    log.info('[boot_v39_8_profile_recovery] Создание Telegram Application')
+    log.info('[boot_v39_9_full_search] Создание Telegram Application')
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=['message', 'callback_query'], bootstrap_retries=3)
