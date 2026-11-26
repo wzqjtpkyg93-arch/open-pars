@@ -1556,7 +1556,8 @@ class Service:
         previous = ''
         while True:
             await asyncio.sleep(20)
-            text = f"⏳ Проверка продолжается…\nСтраниц: {stats['pages']}\nПроверено объявлений: {stats['checked']}\nОтправлено: {stats['sent']}\nУже отправлялись: {stats['duplicates']}\nПроверены ранее: {stats['previously_checked']}\nПовторы продавцов: {stats['seller_duplicates']}\nОтсеяно: {stats['filtered']}\nОшибок: {stats['errors']}\n\nИтоговый отчёт появится после завершения.\nОстановка: /pause"
+            text = f"⏳ Проверка продолжается…\nСтраниц: {stats['pages']}\nПроверено объявлений: {stats['checked']}\nОтправлено: {stats['sent']}\nУже отправлялись: {stats['duplicates']}\nПроверены ранее: {stats['previously_checked']}\nПовторы продавцов: {stats['seller_duplicates']}\nОтсеяно: {stats['filtered']} (тематика {stats['filtered_topic']}, настройки {stats['filtered_rules']}, нет данных {stats['filtered_missing']})\nОшибок: {stats['errors']}\n\nИтоговый отчёт появится после завершения.\nОстановка: /pause"
+            text += '\nОбновлено в ' + datetime.now(DISPLAY_TZ).strftime('%H:%M:%S %Z')
             if text != previous:
                 try:
                     await telegram_call(message.edit_text, text=text)
@@ -1622,7 +1623,7 @@ class Service:
         stop_reasons = []
         outcome, started, stop = ('complete', time.monotonic(), False)
         report_allowed = True
-        progress_task = None
+        progress_message = progress_task = None
         last_delivery = 0.0
         try:
             progress_message = await telegram_call(self.bot.send_message, chat_id=chat, text='🚀 Начинаю проверку объявлений…')
@@ -1641,6 +1642,7 @@ class Service:
                         stats['errors'] += 1
                         outcome = 'partial'
                         continue
+                    page_contents = set()
                     pages_seen = set()
                     known_pages = 0
                     scan_rules = self.state(chat)['rules']
@@ -1675,9 +1677,11 @@ class Service:
                         if not ads:
                             stop_reasons.append(source_country(source) + ': выдача закончилась — пустая страница.')
                             break
-                        if all(urlsplit(ad['url']).hostname + ':' + ad['id'] in seen for ad in ads):
+                        contents = frozenset(ad['id'] for ad in ads)
+                        if contents in page_contents:
                             stop_reasons.append(source_country(source) + ': сайт повторил уже просмотренную выдачу.')
                             break
+                        page_contents.add(contents)
                         page_known = bool(ads) and not deep
                         for candidate in ads if not deep else []:
                             candidate_key = urlsplit(candidate['url']).hostname + ':' + candidate['id']
@@ -1838,6 +1842,9 @@ class Service:
                 markup = InlineKeyboardMarkup([*([[InlineKeyboardButton('🔎 Проверить страницу поиска', callback_data='ui:testsource')]] if stats['errors'] else []), [InlineKeyboardButton('🔄 Перезапустить парсер', callback_data='restart_scan')], [InlineKeyboardButton('🏠 Главное меню', callback_data='menu_home')]])
                 try:
                     await telegram_call(self.bot.send_message, chat_id=chat, text=report, parse_mode='HTML', reply_markup=markup)
+                    if progress_message is not None:
+                        with suppress(TelegramError):
+                            await progress_message.edit_text('🏁 Проверка окончена. Итоговый отчёт ниже.')
                 except Forbidden:
                     self.save(chat, enabled=0)
                 except TelegramError:
@@ -2813,7 +2820,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text('В этой версии оставлен публичный парсер. Вход в OpenSooq и диалоги отключены. Используйте /testsource и /check.')
         return
     if command == '/version':
-        await message.reply_text('Версия v39.10 · Поиск объявлений · Chrome')
+        await message.reply_text('Версия v39.11 · Поиск объявлений · Chrome')
         return
     if not service.permitted(user.id):
         await handle_commands(update, context)
