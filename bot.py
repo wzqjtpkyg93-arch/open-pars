@@ -881,6 +881,8 @@ class Reader:
         self.proxy_clients = [self._http_client(proxy) for proxy in self.proxy_pool]
         self.http = self.proxy_clients[self.proxy_index]
         self.on_proxy_switch = None
+        self.browser_fetch = None
+        self.browser_hosts = {}
         self.request_lock = asyncio.Lock()
         self.lock = asyncio.Lock()
         self.browser_lock = asyncio.Lock()
@@ -913,6 +915,7 @@ class Reader:
             self.browser = self.browser_context = None
             self.browser_failures = 0
             self.cache.clear()
+            self.browser_hosts.clear()
 
     async def configure_proxies(self, action, value=""):
         async with self.request_lock:
@@ -1001,8 +1004,24 @@ class Reader:
             raise SourceError("OpenSooq показал проверку доступа.", reason="access_check")
 
     async def get(self, url):
+        url = safe_url(url)
+        host = urlsplit(url).hostname
         async with self.request_lock:
-            return await self._get(url)
+            if self.pauses.get(host, 0) > time.monotonic():
+                raise RateLimit("Пауза после ограничения OpenSooq ещё не закончилась.", reason="rate_limit_pause")
+            if self.browser_fetch is not None and self.browser_hosts.get(host, 0) > time.monotonic():
+                return await self.browser_fetch(url)
+            try:
+                return await self._get(url)
+            except RateLimit:
+                raise
+            except SourceError as exc:
+                if self.browser_fetch is None or exc.reason not in {"waf_challenge", "http202", "access_check"}:
+                    raise
+                result = await self.browser_fetch(url)
+                self.browser_hosts[host] = time.monotonic() + 300
+                log.info("[parser_browser] host=%s public_page_loaded", host)
+                return result
 
     async def _get(self, url):
         url = safe_url(url)
@@ -1297,6 +1316,18 @@ def help_text(user_id):
     return "\n".join(line for line in text.splitlines() if "(для владельца)" not in line) + "\nДля добавления категории отправьте её ссылку."
 
 
+def public_browser_url(url):
+    url = safe_url(url)
+    parsed = urlsplit(url)
+    if (parsed.hostname not in {code + ".opensooq.com" for code in COUNTRIES}
+            or not re.fullmatch(r"/(?:en|ar)/(?:find/?|search/\d+(?:/[^?#]*)?|mid/[^/]+/?)", parsed.path)
+            or any(key.lower() in {"selectedroom", "token", "redirect", "redirect_uri", "next", "returnurl"}
+                   for key, _ in parse_qsl(parsed.query))):
+        raise SourceError("Браузерная загрузка разрешена только для публичной выдачи /en/find, объявлений и продавцов.",
+                          reason="browser_public_only")
+    return url
+
+
 def source_failure_text(exc):
     reason = getattr(exc, "reason", "")
     labels = {
@@ -1307,6 +1338,13 @@ def source_failure_text(exc):
         "rate_limit": "HTTP 429: сайт ограничил частоту запросов. Дождитесь окончания паузы.",
         "rate_limit_pause": "Действует пауза после ограничения запросов сайтом.",
         "network": "Не удалось получить ответ через текущее соединение.",
+        "browser_manual": "Открыт удалённый экран. Отправьте /account_end, затем повторите поиск.",
+        "browser_proxy_pending": "Chrome применяет новый прокси. Повторите проверку через несколько секунд.",
+        "browser_timeout": "Chrome не успел загрузить страницу. Проверьте /account_diag.",
+        "browser_network": "Не удалось загрузить страницу в Chrome. Проверьте /account_diag.",
+        "country_redirect": "Сайт перенаправил Chrome в другую страну. Выдача не использована.",
+        "browser_redirect": "Chrome перенаправлен на другую страницу. Выдача не использована.",
+        "browser_public_only": "Для браузерного поиска выберите страну через меню «Страны»: её публичную выдачу /en/find.",
     }
     if reason in labels:
         return labels[reason]
@@ -1338,10 +1376,11 @@ async def test_source_message(update, context):
     await message.reply_text("🔎 Проверяю страницы текущего поиска через активное соединение…")
     for source in urls:
         try:
-            async with asyncio.timeout(25):
+            async with asyncio.timeout(60):
                 raw, final = await service.reader.get(recent_source(source))
                 ads, _ = await asyncio.to_thread(parse_category, raw, final)
-            result = f"✅ Страница загружена: HTTP 200. Прочитано объявлений: {len(ads)}."
+            mode = "Chrome" if service.reader.browser_hosts.get(urlsplit(final).hostname, 0) > time.monotonic() else "HTTP"
+            result = f"✅ Страница загружена: HTTP 200 ({mode}). Прочитано объявлений: {len(ads)}."
         except (SourceError, ValueError, TimeoutError) as exc:
             result = "⚠️ " + source_failure_text(exc)
             log.warning("[source_test] chat=%s host=%s %s", chat, urlsplit(source).hostname, error_text(exc))
@@ -1427,9 +1466,59 @@ class Service:
         self.account_browser = PersistentOpenSooqBrowser()
         self.dialogues = SellerDialogues(self)
         self.account_login = AccountLogin(self)
+        self.reader.browser_fetch = self.fetch_public_page
         self.proxy_browser_pending = False
         if getattr(self.reader, "proxy_url", None):
             os.environ["OPENSOOQ_PROXY_URL"] = self.reader.proxy_url
+
+    async def fetch_public_page(self, url):
+        # Read public documents only. Never expose account/chat documents through a shared profile.
+        url = public_browser_url(url)
+        if self.account_login.active:
+            raise SourceError("Удалённый экран открыт. Завершите управление через /account_end.", reason="browser_manual")
+        if self.proxy_browser_pending:
+            raise SourceError("Смена прокси браузера ещё не завершена. Повторите проверку через несколько секунд.", reason="browser_proxy_pending")
+        profile = self.account_browser
+        try:
+            async with asyncio.timeout(50):
+                context, _ = await profile.get_page()
+                async with profile.lock:
+                    if self.account_login.active:
+                        raise SourceError("Завершите управление через /account_end.", reason="browser_manual")
+                    page = None
+                    try:
+                        page = await context.new_page()
+                        page.set_default_timeout(12000)
+                        await self.reader.throttle()
+                        response = await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                        if response is None:
+                            raise SourceError("Chrome не получил ответ страницы.", reason="browser_network")
+                        self.reader.status_error(response.status, response.headers, urlsplit(url).hostname)
+                        final = public_browser_url(page.url)
+                        if urlsplit(final).hostname != urlsplit(url).hostname:
+                            raise SourceError("Chrome перенаправлен в другую страну.", reason="country_redirect")
+                        if urlsplit(final).path.rstrip("/") != urlsplit(url).path.rstrip("/"):
+                            raise SourceError("Chrome перенаправлен на другую страницу.", reason="browser_redirect")
+                        raw = await page.content()
+                        self.reader.check_html(raw)
+                        # Wait for regular page content; do not click or solve access checks.
+                        await page.locator("script#__NEXT_DATA__, [data-testid='serp-results'], main, [role='main']").first.wait_for(state="attached", timeout=10000)
+                        raw = await page.content()
+                        self.reader.check_html(raw)
+                        if len(raw.encode("utf-8")) > 8 * 1024 * 1024:
+                            raise SourceError("Слишком большой ответ OpenSooq.")
+                        return raw, final
+                    finally:
+                        if page is not None:
+                            with suppress(Exception):
+                                await page.close()
+        except (SourceError, ValueError):
+            raise
+        except TimeoutError:
+            raise SourceError("Chrome не успел загрузить страницу.", reason="browser_timeout") from None
+        except Exception as exc:
+            log.warning("[parser_browser] host=%s error=%s", urlsplit(url).hostname, type(exc).__name__)
+            raise SourceError("Не удалось загрузить страницу в Chrome. Проверьте /account_diag.", reason="browser_network") from None
 
     async def apply_browser_proxy(self):
         if self.account_login.active:
@@ -3053,11 +3142,13 @@ class SellerDialogues:
         await self.service.account_login.expire()
         if self.service.account_login.active:
             return
-        if self.service.closing or self.lock.locked() or not self.transport.configured():
+        if self.service.closing or self.lock.locked():
             return
         async with self.lock:
             if getattr(self.service, "proxy_browser_pending", False):
                 await self.service.apply_browser_proxy()
+            if not self.transport.configured():
+                return
             rows = list(self.db.execute(
                 "SELECT * FROM seller_dialogues WHERE chat=? AND state IN ('queued','waiting','sending') "
                 "ORDER BY updated LIMIT 5", (ADMIN_ID,)))
@@ -3972,11 +4063,15 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await proxy_management_message(update, context):
         return
     command = message.text.strip().split(maxsplit=1)[0].split("@")[0].lower() if message.text.strip() else ""
-    if command in {"/account", "/account_off", "/account_diag"}:
+    if command in {"/account", "/account_off", "/account_diag", "/account_end"}:
         if user.id != ADMIN_ID:
             await message.reply_text("Подключение личного аккаунта доступно только владельцу.")
             return
         try:
+            if command == "/account_end":
+                await service.account_login.close()
+                await message.reply_text("✅ Удалённое управление завершено, профиль Chrome сохранён. Можно запускать /testsource и /check. Это не подтверждает вход в аккаунт и не возобновляет диалоги.")
+                return
             if command == "/account_diag":
                 await message.reply_text(service.account_login.diagnostic_text())
                 return
@@ -4842,7 +4937,9 @@ class AccountLogin:
         flags_map = {'captcha_failed': 'На странице: reCAPTCHA verification failed.',
                      'unauthorized': 'На странице: Unauthorized. Точная причина не раскрыта.',
                      'wait': 'Сайт просит подождать перед повторным входом.',
-                     'browser_error': 'Не удалось открыть браузер входа.'}
+                     'browser_error': 'Не удалось открыть браузер входа.',
+                     'waf_challenge': 'Ответ сайта содержит AWS WAF Challenge.',
+                     'waf_captcha': 'Ответ сайта содержит требование CAPTCHA.'}
         lines.extend(flags_map[k] for k in sorted(self.diag_flags) if k in flags_map)
         if self.diag_events:
             lines.append('Последние запросы авторизации и ошибки:')
@@ -4912,6 +5009,9 @@ class AccountLogin:
         if not 100 <= status <= 599:
             return
         self.diag_http[(metadata[6], status)] += 1
+        waf_action = str(response.headers.get('x-amzn-waf-action', '')).lower()
+        if metadata[6] == 'OpenSooq' and waf_action in {'challenge', 'captcha'}:
+            self.diag_flags.add('waf_' + waf_action)
         if status >= 400 or (metadata[3] == 'авторизация*' and metadata[5] in {'xhr', 'fetch', 'document'}):
             self.add_diagnostic_event(metadata, 'HTTP ' + str(status))
         self.inspect_login_error(response, metadata, status)
@@ -5480,7 +5580,8 @@ def build_app(token, allowed, database):
                 BotCommand("start", "Меню"), BotCommand("check", "Найти объявления"),
                 BotCommand("status", "Результаты"), BotCommand("pause", "Остановить поиск"),
                 BotCommand("dialogs", "Диалоги"), BotCommand("phrases", "Вопросы"),
-                BotCommand("account", "Подключить аккаунт"), BotCommand("proxies", "Прокси"),
+                BotCommand("account", "Подключить аккаунт"), BotCommand("account_end", "Закрыть удалённое управление"),
+                BotCommand("proxies", "Прокси"),
                 BotCommand("newproxy", "Заменить основной прокси"), BotCommand("addproxy", "Добавить резервный"),
                 BotCommand("nextproxy", "Переключить прокси"), BotCommand("testproxy", "Проверить прокси"),
                 BotCommand("testsource", "Проверить страницу поиска"),
@@ -5598,7 +5699,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v37_source_diagnostics] Создание Telegram Application")
+    log.info("[boot_v38_public_chrome_reader] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
