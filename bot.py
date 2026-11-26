@@ -1119,6 +1119,8 @@ def public_browser_url(url):
     return url
 
 def source_failure_text(exc):
+    if isinstance(exc, BrowserUnavailable):
+        return 'Не запустился браузер парсера. ' + error_text(exc)[:600]
     reason = getattr(exc, 'reason', '')
     labels = {'waf_challenge': 'Сайт запросил AWS WAF Challenge. Страница выдачи не получена.', 'waf_captcha': 'Сайт запросил CAPTCHA. Страница выдачи не получена.', 'http202': 'HTTP 202: сайт не вернул обычную страницу выдачи. Защита сайта пока не подтверждена.', 'access_check': 'Сайт показал страницу проверки доступа вместо объявлений.', 'rate_limit': 'HTTP 429: сайт ограничил частоту запросов. Дождитесь окончания паузы.', 'rate_limit_pause': 'Действует пауза после ограничения запросов сайтом.', 'network': 'Не удалось получить ответ через текущее соединение.', 'browser_timeout': 'Chrome не успел загрузить страницу. Повторите /testsource.', 'browser_network': 'Не удалось загрузить страницу в Chrome. Повторите /testsource и проверьте лог [parser_browser].', 'country_redirect': 'Сайт перенаправил Chrome в другую страну. Выдача не использована.', 'browser_redirect': 'Chrome перенаправлен на другую страницу. Выдача не использована.', 'browser_public_only': 'Для браузерного поиска выберите страну через меню «Страны»: её публичную выдачу /en/find.', 'browser_render_timeout': 'Chrome не получил готовые данные объявлений. Проверьте доступ сайта через /testsource.', 'proxy_connection': 'Chrome не смог подключиться через прокси. Проверьте /proxies и /newproxy.'}
     if reason in labels:
@@ -1651,8 +1653,41 @@ class Service:
         finally:
             self.db.close()
 
-class BrowserUnavailable(ValueError):
-    pass
+class BrowserUnavailable(SourceError, ValueError):
+
+    def __init__(self, message):
+        super().__init__(message, reason='browser_startup')
+
+def browser_startup_code(error, stage, desktop_issue=''):
+    detail = str(error).lower()
+    if 'executable doesn' in detail or 'executable not found' in detail or 'distribution' in detail and 'not found' in detail:
+        return 'CHROME_NOT_INSTALLED'
+    if isinstance(error, BlockingIOError) or any(marker in detail for marker in (
+        'profile appears to be in use', 'user data directory is already in use',
+        'failed to create a processsingleton', 'failed to create singletonlock',
+    )):
+        return 'PROFILE_IN_USE'
+    if 'permission denied' in detail or 'read-only file system' in detail:
+        return 'PROFILE_NOT_WRITABLE'
+    if 'no space left' in detail:
+        return 'DISK_FULL'
+    if stage == 'display':
+        return desktop_issue or 'DISPLAY_FAILED'
+    if isinstance(error, TimeoutError) or type(error).__name__ == 'TimeoutError':
+        return 'CHROME_START_TIMEOUT'
+    if 'out of memory' in detail or 'cannot allocate memory' in detail:
+        return 'CHROME_MEMORY'
+    return 'CHROME_START_FAILED'
+
+def browser_startup_hint(code):
+    return {
+        'CHROME_NOT_INSTALLED': 'Google Chrome не установлен в контейнере. Проверьте установку браузера в Dockerfile.',
+        'PROFILE_IN_USE': 'Профиль Chrome занят другим процессом. Проверьте, что запущен только один экземпляр бота.',
+        'PROFILE_NOT_WRITABLE': 'Нет доступа на запись к профилю Chrome. Проверьте DATA_DIR и постоянный диск.',
+        'DISK_FULL': 'На диске закончилось место.',
+        'CHROME_START_TIMEOUT': 'Chrome не завершил запуск за 30 секунд. Подробности: Render Logs → [browser_startup].',
+        'CHROME_MEMORY': 'Chrome не смог выделить память.',
+    }.get(code, 'Подробности: Render Logs → [browser_startup].')
 
 class RemoteChromeDesktop:
     width, height = (1000, 900)
@@ -1877,6 +1912,7 @@ class PublicChromeBrowser:
         self.lock = asyncio.Lock()
         self.pw = self.context = self.page = None
         self._file_lock = None
+        self._session_profile = None
         self.desktop = RemoteChromeDesktop()
         self.startup_stage, self.startup_issue = ('idle', '')
         self.on_blocked = None
@@ -1929,8 +1965,19 @@ class PublicChromeBrowser:
             try:
                 self._acquire_profile()
             except BlockingIOError:
-                raise BrowserUnavailable('Постоянный профиль уже используется другим процессом.') from None
+                self.startup_issue = 'profile:PROFILE_IN_USE'
+                raise BrowserUnavailable('PROFILE_IN_USE: ' + browser_startup_hint('PROFILE_IN_USE')) from None
+            except OSError as error:
+                code = browser_startup_code(error, 'profile')
+                self.startup_issue = 'profile:' + code
+                log.error('[browser_startup] stage=profile code=%s detail=%s', code, error_text(error)[:3000])
+                raise BrowserUnavailable(code + ': ' + browser_startup_hint(code)) from None
             try:
+                # Keep the application lock on DATA_DIR, but never reuse Chrome's
+                # machine-specific Singleton files left by a previous container.
+                # The anonymous session is shared by both tabs until shutdown.
+                self.startup_stage = 'profile'
+                self._session_profile = tempfile.TemporaryDirectory(prefix='opensooq-reader-')
                 self.startup_stage = 'display'
                 await self.desktop.start()
                 self.startup_stage = 'chrome'
@@ -1938,7 +1985,7 @@ class PublicChromeBrowser:
                 self.pw = await async_playwright().start()
                 launch_options = opensooq_browser_launch_options()
                 launch_options.update(headless=False, channel='chrome', env={**os.environ, **self.desktop.environment}, no_viewport=True, args=['--disable-dev-shm-usage', '--window-position=0,0', '--window-size=1000,900'])
-                self.context = await self.pw.chromium.launch_persistent_context(str(self.directory), **launch_options, locale='en-US', accept_downloads=False, timeout=30000)
+                self.context = await self.pw.chromium.launch_persistent_context(self._session_profile.name, **launch_options, locale='en-US', accept_downloads=False, timeout=30000)
                 self.context.on('close', self._context_closed)
                 await self.context.route('**/*', self._restrict_navigation)
                 pages = [page for page in self.context.pages if not page.is_closed()]
@@ -1950,11 +1997,11 @@ class PublicChromeBrowser:
                 await self._shutdown()
                 raise
             except Exception as error:
-                code = getattr(self.desktop, 'issue', '') or type(error).__name__ if self.startup_stage == 'display' else type(error).__name__
+                code = browser_startup_code(error, self.startup_stage, getattr(self.desktop, 'issue', ''))
                 self.startup_issue = self.startup_stage + ':' + code
+                log.error('[browser_startup] stage=%s code=%s detail=%s', self.startup_stage, code, error_text(error)[:3000])
                 await self._shutdown()
-                label = 'экран' if self.startup_stage == 'display' else 'Chrome'
-                raise BrowserUnavailable('Не удалось запустить ' + label + ' (' + code + ').') from None
+                raise BrowserUnavailable(code + ': ' + browser_startup_hint(code)) from None
 
     async def _shutdown(self):
         context, pw = (self.context, self.pw)
@@ -1972,7 +2019,12 @@ class PublicChromeBrowser:
                 try:
                     await self.desktop.close()
                 finally:
-                    self._release_profile()
+                    try:
+                        if self._session_profile is not None:
+                            profile, self._session_profile = self._session_profile, None
+                            profile.cleanup()
+                    finally:
+                        self._release_profile()
 
     async def close(self):
         async with self.lock:
@@ -2394,7 +2446,7 @@ async def panel(update, context, screen='home', notice=''):
         countries = ', '.join(dict.fromkeys((source_country(url) for url in active_sources(state)))) or 'нет включённых стран'
         search_status = '⏳ Выполняется или ожидает очереди' if active else 'Готов к поиску'
         watch_status = '🟢 Включён' if state['enabled'] else '⚪ Выключен'
-        text = '<b>ParsSTAFF v39 · Публичный парсер</b>\n' + 'Поиск свежих объявлений без входа в аккаунт\n\n' + ('🌐 Все включённые страны\n' if state.get('country_mode') == 'all' else '🎯 Поиск по одной стране\n') + f"🌍 <b>{escape(countries)}</b>\nАктивных категорий: {len(active_sources(state))} из {len(state['urls'])} · Сохранённых поисков: {len(saved_rows(service, chat))}\n\n<b>Поиск</b> · {search_status}\n<b>Мониторинг</b> · {watch_status} · {state['minutes']} мин.\n\n" + 'Настройте фильтры и начните поиск.'
+        text = '<b>ParsSTAFF v39-r1 · Публичный парсер</b>\n' + 'Поиск свежих объявлений без входа в аккаунт\n\n' + ('🌐 Все включённые страны\n' if state.get('country_mode') == 'all' else '🎯 Поиск по одной стране\n') + f"🌍 <b>{escape(countries)}</b>\nАктивных категорий: {len(active_sources(state))} из {len(state['urls'])} · Сохранённых поисков: {len(saved_rows(service, chat))}\n\n<b>Поиск</b> · {search_status}\n<b>Мониторинг</b> · {watch_status} · {state['minutes']} мин.\n\n" + 'Настройте фильтры и начните поиск.'
         keyboard = get_main_menu()
     if screen == 'home' and update.effective_user.id == ADMIN_ID:
         rows = list(keyboard.inline_keyboard)
@@ -2478,7 +2530,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text('В этой версии оставлен публичный парсер. Вход в OpenSooq и диалоги отключены. Используйте /testsource и /check.')
         return
     if command == '/version':
-        await message.reply_text('ParsSTAFF v39 · публичный парсер · отдельный профиль Chrome · вход в OpenSooq не используется.')
+        await message.reply_text('ParsSTAFF v39-r1 · публичный парсер · отдельный профиль Chrome · вход в OpenSooq не используется.')
         return
     if not service.permitted(user.id):
         await handle_commands(update, context)
