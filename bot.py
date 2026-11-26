@@ -49,6 +49,9 @@ if not math.isfinite(REQUEST_INTERVAL) or not 1 <= REQUEST_INTERVAL <= 30:
     raise ValueError('REQUEST_INTERVAL: число от 1 до 30 секунд.')
 COUNTRIES = 'kw ae bh sa jo'.split()
 HOSTS = {'opensooq.com', 'www.opensooq.com'} | {c + '.opensooq.com' for c in COUNTRIES}
+AD_READ_SECONDS = 150
+PAGE_CLOSE_SECONDS = 5
+CATEGORY_READ_SECONDS = 85
 MAX_PAGES, MAX_ADS, MAX_SEND = (20, 1000, 200)
 CDN = 'https://opensooq-imagesv2.os-cdn.com/previews/700x0/'
 log = logging.getLogger('opensooq')
@@ -1411,10 +1414,16 @@ class Service:
             finally:
                 log.info('[parser_timing] stage=page host=%s seconds=%.2f ready=%s', urlsplit(url).hostname, time.monotonic() - read_started, completed)
                 if page is not None:
-                    if not completed:
-                        with suppress(Exception):
-                            await page.close()
-                    self.busy_pages.discard(page)
+                    try:
+                        if not completed:
+                            self.read_pages = [candidate for candidate in self.read_pages if candidate is not page]
+                            if getattr(self.public_browser, 'page', None) is page:
+                                self.public_browser.page = None
+                            with suppress(Exception):
+                                async with asyncio.timeout(PAGE_CLOSE_SECONDS):
+                                    await page.close()
+                    finally:
+                        self.busy_pages.discard(page)
 
     async def reset_public_browser(self):
         os.environ['OPENSOOQ_PROXY_URL'] = self.reader.proxy_url
@@ -1560,10 +1569,18 @@ class Service:
             text += '\nОбновлено в ' + datetime.now(DISPLAY_TZ).strftime('%H:%M:%S %Z')
             if text != previous:
                 try:
-                    await telegram_call(message.edit_text, text=text)
+                    async with asyncio.timeout(18):
+                        await telegram_call(message.edit_text, text=text)
                     previous = text
-                except TelegramError:
+                except (TelegramError, TimeoutError):
                     log.warning('[scan_progress] Не удалось обновить прогресс')
+
+    async def read_candidate(self, ad, chat, rules):
+        try:
+            async with asyncio.timeout(AD_READ_SECONDS):
+                return await self.reader.enrich(ad, rules=rules, seller_seen=lambda item: self.seller_seen(chat, item))
+        except TimeoutError:
+            raise SourceError('Истекло время проверки объявления.') from None
 
     async def prepared_ads(self, ads, chat, source, rules, signature, seen, stats):
         """Two page readers overlap with ordered Telegram delivery.
@@ -1577,9 +1594,7 @@ class Service:
 
         async def prepare(ad):
             try:
-                result = await self.reader.enrich(
-                    dict(ad), rules=rules,
-                    seller_seen=lambda item: self.seller_seen(chat, item))
+                result = await self.read_candidate(dict(ad), chat, rules)
                 return result, None
             except Exception as exc:
                 return None, exc
@@ -1659,8 +1674,10 @@ class Service:
                             break
                         pages_seen.add(url)
                         try:
-                            raw, final = await self.reader.get(url)
-                            ads, next_url = await asyncio.to_thread(parse_category, raw, final)
+                            async with asyncio.timeout(CATEGORY_READ_SECONDS):
+                                raw, final = await self.reader.get(url)
+                                ads, next_url = await asyncio.to_thread(parse_category, raw, final)
+                            del raw
                             stats['pages'] += 1
                         except RateLimit as exc:
                             failure_reasons.append(source_failure_text(exc))
@@ -1668,7 +1685,7 @@ class Service:
                             stats['errors'] += 1
                             outcome, stop = ('partial', True)
                             break
-                        except (SourceError, ValueError) as exc:
+                        except (SourceError, ValueError, TimeoutError) as exc:
                             failure_reasons.append(source_failure_text(exc))
                             warnings[str(exc)] = True
                             stats['errors'] += 1
@@ -1725,7 +1742,7 @@ class Service:
                                 try:
                                     rules = scan_rules
                                     if prepared is None:
-                                        ad, warning = await self.reader.enrich(ad, rules=rules, seller_seen=lambda item: self.seller_seen(chat, item))
+                                        ad, warning = await self.read_candidate(ad, chat, rules)
                                     else:
                                         result, error = await prepared
                                         if error is not None:
@@ -1819,8 +1836,12 @@ class Service:
         finally:
             if progress_task is not None:
                 progress_task.cancel()
-                with suppress(asyncio.CancelledError):
+                try:
                     await progress_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    log.exception('[scan_progress] Ошибка задачи прогресса')
             if outcome == 'complete' and warnings:
                 outcome = 'partial'
             if stats['errors'] and (not stats['pages']) and (outcome not in {'stopped'}):
@@ -1849,6 +1870,10 @@ class Service:
                     self.save(chat, enabled=0)
                 except TelegramError:
                     log.exception('Не удалось доставить итоговый отчёт')
+                    if progress_message is not None:
+                        with suppress(TelegramError, TimeoutError):
+                            async with asyncio.timeout(18):
+                                await progress_message.edit_text(report, parse_mode='HTML', reply_markup=markup)
 
     async def close(self):
         self.closing = True
@@ -2820,7 +2845,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text('В этой версии оставлен публичный парсер. Вход в OpenSooq и диалоги отключены. Используйте /testsource и /check.')
         return
     if command == '/version':
-        await message.reply_text('Версия v39.11 · Поиск объявлений · Chrome')
+        await message.reply_text('Версия v39.12 · Поиск объявлений · Chrome')
         return
     if not service.permitted(user.id):
         await handle_commands(update, context)
@@ -3285,7 +3310,7 @@ def main():
     if not token:
         raise SystemExit('Задайте BOT_TOKEN в Environment на Render.')
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv('ALLOWED_TELEGRAM_IDS', '').split(',') if v.strip()}
-    log.info('[boot_v39_10_clean_report] Создание Telegram Application')
+    log.info('[boot_v39_12_bounded_scan] Создание Telegram Application')
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=['message', 'callback_query'], bootstrap_retries=3)
