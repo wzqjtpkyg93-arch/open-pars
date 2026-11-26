@@ -152,7 +152,9 @@ def excluded_topic(ad):
 
 
 class SourceError(Exception):
-    pass
+    def __init__(self, message, *, reason="", status=None):
+        super().__init__(message)
+        self.reason, self.status = reason, status
 
 
 class RateLimit(SourceError):
@@ -972,6 +974,13 @@ class Reader:
             self.last = time.monotonic()
 
     def status_error(self, status, headers, host):
+        action = str(headers.get("x-amzn-waf-action", "")).lower()
+        if action in {"challenge", "captcha"}:
+            raise SourceError(f"OpenSooq: HTTP {status}, AWS WAF {action}. Страница объявлений не получена.",
+                              reason="waf_" + action, status=status)
+        if status == 202:
+            raise SourceError("OpenSooq вернул HTTP 202. Страница объявлений не получена; проверка защиты не подтверждена заголовком.",
+                              reason="http202", status=status)
         if status == 429:
             retry = headers.get("retry-after", "300")
             try:
@@ -982,14 +991,14 @@ class Reader:
                 except (ValueError, TypeError, OverflowError, AttributeError):
                     delay = 300
             self.pauses[host] = time.monotonic() + max(60, min(3600, delay))
-            raise RateLimit("OpenSooq ограничил запросы: HTTP 429.")
+            raise RateLimit("OpenSooq ограничил запросы: HTTP 429.", reason="rate_limit", status=429)
         if status != 200:
-            raise SourceError(f"OpenSooq вернул HTTP {status}.")
+            raise SourceError(f"OpenSooq вернул HTTP {status}.", reason="http_error", status=status)
 
     @staticmethod
     def check_html(raw):
         if re.search(r"<title>\s*(?:Just a moment|Access Denied|Access Restricted|Attention Required)", raw[:20000], re.I):
-            raise SourceError("OpenSooq показал проверку доступа.")
+            raise SourceError("OpenSooq показал проверку доступа.", reason="access_check")
 
     async def get(self, url):
         async with self.request_lock:
@@ -1000,7 +1009,7 @@ class Reader:
         for _ in range(6):
             host = urlsplit(url).hostname
             if self.pauses.get(host, 0) > time.monotonic():
-                raise RateLimit("Пауза после ограничения OpenSooq ещё не закончилась.")
+                raise RateLimit("Пауза после ограничения OpenSooq ещё не закончилась.", reason="rate_limit_pause")
             response = None
             attempt = 0
             while attempt < 3:
@@ -1027,7 +1036,7 @@ class Reader:
                             attempt = 0
                             continue
                     if attempt == 2:
-                        raise SourceError("OpenSooq не ответил вовремя.") from None
+                        raise SourceError("OpenSooq не ответил вовремя.", reason="network") from None
                     await asyncio.sleep(2 ** (attempt + 1))
                     attempt += 1
             if response is None:
@@ -1268,6 +1277,7 @@ HELP_TEXT = """ℹ️ Команды
 /cancel — отменить ввод
 /admin — пользователи и пароли (для владельца)
 /revokepass ID — отозвать пароль и доступ (для владельца)
+/testsource — проверить страницу выбранной страны
 /testproxy — проверить просмотры и активные объявления через прокси
 /id — ваш Telegram ID
 
@@ -1287,8 +1297,59 @@ def help_text(user_id):
     return "\n".join(line for line in text.splitlines() if "(для владельца)" not in line) + "\nДля добавления категории отправьте её ссылку."
 
 
+def source_failure_text(exc):
+    reason = getattr(exc, "reason", "")
+    labels = {
+        "waf_challenge": "Сайт запросил AWS WAF Challenge. Страница выдачи не получена.",
+        "waf_captcha": "Сайт запросил CAPTCHA. Страница выдачи не получена.",
+        "http202": "HTTP 202: сайт не вернул обычную страницу выдачи. Защита сайта пока не подтверждена.",
+        "access_check": "Сайт показал страницу проверки доступа вместо объявлений.",
+        "rate_limit": "HTTP 429: сайт ограничил частоту запросов. Дождитесь окончания паузы.",
+        "rate_limit_pause": "Действует пауза после ограничения запросов сайтом.",
+        "network": "Не удалось получить ответ через текущее соединение.",
+    }
+    if reason in labels:
+        return labels[reason]
+    status = getattr(exc, "status", None)
+    if status is None:
+        match = re.search(r"HTTP\s+(\d{3})", str(exc))
+        status = int(match[1]) if match else None
+    if status == 403:
+        return "HTTP 403: сайт отказал в доступе к странице выдачи."
+    if status == 407:
+        return "HTTP 407: прокси отклонил авторизацию."
+    if isinstance(status, int):
+        return f"HTTP {status}: страница выдачи не получена."
+    if isinstance(exc, (TimeoutError, httpx.RequestError)):
+        return "Истекло время ожидания ответа через текущее соединение."
+    if isinstance(exc, ValueError):
+        return "Ссылка или настройки поиска некорректны."
+    return "Не удалось загрузить или прочитать страницу выдачи. Подробности — в логах сервиса."
+
+
+async def test_source_message(update, context):
+    service = context.application.bot_data["service"]
+    chat = update.effective_chat.id
+    urls = active_sources(service.state(chat))
+    message = update.effective_message
+    if not urls:
+        await message.reply_text("Нет активных категорий. Выберите страну и категорию поиска.")
+        return
+    await message.reply_text("🔎 Проверяю страницы текущего поиска через активное соединение…")
+    for source in urls:
+        try:
+            async with asyncio.timeout(25):
+                raw, final = await service.reader.get(recent_source(source))
+                ads, _ = await asyncio.to_thread(parse_category, raw, final)
+            result = f"✅ Страница загружена: HTTP 200. Прочитано объявлений: {len(ads)}."
+        except (SourceError, ValueError, TimeoutError) as exc:
+            result = "⚠️ " + source_failure_text(exc)
+            log.warning("[source_test] chat=%s host=%s %s", chat, urlsplit(source).hostname, error_text(exc))
+        await message.reply_text(source_country(source) + "\n" + source + "\n\n" + result)
+
+
 def report_text(stats, elapsed, outcome):
-    titles = {"complete": "✅ Поиск завершён", "partial": "⏹ Поиск завершён",
+    titles = {"complete": "✅ Поиск завершён", "partial": "⚠️ Поиск завершён с замечаниями",
               "error": "❌ Поиск прерван", "stopped": "⏸ Поиск остановлен", "limit": "📦 Достигнут лимит поиска"}
     seconds = max(0, round(elapsed))
     duration = f"{seconds // 60} мин. {seconds % 60} сек." if seconds >= 60 else f"{seconds} сек."
@@ -1562,6 +1623,7 @@ class Service:
 
     async def scan(self, chat, deep=False):
         stats, warnings, seen = Counter(), {}, set()
+        failure_reasons = []
         outcome, started, stop = "complete", time.monotonic(), False
         report_allowed = True
         progress_task = None
@@ -1579,6 +1641,7 @@ class Service:
                         url = recent_source(source)
                     except ValueError:
                         warnings["Сохранённая ссылка на категорию некорректна."] = True
+                        failure_reasons.append("Сохранённая ссылка на категорию некорректна.")
                         stats["errors"] += 1
                         outcome = "partial"
                         continue
@@ -1601,11 +1664,13 @@ class Service:
                             ads, next_url = await asyncio.to_thread(parse_category, raw, final)
                             stats["pages"] += 1
                         except RateLimit as exc:
+                            failure_reasons.append(source_failure_text(exc))
                             warnings[str(exc)] = True
                             stats["errors"] += 1
                             outcome, stop = "partial", True
                             break
                         except (SourceError, ValueError) as exc:
+                            failure_reasons.append(source_failure_text(exc))
                             warnings[str(exc)] = True
                             stats["errors"] += 1
                             outcome = "partial"
@@ -1739,15 +1804,22 @@ class Service:
                     await progress_task
             if outcome == "complete" and warnings:
                 outcome = "partial"
+            if stats["errors"] and not stats["pages"] and outcome not in {"stopped"}:
+                outcome = "error"
             for warning in warnings:
                 log.warning("[scan_detail] chat=%s %s", chat, error_text(warning))
             report = report_text(stats, time.monotonic() - started, outcome)
+            if failure_reasons:
+                report += "\n\n<b>Причина:</b>\n" + "\n".join(escape(reason) for reason in dict.fromkeys(failure_reasons))[:1200]
+            elif stats["errors"] and not stats["pages"]:
+                report += "\n\nСтраница поиска не получена. Проверьте выдачу командой /testsource."
             with suppress(sqlite3.Error):
                 self.save(chat, last=report, next_check=time.time() + self.state(chat)["minutes"] * 60)
             if self.tasks.get(chat) is asyncio.current_task():
                 self.tasks.pop(chat, None)
             if report_allowed and not self.closing:
                 markup = InlineKeyboardMarkup([
+                    *([[InlineKeyboardButton("🔎 Проверить страницу поиска", callback_data="ui:testsource")]] if stats["errors"] else []),
                     [InlineKeyboardButton("🔄 Перезапустить парсер", callback_data="restart_scan")],
                     [InlineKeyboardButton("🏠 Главное меню", callback_data="menu_home")],
                 ])
@@ -3476,6 +3548,8 @@ async def handle_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif command == "/reset":
             service.save(chat.id, rules={})
             await message.reply_text("✅ Фильтры сброшены.")
+        elif command == "/testsource":
+            await test_source_message(update, context)
         elif command == "/testproxy":
             if not service.reader.proxy_url:
                 await message.reply_text("Добавьте OPENSOOQ_PROXY_URL в Environment на Render и перезапустите сервис.")
@@ -4107,6 +4181,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         navigation = {"menu_home": "home", "menu_sources": "sources", "menu_filters": "filters",
                       "menu_status": "status", "ui:saved": "saved", "ui:monitor": "monitor", "ui:cancel": "home"}
+        if data == "ui:testsource":
+            await test_source_message(update, context)
+            return
         if data.startswith("ui:admin"):
             if user.id != ADMIN_ID:
                 raise ValueError("Админ-панель доступна только владельцу.")
@@ -5395,6 +5472,7 @@ def build_app(token, allowed, database):
                 BotCommand("restart", "Перезапустить проверку"), BotCommand("pause", "Остановить"),
                 BotCommand("status", "Статус и отчёт"), BotCommand("help", "Справка"), BotCommand("id", "Мой ID"),
                 BotCommand("testproxy", "Проверить прокси и просмотры"),
+                BotCommand("testsource", "Проверить страницу поиска"),
                 BotCommand("saved", "Сохранённые поиски"), BotCommand("cancel", "Отменить ввод"),
                 *([BotCommand("subscription", "Подписка и оплата")] if SUBSCRIPTIONS_ENABLED else []),
             ])
@@ -5405,6 +5483,7 @@ def build_app(token, allowed, database):
                 BotCommand("account", "Подключить аккаунт"), BotCommand("proxies", "Прокси"),
                 BotCommand("newproxy", "Заменить основной прокси"), BotCommand("addproxy", "Добавить резервный"),
                 BotCommand("nextproxy", "Переключить прокси"), BotCommand("testproxy", "Проверить прокси"),
+                BotCommand("testsource", "Проверить страницу поиска"),
                 BotCommand("users", "Пользователи"),
             ], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
         except TelegramError as exc:
@@ -5519,7 +5598,7 @@ def main():
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в Environment на Render.")
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",") if v.strip()}
-    log.info("[boot_v36_country_modes] Создание Telegram Application")
+    log.info("[boot_v37_source_diagnostics] Создание Telegram Application")
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
