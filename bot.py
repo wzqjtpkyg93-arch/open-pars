@@ -1191,7 +1191,7 @@ def public_document_ready(raw, url):
     except (SourceError, ValueError, KeyError, TypeError):
         return False
 
-async def read_rendered_document(page, reader, url, *, render_timeout=18, settle=0.5):
+async def read_rendered_document(page, reader, url, *, render_timeout=18, settle=0):
     from playwright.async_api import TimeoutError as PlaywrightTimeout
     latest = {'response': None, 'at': 0.0}
 
@@ -1281,13 +1281,15 @@ class Service:
         url = public_browser_url(url)
         async with self.browser_lock:
             page = None
+            completed = False
             try:
                 async with asyncio.timeout(55):
-                    context, _ = await self.public_browser.get_page()
-                    page = await context.new_page()
+                    _, page = await self.public_browser.get_page()
                     page.set_default_timeout(12000)
                     await self.reader.throttle()
-                    return await read_rendered_document(page, self.reader, url)
+                    result = await read_rendered_document(page, self.reader, url)
+                    completed = True
+                    return result
             except (SourceError, ValueError):
                 raise
             except TimeoutError:
@@ -1298,7 +1300,8 @@ class Service:
                 log.warning('[parser_browser] host=%s error=%s reason=%s', urlsplit(url).hostname, type(exc).__name__, reason)
                 raise SourceError('Не удалось загрузить страницу в Chrome.', reason=reason) from None
             finally:
-                if page is not None:
+                # Reuse the reading tab; discard failed/cancelled navigations.
+                if page is not None and not completed:
                     with suppress(Exception):
                         await page.close()
 
@@ -1907,6 +1910,13 @@ class PublicChromeBrowser:
 
     async def _restrict_navigation(self, route):
         request = route.request
+        # Only public-site media is dispensable. Keep scripts, XHR and
+        # third-party verification resources available to the normal browser.
+        if not request.is_navigation_request() and request.resource_type in {'image', 'media', 'font'}:
+            host = (urlsplit(request.url).hostname or '').lower()
+            if host == 'opensooq.com' or host.endswith('.opensooq.com') or host == 'opensooqcdn.com' or host.endswith('.opensooqcdn.com') or host == 'opensooq-imagesv2.os-cdn.com':
+                await route.abort()
+                return
         if request.is_navigation_request():
             try:
                 allowed = public_navigation_allowed(request.url, request.frame.parent_frame is None)
@@ -2546,7 +2556,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text('В этой версии оставлен публичный парсер. Вход в OpenSooq и диалоги отключены. Используйте /testsource и /check.')
         return
     if command == '/version':
-        await message.reply_text('Версия v39.1 · Поиск объявлений · Chrome')
+        await message.reply_text('Версия v39.2 · Поиск объявлений · Chrome')
         return
     if not service.permitted(user.id):
         await handle_commands(update, context)
@@ -3003,7 +3013,7 @@ def main():
     if not token:
         raise SystemExit('Задайте BOT_TOKEN в Environment на Render.')
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv('ALLOWED_TELEGRAM_IDS', '').split(',') if v.strip()}
-    log.info('[boot_v39_1_menu_banner] Создание Telegram Application')
+    log.info('[boot_v39_2_faster_reader] Создание Telegram Application')
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=['message', 'callback_query'], bootstrap_retries=3)
