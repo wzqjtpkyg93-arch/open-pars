@@ -1241,7 +1241,7 @@ async def test_source_message(update, context):
         await message.reply_text(source_country(source) + '\n' + source + '\n\n' + result)
 
 def report_text(stats, elapsed, outcome):
-    titles = {'complete': '✅ Поиск завершён', 'partial': '⚠️ Поиск завершён с замечаниями', 'error': '❌ Поиск прерван', 'stopped': '⏸ Поиск остановлен', 'limit': '📦 Достигнут лимит поиска'}
+    titles = {'complete': '✅ Поиск завершён', 'partial': '🏁 Поиск завершён', 'error': '❌ Поиск прерван', 'stopped': '⏸ Поиск остановлен', 'limit': '📦 Достигнут лимит поиска'}
     seconds = max(0, round(elapsed))
     duration = f'{seconds // 60} мин. {seconds % 60} сек.' if seconds >= 60 else f'{seconds} сек.'
     text = f"<b>{titles[outcome]}</b>\n\nОтправлено объявлений: <b>{stats['sent']}</b>\nУже отправлялись: <b>{stats['duplicates']}</b>\nПроверены ранее: <b>{stats['previously_checked']}</b>\nПовторы продавцов: <b>{stats['seller_duplicates']}</b>\nВремя: <b>{duration}</b>\n\nСтраниц: {stats['pages']} · Объявлений: {stats['found']}\nПроверено объявлений: {stats['checked']}\nОтсеяно фильтрами: {stats['filtered']} · Ошибок: {stats['errors']}"
@@ -1826,10 +1826,6 @@ class Service:
             report = report_text(stats, time.monotonic() - started, outcome)
             if stop_reasons:
                 report += '\n\n' + '\n'.join(escape(value) for value in dict.fromkeys(stop_reasons))[:800]
-            if warnings and stats['pages']:
-                # Surface actual failures instead of a bare error counter.
-                details = list(dict.fromkeys(error_text(value)[:200] for value in warnings))[:3]
-                report += '\n\n<b>Замечания:</b>\n' + '\n'.join(escape(value) for value in details)
             if failure_reasons:
                 report += '\n\n<b>Причина:</b>\n' + '\n'.join((escape(reason) for reason in dict.fromkeys(failure_reasons)))[:1200]
             elif stats['errors'] and (not stats['pages']):
@@ -2817,7 +2813,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text('В этой версии оставлен публичный парсер. Вход в OpenSooq и диалоги отключены. Используйте /testsource и /check.')
         return
     if command == '/version':
-        await message.reply_text('Версия v39.9 · Поиск объявлений · Chrome')
+        await message.reply_text('Версия v39.10 · Поиск объявлений · Chrome')
         return
     if not service.permitted(user.id):
         await handle_commands(update, context)
@@ -3282,7 +3278,7 @@ def main():
     if not token:
         raise SystemExit('Задайте BOT_TOKEN в Environment на Render.')
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv('ALLOWED_TELEGRAM_IDS', '').split(',') if v.strip()}
-    log.info('[boot_v39_9_full_search] Создание Telegram Application')
+    log.info('[boot_v39_10_clean_report] Создание Telegram Application')
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=['message', 'callback_query'], bootstrap_retries=3)
