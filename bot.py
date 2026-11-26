@@ -21,7 +21,7 @@ import tempfile
 import time
 import unicodedata
 from collections import Counter
-from contextlib import suppress
+from contextlib import suppress, aclosing
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
@@ -1205,7 +1205,7 @@ async def read_rendered_document(page, reader, url, *, render_timeout=18, settle
     page.on('response', observe)
     try:
         try:
-            response = await page.goto(url, wait_until='domcontentloaded', timeout=25000)
+            response = await page.goto(url, wait_until='commit', timeout=25000)
             if latest['response'] is None and response is not None:
                 latest.update(response=response, at=time.monotonic())
         except PlaywrightTimeout:
@@ -1282,6 +1282,7 @@ class Service:
         async with self.browser_lock:
             page = None
             completed = False
+            read_started = time.monotonic()
             try:
                 async with asyncio.timeout(55):
                     _, page = await self.public_browser.get_page()
@@ -1300,6 +1301,8 @@ class Service:
                 log.warning('[parser_browser] host=%s error=%s reason=%s', urlsplit(url).hostname, type(exc).__name__, reason)
                 raise SourceError('Не удалось загрузить страницу в Chrome.', reason=reason) from None
             finally:
+                log.info('[parser_timing] stage=page host=%s seconds=%.2f ready=%s',
+                         urlsplit(url).hostname, time.monotonic() - read_started, completed)
                 # Reuse the reading tab; discard failed/cancelled navigations.
                 if page is not None and not completed:
                     with suppress(Exception):
@@ -1440,6 +1443,65 @@ class Service:
                 except TelegramError:
                     log.warning('[scan_progress] Не удалось обновить прогресс')
 
+    async def prepared_ads(self, ads, chat, source, rules, signature, seen, stats):
+        """One bounded look-ahead overlaps reading with Telegram delivery.
+
+        Results stay in listing order. No history is changed until scan accepts
+        or delivers a result. Closing the iterator drains every owned task.
+        """
+        pending = []
+        cursor = 0
+        reserved = set()
+
+        async def prepare(ad, previous):
+            try:
+                # Finish the first listing AND its profile before starting the
+                # next one, so look-ahead cannot delay the first delivery.
+                if previous is not None:
+                    _, previous_error = await previous
+                    if isinstance(previous_error, RateLimit):
+                        return None, previous_error
+                result = await self.reader.enrich(
+                    dict(ad), rules=rules,
+                    seller_seen=lambda item: self.seller_seen(chat, item))
+                return result, None
+            except Exception as exc:
+                return None, exc
+
+        def eligible(ad):
+            key = urlsplit(ad['url']).hostname + ':' + ad['id']
+            if key in seen or key in reserved or excluded_topic(ad):
+                return False
+            if (not self.permitted(chat) or source not in active_sources(self.state(chat))
+                    or self.state(chat)['rules'] != rules):
+                return False
+            if stats['checked'] + len(reserved) >= MAX_ADS or stats['sent'] >= MAX_SEND:
+                return False
+            if (self.db.execute('SELECT 1 FROM delivered WHERE chat=? AND key=?', (chat, key)).fetchone()
+                    or self.db.execute('SELECT 1 FROM checked_ads WHERE chat=? AND rules=? AND key=?', (chat, signature, key)).fetchone()
+                    or self.seller_seen(chat, ad)):
+                return False
+            reserved.add(key)
+            return True
+
+        try:
+            while cursor < len(ads) or pending:
+                while cursor < len(ads) and len(pending) < 2:
+                    ad = ads[cursor]
+                    cursor += 1
+                    previous = next((task for _, task in reversed(pending) if task is not None), None)
+                    task = asyncio.create_task(prepare(ad, previous)) if eligible(ad) else None
+                    pending.append((ad, task))
+                ad, task = pending[0]
+                yield ad, task
+                pending.pop(0)
+                reserved.discard(urlsplit(ad['url']).hostname + ':' + ad['id'])
+        finally:
+            tasks = [task for _, task in pending if task is not None]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def scan(self, chat, deep=False):
         stats, warnings, seen = (Counter(), {}, set())
         failure_reasons = []
@@ -1501,93 +1563,104 @@ class Service:
                             if not known:
                                 page_known = False
                                 break
-                        for ad in ads:
-                            if self.state(chat)['rules'] != scan_rules:
-                                warnings['Фильтры изменены во время проверки. Запустите поиск заново.'] = True
-                                outcome, stop = ('partial', True)
-                                break
-                            key = urlsplit(ad['url']).hostname + ':' + ad['id']
-                            if key in seen:
-                                continue
-                            seen.add(key)
-                            stats['found'] += 1
-                            if self.db.execute('SELECT 1 FROM delivered WHERE chat=? AND key=?', (chat, key)).fetchone():
-                                stats['duplicates'] += 1
-                                with self.db:
-                                    self.remember_seller(chat, ad)
-                                continue
-                            if self.seller_seen(chat, ad):
-                                stats['seller_duplicates'] += 1
-                                continue
-                            if self.db.execute('SELECT 1 FROM checked_ads WHERE chat=? AND rules=? AND key=?', (chat, signature, key)).fetchone():
-                                stats['previously_checked'] += 1
-                                continue
-                            if stats['checked'] >= MAX_ADS or stats['sent'] >= MAX_SEND:
-                                outcome, stop = ('limit', True)
-                                break
-                            if source not in active_sources(self.state(chat)) or not self.permitted(chat):
-                                break
-                            stats['checked'] += 1
-                            if excluded_topic(ad):
-                                stats['filtered'] += 1
-                                stats['filtered_topic'] += 1
-                                self.mark_checked(chat, signature, key)
-                                continue
-                            try:
-                                rules = scan_rules
-                                ad, warning = await self.reader.enrich(ad, rules=rules, seller_seen=lambda item: self.seller_seen(chat, item))
+                        async with aclosing(self.prepared_ads(ads, chat, source, scan_rules, signature, seen, stats)) as stream:
+                            async for ad, prepared in stream:
                                 if self.state(chat)['rules'] != scan_rules:
                                     warnings['Фильтры изменены во время проверки. Запустите поиск заново.'] = True
                                     outcome, stop = ('partial', True)
                                     break
-                                if ad.pop('_seller_already_sent', False) or self.seller_seen(chat, ad):
+                                key = urlsplit(ad['url']).hostname + ':' + ad['id']
+                                if key in seen:
+                                    continue
+                                seen.add(key)
+                                stats['found'] += 1
+                                if self.db.execute('SELECT 1 FROM delivered WHERE chat=? AND key=?', (chat, key)).fetchone():
+                                    stats['duplicates'] += 1
+                                    with self.db:
+                                        self.remember_seller(chat, ad)
+                                    continue
+                                if self.seller_seen(chat, ad):
                                     stats['seller_duplicates'] += 1
-                                    self.mark_checked(chat, signature, key)
                                     continue
-                                rejection = ad.pop('_filtered_before_profile', False)
-                                if rejection:
-                                    stats['filtered'] += 1
-                                    stats['filtered_topic' if rejection == 'topic' else 'filtered_rules'] += 1
-                                    self.mark_checked(chat, signature, key)
+                                if self.db.execute('SELECT 1 FROM checked_ads WHERE chat=? AND rules=? AND key=?', (chat, signature, key)).fetchone():
+                                    stats['previously_checked'] += 1
                                     continue
-                                if warning:
-                                    warnings[warning] = True
-                                accepted, absent = matches(ad, rules)
-                                if not accepted:
-                                    stats['filtered'] += 1
-                                    if absent and rules.get('unknown') != 'include':
-                                        stats['filtered_missing'] += 1
-                                    else:
-                                        stats['filtered_rules'] += 1
-                                    if not absent and (not warning):
-                                        self.mark_checked(chat, signature, key)
-                                    continue
-                                await asyncio.sleep(max(0, last_delivery + 1.1 - time.monotonic()))
-                                if not self.permitted(chat):
-                                    outcome, stop = ('stopped', True)
+                                if stats['checked'] >= MAX_ADS or stats['sent'] >= MAX_SEND:
+                                    outcome, stop = ('limit', True)
                                     break
-                                await self.send(chat, ad)
-                                with self.db:
-                                    self.db.execute('INSERT OR IGNORE INTO delivered VALUES (?,?)', (chat, key))
-                                    self.remember_seller(chat, ad)
-                                    self.db.execute('INSERT OR IGNORE INTO checked_ads VALUES (?,?,?)', (chat, signature, key))
-                                stats['sent'] += 1
-                                last_delivery = time.monotonic()
-                            except Forbidden:
-                                raise
-                            except RateLimit as exc:
-                                warnings[str(exc)] = True
-                                stats['errors'] += 1
-                                outcome, stop = ('partial', True)
-                                break
-                            except (SourceError, ValueError, TelegramError) as exc:
-                                stats['errors'] += 1
-                                warnings[str(exc)[:220]] = True
-                                log.warning('Объявление %s: %s', ad['id'], type(exc).__name__)
-                            except Exception:
-                                stats['errors'] += 1
-                                warnings[f"Объявление {ad['id']}: ошибка обработки; подробности в логах Render."] = True
-                                log.exception('Ошибка обработки объявления %s', ad['id'])
+                                if source not in active_sources(self.state(chat)) or not self.permitted(chat):
+                                    break
+                                stats['checked'] += 1
+                                if excluded_topic(ad):
+                                    stats['filtered'] += 1
+                                    stats['filtered_topic'] += 1
+                                    self.mark_checked(chat, signature, key)
+                                    continue
+                                try:
+                                    rules = scan_rules
+                                    if prepared is None:
+                                        ad, warning = await self.reader.enrich(ad, rules=rules, seller_seen=lambda item: self.seller_seen(chat, item))
+                                    else:
+                                        result, error = await prepared
+                                        if error is not None:
+                                            raise error
+                                        ad, warning = result
+                                    if self.state(chat)['rules'] != scan_rules:
+                                        warnings['Фильтры изменены во время проверки. Запустите поиск заново.'] = True
+                                        outcome, stop = ('partial', True)
+                                        break
+                                    if ad.pop('_seller_already_sent', False) or self.seller_seen(chat, ad):
+                                        stats['seller_duplicates'] += 1
+                                        self.mark_checked(chat, signature, key)
+                                        continue
+                                    rejection = ad.pop('_filtered_before_profile', False)
+                                    if rejection:
+                                        stats['filtered'] += 1
+                                        stats['filtered_topic' if rejection == 'topic' else 'filtered_rules'] += 1
+                                        self.mark_checked(chat, signature, key)
+                                        continue
+                                    if warning:
+                                        warnings[warning] = True
+                                    accepted, absent = matches(ad, rules)
+                                    if not accepted:
+                                        stats['filtered'] += 1
+                                        if absent and rules.get('unknown') != 'include':
+                                            stats['filtered_missing'] += 1
+                                        else:
+                                            stats['filtered_rules'] += 1
+                                        if not absent and (not warning):
+                                            self.mark_checked(chat, signature, key)
+                                        continue
+                                    await asyncio.sleep(max(0, last_delivery + 1.1 - time.monotonic()))
+                                    if (not self.permitted(chat) or source not in active_sources(self.state(chat))
+                                            or self.state(chat)['rules'] != scan_rules):
+                                        outcome, stop = ('stopped', True)
+                                        break
+                                    send_started = time.monotonic()
+                                    await self.send(chat, ad)
+                                    log.info('[parser_timing] stage=send chat=%s seconds=%.2f',
+                                             chat, time.monotonic() - send_started)
+                                    with self.db:
+                                        self.db.execute('INSERT OR IGNORE INTO delivered VALUES (?,?)', (chat, key))
+                                        self.remember_seller(chat, ad)
+                                        self.db.execute('INSERT OR IGNORE INTO checked_ads VALUES (?,?,?)', (chat, signature, key))
+                                    stats['sent'] += 1
+                                    last_delivery = time.monotonic()
+                                except Forbidden:
+                                    raise
+                                except RateLimit as exc:
+                                    warnings[str(exc)] = True
+                                    stats['errors'] += 1
+                                    outcome, stop = ('partial', True)
+                                    break
+                                except (SourceError, ValueError, TelegramError) as exc:
+                                    stats['errors'] += 1
+                                    warnings[str(exc)[:220]] = True
+                                    log.warning('Объявление %s: %s', ad['id'], type(exc).__name__)
+                                except Exception:
+                                    stats['errors'] += 1
+                                    warnings[f"Объявление {ad['id']}: ошибка обработки; подробности в логах Render."] = True
+                                    log.exception('Ошибка обработки объявления %s', ad['id'])
                         known_pages = known_pages + 1 if page_known else 0
                         if not deep and known_pages >= 2:
                             stats['history_boundary'] += 1
@@ -2556,7 +2629,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text('В этой версии оставлен публичный парсер. Вход в OpenSooq и диалоги отключены. Используйте /testsource и /check.')
         return
     if command == '/version':
-        await message.reply_text('Версия v39.2 · Поиск объявлений · Chrome')
+        await message.reply_text('Версия v39.3 · Поиск объявлений · Chrome')
         return
     if not service.permitted(user.id):
         await handle_commands(update, context)
@@ -3013,7 +3086,7 @@ def main():
     if not token:
         raise SystemExit('Задайте BOT_TOKEN в Environment на Render.')
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv('ALLOWED_TELEGRAM_IDS', '').split(',') if v.strip()}
-    log.info('[boot_v39_2_faster_reader] Создание Telegram Application')
+    log.info('[boot_v39_3_pipeline] Создание Telegram Application')
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=['message', 'callback_query'], bootstrap_retries=3)
