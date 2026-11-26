@@ -1161,6 +1161,8 @@ def public_browser_url(url):
 
 def source_failure_text(exc):
     reason = getattr(exc, 'reason', '')
+    if reason == 'browser_startup':
+        return 'Не запустился браузер парсера. ' + error_text(exc)[:600]
     labels = {'waf_challenge': 'Сайт запросил AWS WAF Challenge. Страница выдачи не получена.', 'waf_captcha': 'Сайт запросил CAPTCHA. Страница выдачи не получена.', 'http202': 'HTTP 202: сайт не вернул обычную страницу выдачи. Защита сайта пока не подтверждена.', 'access_check': 'Сайт показал страницу проверки доступа вместо объявлений.', 'rate_limit': 'HTTP 429: сайт ограничил частоту запросов. Дождитесь окончания паузы.', 'rate_limit_pause': 'Действует пауза после ограничения запросов сайтом.', 'network': 'Не удалось получить ответ через текущее соединение.', 'browser_timeout': 'Chrome не успел загрузить страницу. Повторите /testsource.', 'browser_network': 'Не удалось загрузить страницу в Chrome. Повторите /testsource и проверьте лог [parser_browser].', 'country_redirect': 'Сайт перенаправил Chrome в другую страну. Выдача не использована.', 'browser_redirect': 'Chrome перенаправлен на другую страницу. Выдача не использована.', 'browser_public_only': 'Для браузерного поиска выберите страну через меню «Страны»: её публичную выдачу /en/find.', 'browser_render_timeout': 'Chrome не получил готовые данные объявлений. Проверьте доступ сайта через /testsource.', 'proxy_connection': 'Chrome не смог подключиться через прокси. Проверьте /proxies и /newproxy.'}
     if reason in labels:
         return labels[reason]
@@ -1788,8 +1790,38 @@ class Service:
         finally:
             self.db.close()
 
-class BrowserUnavailable(ValueError):
-    pass
+class BrowserUnavailable(SourceError, ValueError):
+
+    def __init__(self, message):
+        super().__init__(message, reason='browser_startup')
+
+def browser_startup_code(error, stage, desktop_issue=''):
+    detail = str(error).lower()
+    if 'executable doesn' in detail or 'executable not found' in detail or 'distribution' in detail and 'not found' in detail:
+        return 'CHROME_NOT_INSTALLED'
+    if 'singleton' in detail or 'processsingleton' in detail or isinstance(error, BlockingIOError):
+        return 'PROFILE_IN_USE'
+    if 'permission denied' in detail or 'read-only file system' in detail:
+        return 'PROFILE_NOT_WRITABLE'
+    if 'no space left' in detail:
+        return 'DISK_FULL'
+    if stage == 'display':
+        return desktop_issue or 'DISPLAY_FAILED'
+    if isinstance(error, TimeoutError) or type(error).__name__ == 'TimeoutError':
+        return 'CHROME_START_TIMEOUT'
+    if 'out of memory' in detail or 'cannot allocate memory' in detail:
+        return 'CHROME_MEMORY'
+    return 'CHROME_START_FAILED'
+
+def browser_startup_hint(code):
+    return {
+        'CHROME_NOT_INSTALLED': 'Google Chrome не установлен в контейнере. Проверьте установку браузера в Dockerfile.',
+        'PROFILE_IN_USE': 'Профиль Chrome занят другим процессом. Проверьте, что запущен только один экземпляр бота.',
+        'PROFILE_NOT_WRITABLE': 'Нет доступа на запись к профилю Chrome. Проверьте DATA_DIR и постоянный диск.',
+        'DISK_FULL': 'На диске закончилось место.',
+        'CHROME_START_TIMEOUT': 'Chrome не завершил запуск за 30 секунд. Подробности: Render Logs → [browser_startup].',
+        'CHROME_MEMORY': 'Chrome не смог выделить память.',
+    }.get(code, 'Подробности: Render Logs → [browser_startup].')
 
 class RemoteChromeDesktop:
     width, height = (1000, 900)
@@ -2073,7 +2105,13 @@ class PublicChromeBrowser:
             try:
                 self._acquire_profile()
             except BlockingIOError:
-                raise BrowserUnavailable('Постоянный профиль уже используется другим процессом.') from None
+                self.startup_issue = 'profile:PROFILE_IN_USE'
+                raise BrowserUnavailable('PROFILE_IN_USE: ' + browser_startup_hint('PROFILE_IN_USE')) from None
+            except OSError as error:
+                code = browser_startup_code(error, 'profile')
+                self.startup_issue = 'profile:' + code
+                log.error('[browser_startup] stage=profile code=%s detail=%s', code, error_text(error)[:3000])
+                raise BrowserUnavailable(code + ': ' + browser_startup_hint(code)) from None
             try:
                 self.startup_stage = 'display'
                 await self.desktop.start()
@@ -2094,11 +2132,11 @@ class PublicChromeBrowser:
                 await self._shutdown()
                 raise
             except Exception as error:
-                code = getattr(self.desktop, 'issue', '') or type(error).__name__ if self.startup_stage == 'display' else type(error).__name__
+                code = browser_startup_code(error, self.startup_stage, getattr(self.desktop, 'issue', ''))
                 self.startup_issue = self.startup_stage + ':' + code
+                log.error('[browser_startup] stage=%s code=%s detail=%s', self.startup_stage, code, error_text(error)[:3000])
                 await self._shutdown()
-                label = 'экран' if self.startup_stage == 'display' else 'Chrome'
-                raise BrowserUnavailable('Не удалось запустить ' + label + ' (' + code + ').') from None
+                raise BrowserUnavailable(code + ': ' + browser_startup_hint(code)) from None
 
     async def _shutdown(self):
         context, pw = (self.context, self.pw)
@@ -2695,7 +2733,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text('В этой версии оставлен публичный парсер. Вход в OpenSooq и диалоги отключены. Используйте /testsource и /check.')
         return
     if command == '/version':
-        await message.reply_text('Версия v39.6 · Поиск объявлений · Chrome')
+        await message.reply_text('Версия v39.7 · Поиск объявлений · Chrome')
         return
     if not service.permitted(user.id):
         await handle_commands(update, context)
@@ -3160,7 +3198,7 @@ def main():
     if not token:
         raise SystemExit('Задайте BOT_TOKEN в Environment на Render.')
     allowed = {ADMIN_ID} | {int(v.strip()) for v in os.getenv('ALLOWED_TELEGRAM_IDS', '').split(',') if v.strip()}
-    log.info('[boot_v39_6_settings] Создание Telegram Application')
+    log.info('[boot_v39_7_browser_diagnostics] Создание Telegram Application')
     app = build_app(token, allowed, DATABASE)
     try:
         app.run_polling(allowed_updates=['message', 'callback_query'], bootstrap_retries=3)
