@@ -857,6 +857,16 @@ class Reader:
                 raise RateLimit('Пауза после ограничения OpenSooq ещё не закончилась.', reason='rate_limit_pause')
             if self.browser_fetch is None:
                 return await self._get(url)
+            if self.browser_hosts.get(host, 0) <= time.monotonic():
+                try:
+                    result = await self._get(url)
+                    if await asyncio.to_thread(public_document_ready, *result):
+                        return result
+                except RateLimit:
+                    raise
+                except SourceError as exc:
+                    if exc.reason not in {'waf_challenge', 'http202', 'access_check'}:
+                        raise
             while True:
                 try:
                     result = await self.browser_fetch(url)
@@ -2530,7 +2540,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text('Открыть меню — /start. Начать поиск — /check.')
         return
     if command == '/version':
-        await message.reply_text('Версия v39-r2.')
+        await message.reply_text('Версия v39-r3 · загрузка HTTP с резервным Chrome.')
         return
     if not service.permitted(user.id):
         await handle_commands(update, context)
